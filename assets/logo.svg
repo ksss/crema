@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 220" width="720" height="220" role="img" aria-label="crema">
+  <title>crema</title>
+  <defs>
+    <clipPath id="cup-wm">
+      <circle cx="110" cy="110" r="100"/>
+    </clipPath>
+  </defs>
+  <circle cx="110" cy="110" r="100" fill="#1E120A"/>
+  <rect x="0" y="10" width="220" height="55" fill="#C8965B" clip-path="url(#cup-wm)"/>
+  <text x="240" y="153"
+        font-family="'Inter','Helvetica Neue','Segoe UI',Arial,sans-serif"
+        font-size="140" font-weight="600" fill="#1E120A"
+        letter-spacing="-3">crema</text>
+</svg>

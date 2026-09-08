@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="crema — An AI-agent-first Ruby type checker.">
+  <title>crema</title>
+  <defs>
+    <clipPath id="cup-social">
+      <circle cx="320" cy="320" r="180"/>
+    </clipPath>
+  </defs>
+  <rect width="1280" height="640" fill="#FAF6F0"/>
+  <circle cx="320" cy="320" r="180" fill="#1E120A"/>
+  <rect x="140" y="140" width="360" height="98" fill="#C8965B" clip-path="url(#cup-social)"/>
+  <text x="560" y="350"
+        font-family="'Inter','Helvetica Neue','Segoe UI',Arial,sans-serif"
+        font-size="200" font-weight="600" fill="#1E120A"
+        letter-spacing="-4">crema</text>
+  <text x="560" y="410"
+        font-family="'Inter','Helvetica Neue','Segoe UI',Arial,sans-serif"
+        font-size="30" font-weight="400" fill="#5A4A3E">
+    An AI-agent-first Ruby type checker.
+  </text>
+</svg>

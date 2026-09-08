@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to build, for example v0.1.4"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
+
+jobs:
+  build:
+    name: build amazonlinux-2023-x86_64
+    runs-on: ubuntu-24.04
+    container: amazonlinux:2023
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y gcc clang-devel tar gzip git
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          if [ -f Cargo.lock ]; then
+            cargo build --release --locked
+          else
+            cargo build --release
+          fi
+
+      - name: Package
+        run: |
+          # LICENSE and THIRD_PARTY_LICENSES come from the checked-out
+          # snapshot, so tags published before they existed cannot be
+          # rebuilt with workflow_dispatch.
+          asset="crema-${RELEASE_TAG}-amazonlinux-2023-x86_64"
+          mkdir "$asset"
+          cp target/release/crema LICENSE THIRD_PARTY_LICENSES "$asset/"
+          tar -czf "${asset}.tar.gz" -C "$asset" crema LICENSE THIRD_PARTY_LICENSES
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crema-amazonlinux-2023-x86_64
+          path: crema-${{ env.RELEASE_TAG }}-amazonlinux-2023-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release assets
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt

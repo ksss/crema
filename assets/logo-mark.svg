@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="crema">
+  <title>crema</title>
+  <defs>
+    <clipPath id="cup">
+      <circle cx="128" cy="128" r="120"/>
+    </clipPath>
+  </defs>
+  <circle cx="128" cy="128" r="120" fill="#1E120A"/>
+  <rect x="0" y="8" width="256" height="65" fill="#C8965B" clip-path="url(#cup)"/>
+</svg>
