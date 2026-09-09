@@ -315,12 +315,15 @@ impl DecodeTables {
 
 /// Where nested-declaration refs fetch their target entry from: the
 /// eager rebuild pre-decodes everything into a map; the lazy backend
-/// probes the flat entry index and memoizes per-fetch decodes.
+/// probes the flat entry index and memoizes per-fetch decodes for the
+/// memo's (caller-chosen) lifetime, bumping `decodes` on every real
+/// deserialization.
 pub(crate) enum EntrySource<'a> {
     Map(&'a FxHashMap<u64, MEntry>),
     Flat {
         reader: &'a flat::Reader<'a>,
         memo: &'a AppendMap<u64, MEntry>,
+        decodes: &'a std::cell::Cell<usize>,
     },
 }
 
@@ -328,7 +331,11 @@ impl EntrySource<'_> {
     pub(crate) fn get(&self, id: u64) -> Result<Option<&MEntry>, RebuildError> {
         match self {
             EntrySource::Map(map) => Ok(map.get(&id)),
-            EntrySource::Flat { reader, memo } => {
+            EntrySource::Flat {
+                reader,
+                memo,
+                decodes,
+            } => {
                 if let Some(e) = memo.get(&id) {
                     return Ok(Some(e));
                 }
@@ -336,6 +343,7 @@ impl EntrySource<'_> {
                     return Ok(None);
                 };
                 let entry = memo.get_or_try_insert_with(id, || {
+                    decodes.set(decodes.get() + 1);
                     bincode::deserialize(bytes).map_err(RebuildError::BincodeDecode)
                 })?;
                 Ok(Some(entry))

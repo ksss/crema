@@ -54,7 +54,7 @@ Running `crema check app.rb` outputs:
 
 The doc-style `# @rbs (Integer, Integer) -> Integer` works equivalently; pick whichever fits your comment conventions. See [rbs's inline annotation spec](https://github.com/ruby/rbs/blob/master/docs/inline.md) for the full grammar.
 
-If you prefer to keep type definitions in a separate `sig/` file (e.g. for `.rbs`-only libraries or vendored gems), crema auto-discovers `./sig/`:
+If you prefer to keep type definitions in a separate `sig/` file (e.g. for `.rbs`-only libraries or vendored gems), add `sig = ["sig"]` to `crema.toml` — crema does not read `./sig/` on its own:
 
 ```rbs
 # sig/calculator.rbs
@@ -154,6 +154,7 @@ Notes:
 | `--add-sig <DIR>` | Extra RBS directory to load (repeatable). Appended to the `sig` list in `crema.toml`. Ignored (with a warning) when `--sig` is also given. |
 | `--inline <true\|false>` | Whether to read `# @rbs` / `#:` inline annotations from `.rb` files. Default: `true`. Set to `false` to use only `sig/` as the source of truth. |
 | `--config <PATH>` | Top-level flag: load a config file from `<PATH>` instead of auto-discovering `./crema.toml`. The filename is arbitrary. When set, cwd discovery is **bypassed** (no merge). Missing or malformed files exit `2`. |
+| `--no-bundler` | Top-level flag: resolve gem paths with plain `ruby` instead of `bundle exec ruby`, even when a `Gemfile` is present. Lets `crema extract` run in CI without `bundle install`; gem-provided types (anything beyond rbs core and globally installed gems) are then **not** resolved. Snapshots built with and without the flag are cached separately. |
 
 Positional `<path>` arguments (`crema check app.rb lib/foo.rb`) no longer expand the type-check scope — they **filter** the diagnostics down to files within the scope declared by `crema.toml`'s `check` field. A file argument must already be inside that scope (exit `2` otherwise); a directory argument is expanded recursively and intersected with the scope. Bare `crema check` (no positional arguments) reports every file in scope.
 
@@ -179,7 +180,7 @@ crema --config /abs/path/profile.toml doc diagnostic
 # add to it.
 check = ["app", "lib"]
 
-# Extra RBS directories, appended to the auto-discovered ./sig/. The
+# RBS directories to load. Nothing is loaded implicitly, not even ./sig/. The
 # CLI `--sig` flag replaces this list wholesale (spec Design Goal 4,
 # CLI overrides config); use `--add-sig` for the "config plus extras"
 # workflow instead.
@@ -281,6 +282,38 @@ cargo install --path .
 
 - Rust toolchain (edition 2024)
 - `rbs` gem installed (for core/stdlib type definitions auto-detection)
+
+## Agent skills
+
+`skills/` holds [Agent Skills](https://agentskills.io) that teach a coding
+agent a crema workflow. They are versioned with the binary because they
+read its JSONL output, so replace `vX.Y.Z` below with the tag of the binary
+you installed.
+
+- `rbs-from-diagnostics` — turn `crema check` output into
+  `sig/gem-patch/<gem>/*.rbs` for gems that ship no RBS, one gem per
+  cycle, ranked by how many NoMethod diagnostics cascade from each
+  unresolved constant. See `skills/rbs-from-diagnostics/SKILL.md`.
+
+Install with the GitHub CLI (preferred; `gh skill` is in preview):
+
+```sh
+gh skill install ksss/crema rbs-from-diagnostics@vX.Y.Z --agent claude-code
+```
+
+or with the `skills` CLI:
+
+```sh
+npx skills add ksss/crema --skill rbs-from-diagnostics
+```
+
+or copy the directory into your agent's skill location by hand, for
+example `.claude/skills/rbs-from-diagnostics/` for Claude Code:
+
+```sh
+git clone --depth 1 --branch vX.Y.Z https://github.com/ksss/crema.git /tmp/crema
+cp -r /tmp/crema/skills/rbs-from-diagnostics .claude/skills/
+```
 
 ## Development
 

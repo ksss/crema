@@ -269,9 +269,40 @@ fn baked_from_mirror(
 /// key matched, and writes are atomic — a bincode error here means the
 /// file was corrupted in place, and silently dropping gem declarations
 /// would produce wrong diagnostics. Deleting `.crema/cache` recovers.
+/// The snapshot file image (64-byte header + flat payload) a backend
+/// reads from. The warm path maps the file (`read_g_snapshot_backend`)
+/// so its pages stay file-backed instead of being copied into the heap;
+/// the cold path hands over the bytes it just encoded.
+pub enum SnapshotImage {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for SnapshotImage {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            SnapshotImage::Owned(v) => v,
+            SnapshotImage::Mapped(m) => m,
+        }
+    }
+}
+
+impl From<Vec<u8>> for SnapshotImage {
+    fn from(v: Vec<u8>) -> Self {
+        SnapshotImage::Owned(v)
+    }
+}
+
+impl From<memmap2::Mmap> for SnapshotImage {
+    fn from(m: memmap2::Mmap) -> Self {
+        SnapshotImage::Mapped(m)
+    }
+}
+
 pub struct GSnapshotBackend {
     /// Full snapshot file image (64-byte header + flat payload).
-    bytes: Vec<u8>,
+    bytes: SnapshotImage,
     tables: DecodeTables,
     class_kinds: FxHashMap<TypeName, GClassKind>,
     interface_keys: FxHashSet<TypeName>,
@@ -298,19 +329,16 @@ pub struct GSnapshotBackend {
     constant_all: OnceCell<FxHashMap<TypeName, SingleEntry<Constant>>>,
     global_all: OnceCell<FxHashMap<Symbol, GlobalEntry>>,
 
-    /// Mirror-payload memo shared across every decode: a nested child
-    /// fetched while decoding its parent is not deserialized again when
-    /// the child entry itself is probed or materialized.
-    mentry_memo: AppendMap<u64, MEntry>,
     /// Class/module declarations converted through nested-decl refs,
     /// keyed by `(child entry id, pair index)`. The decode-all pass
     /// reuses these Arcs for the children's flatten pairs (see
     /// [`Decoder::with_nested_cache`]).
     nested_decls: AppendMap<(u64, usize), crate::ast::declarations::Declaration>,
 
-    /// Entry payload decode count (nested children included), for the
-    /// `CREMA_DEBUG_SNAPSHOT_TIMING=1` observability line and the
-    /// laziness regression tests.
+    /// Entry payload deserialization count (nested children included),
+    /// bumped by every `EntrySource::Flat` fetch and the eager alias
+    /// pass, for the `CREMA_DEBUG_SNAPSHOT_TIMING=1` observability line
+    /// and the laziness regression tests.
     decode_count: Cell<usize>,
 }
 
@@ -334,7 +362,11 @@ impl GSnapshotBackend {
     /// invalidation key) the caller has already verified. Interns the
     /// global tables into `names` — the same `NameTable` the A-layer
     /// draft will use, so ids are shared across layers.
-    pub fn open(bytes: Vec<u8>, names: &NameTable) -> Result<GSnapshotBackend, RebuildError> {
+    pub fn open(
+        bytes: impl Into<SnapshotImage>,
+        names: &NameTable,
+    ) -> Result<GSnapshotBackend, RebuildError> {
+        let bytes = bytes.into();
         if bytes.len() < HEADER_LEN {
             return Err(corrupt(format!(
                 "file shorter than header: {} bytes",
@@ -427,7 +459,6 @@ impl GSnapshotBackend {
             type_alias_all: OnceCell::new(),
             constant_all: OnceCell::new(),
             global_all: OnceCell::new(),
-            mentry_memo: AppendMap::default(),
             nested_decls: AppendMap::default(),
             decode_count: Cell::new(0),
         };
@@ -460,35 +491,30 @@ impl GSnapshotBackend {
         &self.baked.warnings
     }
 
-    /// Decode the raw entry payload for `id`, tracking how many new
-    /// payloads (the entry plus any nested children) entered the shared
-    /// memo, and convert it with `f`.
-    fn decode_entry<T>(
-        &self,
-        id: u64,
-        f: impl FnOnce(&mut Decoder<'_>, &EntrySource<'_>, &MEntry) -> Result<T, RebuildError>,
-    ) -> Result<Option<T>, RebuildError> {
-        let mut dec = Decoder::new(&self.tables);
-        self.decode_entry_with(id, &mut dec, f)
-    }
-
+    /// Decode the raw entry payload for `id` and convert it with `f`.
+    /// The mirror-payload `memo` is caller-scoped: a nested child
+    /// fetched while converting its parent is not deserialized twice
+    /// within the same memo's lifetime, but nothing deserialized here
+    /// outlives that memo — point probes pass a fresh one per call,
+    /// the decode-all pass shares one across its whole walk (see
+    /// [`Self::materialize_all`]).
     fn decode_entry_with<T>(
         &self,
         id: u64,
         dec: &mut Decoder<'_>,
+        memo: &AppendMap<u64, MEntry>,
         f: impl FnOnce(&mut Decoder<'_>, &EntrySource<'_>, &MEntry) -> Result<T, RebuildError>,
     ) -> Result<Option<T>, RebuildError> {
         let reader = self.reader();
         let source = EntrySource::Flat {
             reader: &reader,
-            memo: &self.mentry_memo,
+            memo,
+            decodes: &self.decode_count,
         };
-        let before = self.mentry_memo.len();
         let Some(entry) = source.get(id)? else {
             return Ok(None);
         };
         let value = f(dec, &source, entry)?;
-        self.count_decodes(self.mentry_memo.len() - before);
         Ok(Some(value))
     }
 
@@ -540,7 +566,8 @@ impl GSnapshotBackend {
 
     fn decode_class_entry(&self, name: TypeName) -> Result<Option<ClassOrModule>, RebuildError> {
         let mut dec = Decoder::new(&self.tables);
-        self.decode_class_entry_with(name, &mut dec)
+        let memo = AppendMap::default();
+        self.decode_class_entry_with(name, &mut dec, &memo)
     }
 
     /// `dec` may carry the shared nested-decl cache (decode-all pass):
@@ -552,10 +579,11 @@ impl GSnapshotBackend {
         &self,
         name: TypeName,
         dec: &mut Decoder<'_>,
+        memo: &AppendMap<u64, MEntry>,
     ) -> Result<Option<ClassOrModule>, RebuildError> {
         use crate::ast::declarations::Declaration;
         let id = name.get();
-        self.decode_entry_with(id, dec, |dec, source, entry| match entry {
+        self.decode_entry_with(id, dec, memo, |dec, source, entry| match entry {
             MEntry::ClassOrModule(MClassOrModule::Class(e)) => {
                 let mut pairs: Vec<(DeclOrigin, Context, ClassDeclaration)> =
                     Vec::with_capacity(e.context_decls.len());
@@ -731,58 +759,94 @@ impl GSnapshotBackend {
     // ---- per-kind decode bodies, shared by point probes and `*_all` ----
 
     fn interface_entry_uncached(&self, name: &TypeName) -> InterfaceEntry {
+        self.interface_entry_in(name, &AppendMap::default())
+    }
+
+    fn interface_entry_in(&self, name: &TypeName, memo: &AppendMap<u64, MEntry>) -> InterfaceEntry {
         if let Some(v) = self.interface_cache.get(name) {
             return v.clone();
         }
-        let decoded = self.decode_entry(name.get(), |dec, _, entry| match entry {
-            MEntry::Interface(e) => Ok(InterfaceEntry {
-                name: *name,
-                file: DeclOrigin::GSnapshot,
-                context: dec.context(&e.context)?,
-                decl: Arc::new(dec.interface_decl(&e.decl)?),
-            }),
-            _ => Err(corrupt("entry tag/payload mismatch for interface")),
-        });
+        let mut dec = Decoder::new(&self.tables);
+        let decoded =
+            self.decode_entry_with(name.get(), &mut dec, memo, |dec, _, entry| match entry {
+                MEntry::Interface(e) => Ok(InterfaceEntry {
+                    name: *name,
+                    file: DeclOrigin::GSnapshot,
+                    context: dec.context(&e.context)?,
+                    decl: Arc::new(dec.interface_decl(&e.decl)?),
+                }),
+                _ => Err(corrupt("entry tag/payload mismatch for interface")),
+            });
         self.expect_decoded("interface entry", decoded)
     }
 
     fn type_alias_entry_uncached(&self, name: &TypeName) -> SingleEntry<TypeAlias> {
+        self.type_alias_entry_in(name, &AppendMap::default())
+    }
+
+    fn type_alias_entry_in(
+        &self,
+        name: &TypeName,
+        memo: &AppendMap<u64, MEntry>,
+    ) -> SingleEntry<TypeAlias> {
         if let Some(v) = self.type_alias_cache.get(name) {
             return v.clone();
         }
-        let decoded = self.decode_entry(name.get(), |dec, _, entry| match entry {
-            MEntry::TypeAlias(e) => Ok(SingleEntry {
-                name: *name,
-                file: DeclOrigin::GSnapshot,
-                context: dec.context(&e.context)?,
-                decl: Arc::new(dec.type_alias_decl(&e.decl)?),
-            }),
-            _ => Err(corrupt("entry tag/payload mismatch for type alias")),
-        });
+        let mut dec = Decoder::new(&self.tables);
+        let decoded =
+            self.decode_entry_with(name.get(), &mut dec, memo, |dec, _, entry| match entry {
+                MEntry::TypeAlias(e) => Ok(SingleEntry {
+                    name: *name,
+                    file: DeclOrigin::GSnapshot,
+                    context: dec.context(&e.context)?,
+                    decl: Arc::new(dec.type_alias_decl(&e.decl)?),
+                }),
+                _ => Err(corrupt("entry tag/payload mismatch for type alias")),
+            });
         self.expect_decoded("type-alias entry", decoded)
     }
 
     fn constant_entry_uncached(&self, name: &TypeName) -> SingleEntry<Constant> {
+        self.constant_entry_in(name, &AppendMap::default())
+    }
+
+    fn constant_entry_in(
+        &self,
+        name: &TypeName,
+        memo: &AppendMap<u64, MEntry>,
+    ) -> SingleEntry<Constant> {
         if let Some(v) = self.constant_cache.get(name) {
             return v.clone();
         }
-        let decoded = self.decode_entry(name.get(), |dec, _, entry| match entry {
-            MEntry::Constant(e) => Ok(SingleEntry {
-                name: *name,
-                file: DeclOrigin::GSnapshot,
-                context: dec.context(&e.context)?,
-                decl: Arc::new(dec.constant_decl(&e.decl)?),
-            }),
-            _ => Err(corrupt("entry tag/payload mismatch for constant")),
-        });
+        let mut dec = Decoder::new(&self.tables);
+        let decoded =
+            self.decode_entry_with(name.get(), &mut dec, memo, |dec, _, entry| match entry {
+                MEntry::Constant(e) => Ok(SingleEntry {
+                    name: *name,
+                    file: DeclOrigin::GSnapshot,
+                    context: dec.context(&e.context)?,
+                    decl: Arc::new(dec.constant_decl(&e.decl)?),
+                }),
+                _ => Err(corrupt("entry tag/payload mismatch for constant")),
+            });
         self.expect_decoded("constant entry", decoded)
     }
 
     fn global_entry_uncached(&self, name: &Symbol, id: u64) -> GlobalEntry {
+        self.global_entry_in(name, id, &AppendMap::default())
+    }
+
+    fn global_entry_in(
+        &self,
+        name: &Symbol,
+        id: u64,
+        memo: &AppendMap<u64, MEntry>,
+    ) -> GlobalEntry {
         if let Some(v) = self.global_cache.get(name) {
             return v.clone();
         }
-        let decoded = self.decode_entry(id, |dec, _, entry| match entry {
+        let mut dec = Decoder::new(&self.tables);
+        let decoded = self.decode_entry_with(id, &mut dec, memo, |dec, _, entry| match entry {
             MEntry::Global(e) => Ok(GlobalEntry {
                 name: *name,
                 // `MGlobalEntry` is the one G-only shape that persists a
@@ -900,7 +964,16 @@ impl GSnapshotBackend {
 
     // ---- full-scan materialization (decode-all, memoized) ----
 
-    pub fn class_all(&self) -> &FxHashMap<TypeName, ClassOrModule> {
+    /// Fill every `*_all` map that is still empty, in one pass sharing
+    /// one payload memo: a nested interface / type alias / constant
+    /// pulled in while converting its enclosing class is not
+    /// deserialized again on its own kind's turn, so materializing
+    /// costs at most one deserialization per entry. The memo is dropped
+    /// with the pass. Every `*_all` accessor routes through here, so
+    /// asking for one kind materializes all of them — acceptable because
+    /// decode-all is a cold-only / test path, never a warm point probe.
+    fn materialize_all(&self) {
+        let memo = AppendMap::default();
         self.class_all.get_or_init(|| {
             // Parents first (see `tn_depth`), one decoder for the whole
             // pass so nested-decl consumption cursors and the shared
@@ -916,49 +989,64 @@ impl GSnapshotBackend {
                         Some(v) => v.clone(),
                         None => self.expect_decoded(
                             "class entry",
-                            self.decode_class_entry_with(name, &mut dec),
+                            self.decode_class_entry_with(name, &mut dec, &memo),
                         ),
                     };
                     (name, v)
                 })
                 .collect()
-        })
-    }
-
-    pub fn interface_all(&self) -> &FxHashMap<TypeName, InterfaceEntry> {
+        });
         self.interface_all.get_or_init(|| {
             self.interface_keys
                 .iter()
-                .map(|name| (*name, self.interface_entry_uncached(name)))
+                .map(|name| (*name, self.interface_entry_in(name, &memo)))
                 .collect()
-        })
-    }
-
-    pub fn type_alias_all(&self) -> &FxHashMap<TypeName, SingleEntry<TypeAlias>> {
+        });
         self.type_alias_all.get_or_init(|| {
             self.type_alias_keys
                 .iter()
-                .map(|name| (*name, self.type_alias_entry_uncached(name)))
+                .map(|name| (*name, self.type_alias_entry_in(name, &memo)))
                 .collect()
-        })
-    }
-
-    pub fn constant_all(&self) -> &FxHashMap<TypeName, SingleEntry<Constant>> {
+        });
         self.constant_all.get_or_init(|| {
             self.constant_keys
                 .iter()
-                .map(|name| (*name, self.constant_entry_uncached(name)))
+                .map(|name| (*name, self.constant_entry_in(name, &memo)))
                 .collect()
-        })
-    }
-
-    pub fn global_all(&self) -> &FxHashMap<Symbol, GlobalEntry> {
+        });
         self.global_all.get_or_init(|| {
             self.global_ids
                 .iter()
-                .map(|(name, id)| (*name, self.global_entry_uncached(name, *id)))
+                .map(|(name, id)| (*name, self.global_entry_in(name, *id, &memo)))
                 .collect()
-        })
+        });
+    }
+
+    pub fn class_all(&self) -> &FxHashMap<TypeName, ClassOrModule> {
+        self.materialize_all();
+        self.class_all.get().expect("filled by materialize_all")
+    }
+
+    pub fn interface_all(&self) -> &FxHashMap<TypeName, InterfaceEntry> {
+        self.materialize_all();
+        self.interface_all.get().expect("filled by materialize_all")
+    }
+
+    pub fn type_alias_all(&self) -> &FxHashMap<TypeName, SingleEntry<TypeAlias>> {
+        self.materialize_all();
+        self.type_alias_all
+            .get()
+            .expect("filled by materialize_all")
+    }
+
+    pub fn constant_all(&self) -> &FxHashMap<TypeName, SingleEntry<Constant>> {
+        self.materialize_all();
+        self.constant_all.get().expect("filled by materialize_all")
+    }
+
+    pub fn global_all(&self) -> &FxHashMap<Symbol, GlobalEntry> {
+        self.materialize_all();
+        self.global_all.get().expect("filled by materialize_all")
     }
 }
 

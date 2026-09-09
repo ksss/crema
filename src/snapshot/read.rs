@@ -10,6 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use memmap2::Mmap;
+
 use crate::name::NameTable;
 use crate::snapshot::backend::GSnapshotBackend;
 use crate::snapshot::freshness::{self, GFreshnessManifest};
@@ -38,8 +40,13 @@ pub fn read_g_snapshot_backend(
         }
     };
     let t0 = Instant::now();
-    let bytes = match fs::read(cache_path) {
-        Ok(b) => b,
+    // Map rather than read: the backend keeps the whole image alive for
+    // the run, and a file-backed mapping keeps those 10+ MB out of the
+    // heap. Sound because the writer never modifies a snapshot in place
+    // (`write.rs`: `<path>.tmp` + rename), so the mapped inode cannot
+    // change under us; only an external truncation could fault.
+    let bytes = match fs::File::open(cache_path).and_then(|f| unsafe { Mmap::map(&f) }) {
+        Ok(m) => m,
         Err(e) => {
             miss(&format_args!("{}: {}", cache_path.display(), e));
             return None;
@@ -120,9 +127,11 @@ pub fn read_g_snapshot_backend(
 /// diagnostics must stay byte-identical with the snapshot-off path. Set
 /// `CREMA_DEBUG_SNAPSHOT_TIMING=1` for an opt-in stderr breakdown.
 ///
-/// The whole file is read eagerly (`fs::read`, not mmap): slice 1c decodes
-/// every entry anyway, so mapping lazily buys nothing; the lazy mmap-probe
-/// backend is slice 2's territory.
+/// The whole file is read eagerly (`fs::read`, not mmap): this slice 1c
+/// path decodes every entry into an owned environment and drops the
+/// bytes, so a mapping would buy nothing. It has no production caller
+/// (main uses [`read_g_snapshot_backend`], which maps the file); it
+/// stays as the reference decoder for the round-trip tests.
 pub fn read_g_snapshot(
     cache_path: &Path,
     expected_key: &InvalidationKey,

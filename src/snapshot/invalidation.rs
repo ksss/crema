@@ -1,6 +1,8 @@
 //! G-snapshot invalidation key: a 256-bit content fingerprint over every
 //! input whose change must force a snapshot rebuild (ADR-0028 Decision 4:
-//! lockfiles, crema version, crema.toml, sig path set).
+//! lockfiles, crema version, crema.toml, sig path set — plus the gem
+//! resolver mode, since `--no-bundler` can point G at a different rbs
+//! install than bundler does).
 
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -23,6 +25,11 @@ pub struct InvalidationInputs<'a> {
     pub crema_toml_content: Option<&'a [u8]>,
     /// Normalized and sorted by the caller (contract; not re-sorted here).
     pub sig_paths: &'a [&'a str],
+    /// `--no-bundler`: the resolver was pinned to plain `ruby`. Keyed on
+    /// the flag, not on which program actually ran, so a bundler-mode
+    /// run that fell back to `ruby` (bundle missing from PATH) still
+    /// shares its key with the bundler-mode runs it belongs to.
+    pub no_bundler: bool,
 }
 
 /// The `crema_version` input for [`compute`]. Production builds always
@@ -54,6 +61,8 @@ fn base_buf(inputs: &InvalidationInputs<'_>) -> Vec<u8> {
         buf.extend_from_slice(&(p.len() as u64).to_le_bytes());
         buf.extend_from_slice(p.as_bytes());
     }
+    buf.push(5);
+    buf.push(inputs.no_bundler as u8);
     buf
 }
 

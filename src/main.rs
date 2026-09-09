@@ -34,6 +34,15 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
+    /// Spawn the gem resolver with plain `ruby` instead of `bundle exec
+    /// ruby`, even when a Gemfile is discoverable. Lets `crema extract`
+    /// run without `bundle install` (e.g. in CI); gem-provided types
+    /// are then not resolved, only rbs core and globally installed
+    /// gems. Snapshots built with and without this flag never share a
+    /// cache entry.
+    #[arg(long, global = true)]
+    no_bundler: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -246,6 +255,13 @@ fn should_use_bundler(bundle_gemfile: Option<&OsStr>, cwd: &Path) -> bool {
     }
 }
 
+/// `should_use_bundler` gated by the `--no-bundler` opt-out: the flag
+/// wins over both `BUNDLE_GEMFILE` and Gemfile discovery, so `bundle`
+/// is never consulted (neither spawned nor suggested) when it is set.
+fn resolver_uses_bundler(no_bundler: bool, bundle_gemfile: Option<&OsStr>, cwd: &Path) -> bool {
+    !no_bundler && should_use_bundler(bundle_gemfile, cwd)
+}
+
 /// Print a G-construction warning immediately (so a cold run's stderr
 /// is unchanged) and record it verbatim so a later warm `g_snapshot`
 /// hit can replay the identical line — G construction (gem resolution,
@@ -280,9 +296,11 @@ fn warn_and_record(warnings: &mut Vec<String>, message: String) {
 /// spawned under `bundle exec` so bundler-managed gems (vendor/bundle,
 /// `BUNDLE_PATH`) are visible and the rbs gem itself resolves to the
 /// version the host project pins. If `bundle` is not on PATH, we warn
-/// and retry with plain `ruby`.
+/// and retry with plain `ruby`. `no_bundler` (`--no-bundler`) skips
+/// bundler entirely: plain `ruby` from the start, no fallback warning.
 fn resolve_gem_dirs(
     entries: &[(String, Option<String>)],
+    no_bundler: bool,
     warnings: &mut Vec<String>,
 ) -> Result<ResolvedGemDirs, String> {
     let debug_resolver = std::env::var_os("CREMA_DEBUG_RESOLVER").is_some_and(|v| v == "1");
@@ -314,7 +332,7 @@ end
     let cwd =
         std::env::current_dir().map_err(|e| format!("error: failed to get current dir: {}", e))?;
     let bundle_gemfile = std::env::var_os("BUNDLE_GEMFILE");
-    let use_bundler = should_use_bundler(bundle_gemfile.as_deref(), &cwd);
+    let use_bundler = resolver_uses_bundler(no_bundler, bundle_gemfile.as_deref(), &cwd);
     let mut cmd = build_resolver_command(use_bundler, script);
     if debug_resolver {
         eprint_resolver_spawn(&cmd);
@@ -494,6 +512,7 @@ end
 fn get_gem_dirs(
     entries: &[(String, Option<String>)],
     rbs_collection_lock: Option<&Path>,
+    no_bundler: bool,
     warnings: &mut Vec<String>,
 ) -> Result<ResolvedGemDirs, String> {
     // `entries` already carries a pinned `rbs` tuple when the lock file
@@ -509,8 +528,14 @@ fn get_gem_dirs(
                 .chain(entries.iter().cloned())
                 .collect()
         };
-    let resolved = resolve_gem_dirs(&resolver_input, warnings)?;
-    emit_stale_pin_warnings(&resolved, entries, rbs_collection_lock, warnings);
+    let resolved = resolve_gem_dirs(&resolver_input, no_bundler, warnings)?;
+    emit_stale_pin_warnings(
+        &resolved,
+        entries,
+        rbs_collection_lock,
+        no_bundler,
+        warnings,
+    );
     Ok(resolved)
 }
 
@@ -521,6 +546,7 @@ fn emit_stale_pin_warnings(
     gem_dirs: &ResolvedGemDirs,
     entries: &[(String, Option<String>)],
     rbs_collection_lock: Option<&Path>,
+    no_bundler: bool,
     warnings: &mut Vec<String>,
 ) {
     if gem_dirs.stale.is_empty() {
@@ -530,7 +556,7 @@ fn emit_stale_pin_warnings(
         .and_then(|p| p.file_name())
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| "rbs_collection.lock.yaml".to_string());
-    let sync_command = collection_update_command();
+    let sync_command = collection_update_command(no_bundler);
 
     let mut names: Vec<&String> = gem_dirs.stale.keys().collect();
     names.sort();
@@ -558,11 +584,17 @@ fn emit_stale_pin_warnings(
 /// PATH. A Gemfile alone isn't enough — `resolve_gem_dirs` falls back
 /// to plain `ruby` (with its own warning) when `bundle` is missing, so
 /// suggesting `bundle exec ...` in that case would tell the user to
-/// run a command that was just shown not to work.
-fn collection_update_command() -> &'static str {
-    let use_bundler = std::env::current_dir()
-        .is_ok_and(|cwd| should_use_bundler(std::env::var_os("BUNDLE_GEMFILE").as_deref(), &cwd))
-        && bundle_on_path(std::env::var_os("PATH").as_deref());
+/// run a command that was just shown not to work. Likewise under
+/// `--no-bundler` (`no_bundler`): bundler was deliberately bypassed, so
+/// the suggestion follows the resolver and drops the `bundle exec`.
+fn collection_update_command(no_bundler: bool) -> &'static str {
+    let use_bundler = std::env::current_dir().is_ok_and(|cwd| {
+        resolver_uses_bundler(
+            no_bundler,
+            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
+            &cwd,
+        )
+    }) && bundle_on_path(std::env::var_os("PATH").as_deref());
     if use_bundler {
         "bundle exec rbs collection update"
     } else {
@@ -915,7 +947,8 @@ fn load_file_config_with_dir(cli_config: Option<&Path>) -> (Option<Config>, Path
 }
 
 /// G-snapshot invalidation key over the current run's inputs (ADR-0028
-/// Decision 4: lockfiles, crema version, crema.toml, sig path set).
+/// Decision 4: lockfiles, crema version, crema.toml, sig path set) plus
+/// the `--no-bundler` resolver mode.
 /// All project resources (Gemfile.lock, crema.toml) are read from
 /// `project_root` so subdirectory execution and root execution compute
 /// the same key.
@@ -923,6 +956,7 @@ fn compute_g_snapshot_key(
     sig_dirs: &[PathBuf],
     rbs_collection_lock: Option<&Path>,
     project_root: &Path,
+    no_bundler: bool,
 ) -> crema::snapshot::invalidation::InvalidationKey {
     let gemfile_lock_content =
         discover_bundle_root(project_root).and_then(|dir| fs::read(dir.join(GEMFILE_LOCK)).ok());
@@ -941,6 +975,7 @@ fn compute_g_snapshot_key(
         rbs_collection_lock_content: rbs_collection_lock_content.as_deref(),
         crema_toml_content: crema_toml_content.as_deref(),
         sig_paths: &sig_path_refs,
+        no_bundler,
     })
 }
 
@@ -988,7 +1023,7 @@ fn sig_file_targets(sig_dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// when checks write snapshots. The gem-loading sequence intentionally
 /// mirrors `Commands::Check` (kept duplicated because slice scope
 /// forbids touching the check path; slice 1c reconciles the two).
-fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>) {
+fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler: bool) {
     if let Err(e) = std::env::set_current_dir(project_root) {
         eprintln!(
             "error: cannot enter project root {}: {}",
@@ -1100,6 +1135,7 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>) {
     match get_gem_dirs(
         &all_entries,
         rbs_collection_lock_path.as_deref(),
+        no_bundler,
         &mut g_warnings,
     ) {
         Ok(gem_dirs) => {
@@ -1215,6 +1251,7 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>) {
         &resolved.sig_dirs,
         rbs_collection_lock_path.as_deref(),
         project_root,
+        no_bundler,
     );
 
     let cache_path = project_root.join(G_SNAPSHOT_FILE);
@@ -1305,7 +1342,7 @@ enum RunMode {
 /// including env construction. `mode` switches the output contract:
 /// `Extract` discards diagnostics (the emitter writes to a sink) and
 /// runs its own per-file phase.
-fn run_check(cli_config: Option<&Path>, args: CheckInvocation, mode: RunMode) {
+fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation, mode: RunMode) {
     // Anchors the check-timing line: `setup` is everything before
     // ingest (config, collection, gem dirs, snapshot open).
     let t_run = std::time::Instant::now();
@@ -1637,6 +1674,7 @@ fn run_check(cli_config: Option<&Path>, args: CheckInvocation, mode: RunMode) {
             &resolved.sig_dirs,
             rbs_collection_lock_path.as_deref(),
             &project_root,
+            no_bundler,
         ))
     };
     let g_snapshot_path = project_root.join(G_SNAPSHOT_FILE);
@@ -1680,6 +1718,7 @@ fn run_check(cli_config: Option<&Path>, args: CheckInvocation, mode: RunMode) {
         match get_gem_dirs(
             &all_entries,
             rbs_collection_lock_path.as_deref(),
+            no_bundler,
             &mut g_warnings,
         ) {
             Ok(gem_dirs) => {
@@ -2131,6 +2170,7 @@ fn run_check(cli_config: Option<&Path>, args: CheckInvocation, mode: RunMode) {
                 &resolved.sig_dirs,
                 rbs_collection_lock_path.as_deref(),
                 &project_root,
+                no_bundler,
             )
         });
         crema::incremental::CachedGeneration::load(&incremental_cache_path, key, resolved.inline)
@@ -2704,6 +2744,7 @@ fn run_extract(
 fn main() {
     let cli = Cli::parse();
     let cli_config = cli.config.clone();
+    let no_bundler = cli.no_bundler;
 
     match cli.command {
         Commands::Doc { command } => match command {
@@ -2770,7 +2811,7 @@ fn main() {
         Commands::Internal { command } => match command {
             InternalCommands::Snapshot { command } => match command {
                 InternalSnapshotCommands::Dump { project_root } => {
-                    run_snapshot_dump(&project_root, cli_config.as_deref());
+                    run_snapshot_dump(&project_root, cli_config.as_deref(), no_bundler);
                 }
             },
         },
@@ -2787,6 +2828,7 @@ fn main() {
             tamp,
         } => run_check(
             cli_config.as_deref(),
+            no_bundler,
             CheckInvocation {
                 files,
                 eval,
@@ -2803,6 +2845,7 @@ fn main() {
         ),
         Commands::Extract { eval } => run_check(
             cli_config.as_deref(),
+            no_bundler,
             CheckInvocation {
                 files: Vec::new(),
                 eval,
