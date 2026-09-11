@@ -692,6 +692,7 @@ impl<'env> TypeChecker<'env> {
         let mut positional = vec![];
         let mut positional_spans = vec![];
         let mut keywords = vec![];
+        let mut kwsplats = vec![];
         let mut splat_tail: Option<SplatTail> = None;
 
         let Some(arguments) = arguments else {
@@ -699,6 +700,7 @@ impl<'env> TypeChecker<'env> {
                 positional,
                 positional_spans,
                 keywords,
+                kwsplats,
                 has_block,
                 explicit_type_args: None,
                 splat_tail,
@@ -734,6 +736,18 @@ impl<'env> TypeChecker<'env> {
                                 arg_span(key_location.start_offset(), key_location.end_offset()),
                             ));
                         }
+                    } else if let Some(splat) = elem.as_assoc_splat_node()
+                        && let Some(value) = splat.value()
+                    {
+                        let value_type = self.infer_type(&value, None);
+                        self.extract_carry_argument(&value, value_type);
+                        kwsplats.push((
+                            value_type,
+                            arg_span(
+                                splat.location().start_offset(),
+                                splat.location().end_offset(),
+                            ),
+                        ));
                     }
                 }
             } else if let Some(splat) = arg.as_splat_node() {
@@ -785,6 +799,7 @@ impl<'env> TypeChecker<'env> {
             positional,
             positional_spans,
             keywords,
+            kwsplats,
             has_block,
             explicit_type_args: None,
             splat_tail,
@@ -896,6 +911,7 @@ impl<'env> TypeChecker<'env> {
         let mut positional: Vec<Ty> = vec![];
         let mut positional_spans = vec![];
         let mut keywords = vec![];
+        let mut kwsplats = vec![];
         let mut splat_tail: Option<SplatTail> = None;
         let has_block = node.block().is_some();
         // `#[T]` / `#$ T` trailing annotations only attach to CallNode
@@ -910,6 +926,7 @@ impl<'env> TypeChecker<'env> {
                 positional,
                 positional_spans,
                 keywords,
+                kwsplats,
                 has_block,
                 explicit_type_args,
                 splat_tail,
@@ -954,6 +971,18 @@ impl<'env> TypeChecker<'env> {
                                 arg_span(key_location.start_offset(), key_location.end_offset()),
                             ));
                         }
+                    } else if let Some(splat) = elem.as_assoc_splat_node()
+                        && let Some(value) = splat.value()
+                    {
+                        let value_type = self.infer_type(&value, None);
+                        self.extract_carry_argument(&value, value_type);
+                        kwsplats.push((
+                            value_type,
+                            arg_span(
+                                splat.location().start_offset(),
+                                splat.location().end_offset(),
+                            ),
+                        ));
                     }
                 }
             } else if let Some(splat) = arg.as_splat_node() {
@@ -1018,6 +1047,7 @@ impl<'env> TypeChecker<'env> {
             positional,
             positional_spans,
             keywords,
+            kwsplats,
             has_block,
             explicit_type_args,
             splat_tail,
@@ -1057,6 +1087,7 @@ impl<'env> TypeChecker<'env> {
                 func.required_positionals.len()
             ],
             keywords: vec![],
+            kwsplats: vec![],
             has_block: caller_mt.block.is_some(),
             explicit_type_args: self.lookup_callsite_type_args(node),
             splat_tail: None,
@@ -1900,6 +1931,103 @@ impl<'env> TypeChecker<'env> {
         }
     }
 
+    /// Port of Steep's `SendArgs#positional_arg` / `kwargs_node`
+    /// (`type_inference/send_args.rb`): when the overload declares no
+    /// keyword params (`keyword_params.empty?` — no required, optional,
+    /// or rest keyword), Ruby passes a braceless keyword hash as one
+    /// trailing positional Hash. Fold the collected keywords (and `**h`
+    /// splats) into one positional so arity / subtype / binding checks
+    /// see what the runtime sees. Per-overload: an overload that does
+    /// declare keywords keeps the keyword routing, so
+    /// `(Integer x) | (a: Integer)` still resolves `f(a: 1)` through the
+    /// keyword overload.
+    ///
+    /// Literal keywords alone fold to a `Type::Record`. Once a `**h` is
+    /// present the key set is not static, so the fold is a `Hash[K, V]`
+    /// merging the literal keys (`Symbol` / widened values) with each
+    /// splat's K / V (`absorb_kwsplat_ty`: Hash args, Record widened,
+    /// untyped dropped) — Steep's `type_hash` no-hint path. `**h` alone
+    /// therefore types as `h` itself.
+    ///
+    /// Returns `None` when nothing folds (no keywords / splats, overload
+    /// takes keywords, or `(?) -> untyped`) and when a splat tail is
+    /// present — `CallArguments` keeps the tail as the last positional,
+    /// and the folded hash would have to land after it; that shape stays
+    /// on the keyword path (residual false positive, tracked in the todo).
+    pub(super) fn fold_braceless_keywords_for(
+        &self,
+        arguments: &CallArguments,
+        overload: &crate::types::MethodType,
+    ) -> Option<CallArguments> {
+        if (arguments.keywords.is_empty() && arguments.kwsplats.is_empty())
+            || arguments.splat_tail.is_some()
+            || overload.is_untyped_function()
+            || !overload.required_keywords().is_empty()
+            || !overload.optional_keywords().is_empty()
+            || overload.rest_keyword().is_some()
+        {
+            return None;
+        }
+        let mut fields: Vec<(crate::types::RecordKey, Ty, bool)> = Vec::new();
+        for (name, ty, _, _) in &arguments.keywords {
+            let key = crate::types::RecordKey::Symbol(name.clone());
+            // Widen literal values (`a: 1` → Integer): the positional param
+            // is typically `Hash[Symbol, Integer]`, invariant in V, and
+            // Steep types the folded kwargs node with widened values too.
+            let ty = self.widen_literal(*ty);
+            match fields.iter_mut().find(|(k, _, _)| *k == key) {
+                // Duplicate literal key: Ruby keeps the last value.
+                Some(slot) => slot.1 = ty,
+                None => fields.push((key, ty, true)),
+            }
+        }
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        let folded_ty = if arguments.kwsplats.is_empty() {
+            self.env.types().intern(Type::Record { fields })
+        } else {
+            let mut key_members = Vec::new();
+            let mut value_members = Vec::new();
+            if !fields.is_empty() {
+                let record = self.widen_record_to_hash(&fields);
+                self.absorb_kwsplat_ty(record, &mut key_members, &mut value_members);
+            }
+            for (ty, _) in &arguments.kwsplats {
+                self.absorb_kwsplat_ty(*ty, &mut key_members, &mut value_members);
+            }
+            // Every contributor was untyped (or non-Hash): `Hash[untyped,
+            // untyped]`, which still occupies the positional slot.
+            let key_ty = self.union_of_members(&key_members);
+            let value_ty = self.union_of_members(&value_members);
+            self.env.types().intern(Type::ClassInstance {
+                name: self.env.names().builtins().hash,
+                args: vec![key_ty, value_ty],
+            })
+        };
+        let spans = arguments
+            .keywords
+            .iter()
+            .map(|(_, _, span, _)| *span)
+            .chain(arguments.kwsplats.iter().map(|(_, span)| *span));
+        let first = spans.clone().map(|s| s.0).min()?;
+        let last = spans.map(|s| s.1).max()?;
+        let mut folded = arguments.clone();
+        folded.positional.push(folded_ty);
+        folded.positional_spans.push((first, last));
+        folded.keywords.clear();
+        folded.kwsplats.clear();
+        Some(folded)
+    }
+
+    /// Union of an `absorb_kwsplat_ty` member pool; untyped when the pool
+    /// is empty (every contributor dropped).
+    fn union_of_members(&self, members: &[Ty]) -> Ty {
+        match members {
+            [] => Ty::UNTYPED,
+            [single] => *single,
+            _ => self.env.types().intern(Type::Union(members.to_vec())),
+        }
+    }
+
     /// Strict structural filtering shared by all three call-path consumers
     /// (`check_against_method_def`, `infer_return_type`, `lookup_block_type`).
     ///
@@ -1945,6 +2073,22 @@ impl<'env> TypeChecker<'env> {
             return vec![];
         }
 
+        // Per-overload view of the arguments: keyword-less overloads see
+        // the braceless keyword hash as a trailing positional Record.
+        let candidates: Vec<(
+            &crate::types::MethodType,
+            std::borrow::Cow<'_, CallArguments>,
+        )> = candidates
+            .into_iter()
+            .map(|o| {
+                let args = match self.fold_braceless_keywords_for(arguments, o) {
+                    Some(folded) => std::borrow::Cow::Owned(folded),
+                    None => std::borrow::Cow::Borrowed(arguments),
+                };
+                (o, args)
+            })
+            .collect();
+
         // Arity — strict. With a splat tail in scope, an exact `arg_count`
         // can't be enforced (the tail's length is unknown statically), so
         // the arity filter is relaxed:
@@ -1958,13 +2102,13 @@ impl<'env> TypeChecker<'env> {
         //     `(Integer, *Integer)` is a valid Ruby call.
         //   * non-untyped tail + no rest slot — reject (the tail has
         //     nowhere to land; matches Steep's `UnexpectedPositionalArgument`).
-        let arg_count = arguments.positional.len();
         let candidates: Vec<_> = candidates
             .into_iter()
-            .filter(|o| {
+            .filter(|(o, arguments)| {
                 if o.is_untyped_function() {
                     return true;
                 }
+                let arg_count = arguments.positional.len();
                 match &arguments.splat_tail {
                     None => o.arity_accepts(arg_count),
                     // Both untyped and non-untyped tails require a rest
@@ -1992,10 +2136,11 @@ impl<'env> TypeChecker<'env> {
         // runtime any tail element may end up in either slot.
         let candidates: Vec<_> = candidates
             .into_iter()
-            .filter(|o| {
+            .filter(|(o, arguments)| {
                 if o.is_untyped_function() {
                     return true;
                 }
+                let arg_count = arguments.positional.len();
                 let subst = |ty: Ty| {
                     let mut ty = base_subst.apply(ty, self.env.types());
                     if let Some(explicit) = self.explicit_type_bindings_for_overload(o, arguments) {
@@ -2045,7 +2190,7 @@ impl<'env> TypeChecker<'env> {
         // carries `**rest`.
         let candidates: Vec<_> = candidates
             .into_iter()
-            .filter(|o| {
+            .filter(|(o, arguments)| {
                 if o.is_untyped_function() {
                     return true;
                 }
@@ -2101,9 +2246,9 @@ impl<'env> TypeChecker<'env> {
 
         // Required-block presence — strict. A call without a block cannot
         // reach an overload whose block is required.
-        let candidates: Vec<_> = candidates
+        candidates
             .into_iter()
-            .filter(|o| {
+            .filter(|(o, _)| {
                 if let Some(block) = &o.block
                     && block.required
                     && !arguments.has_block
@@ -2112,9 +2257,8 @@ impl<'env> TypeChecker<'env> {
                 }
                 true
             })
-            .collect();
-
-        candidates
+            .map(|(o, _)| o)
+            .collect()
     }
 
     /// Full overload narrowing: strict structural filtering
@@ -2654,6 +2798,7 @@ impl<'env> TypeChecker<'env> {
             positional: arg_types,
             positional_spans,
             keywords: vec![],
+            kwsplats: vec![],
             has_block: false,
             explicit_type_args: None,
             splat_tail: None,
@@ -2828,6 +2973,7 @@ impl<'env> TypeChecker<'env> {
             positional: arg_types,
             positional_spans,
             keywords: vec![],
+            kwsplats: vec![],
             has_block: false,
             explicit_type_args: None,
             splat_tail: None,
@@ -3032,6 +3178,7 @@ impl<'env> TypeChecker<'env> {
                     arg_node.location().end_offset(),
                 )],
                 keywords: vec![],
+                kwsplats: vec![],
                 has_block: false,
                 explicit_type_args: None,
                 splat_tail: None,
@@ -3051,6 +3198,7 @@ impl<'env> TypeChecker<'env> {
                 arg_node.location().end_offset(),
             )],
             keywords: vec![],
+            kwsplats: vec![],
             has_block: false,
             explicit_type_args: None,
             splat_tail: None,
@@ -3493,6 +3641,12 @@ impl<'env> TypeChecker<'env> {
         }
 
         let first_overload = &method_def.defs[0].type_;
+        // Keyword-less overload: match the braceless keyword hash as one
+        // positional (see `fold_braceless_keywords_for`). `unfolded` is
+        // kept for the surplus case below, which reports per-keyword.
+        let unfolded = arguments;
+        let folded = self.fold_braceless_keywords_for(arguments, first_overload);
+        let arguments = folded.as_ref().unwrap_or(arguments);
         // `method_def.defs.len() > 1` already short-circuited to
         // `UnresolvedOverloading` above, so by this point there is
         // exactly one def and its `defined_in` unambiguously owns every
@@ -3510,6 +3664,7 @@ impl<'env> TypeChecker<'env> {
         // When arity is wrong, positional type checking is unreliable
         // because arguments are shifted — skip it to avoid cascade errors.
         let mut positional_arity_error = false;
+        let mut report_folded_keywords = false;
 
         // Splat tail handling. An unexpandable trailing splat (Array[E] or
         // opaque untyped) takes one of four paths:
@@ -3608,17 +3763,35 @@ impl<'env> TypeChecker<'env> {
                 && rest_type.is_none()
                 && arguments.positional.len() > max_len
             {
-                self.push_diagnostic(Diagnostic {
-                    scope: None,
-                    location: self.span_to_location(loc_span),
-                    kind: DiagnosticKind::UnexpectedPositionalArgument {
-                        method_name: method_name.to_string(),
-                        expected: max_len,
-                        actual: arguments.positional.len(),
-                        defined_in: Some(defined_in.clone()),
-                    },
-                });
-                positional_arity_error = true;
+                // Steep (`send_args.rb` `PositionalArgs::UnexpectedArg` with
+                // a `:kwargs` node): when the surplus positional is the
+                // folded keyword hash, report each keyword as
+                // `UnexpectedKeywordArgument` — the user wrote keywords,
+                // so point at them rather than at an invisible Hash.
+                // Emitted after the per-positional check below so
+                // diagnostics stay in source order.
+                let surplus_is_folded_hash = folded.is_some();
+                report_folded_keywords = surplus_is_folded_hash;
+                let plain_surplus =
+                    arguments.positional.len() - usize::from(surplus_is_folded_hash);
+                if plain_surplus > max_len {
+                    self.push_diagnostic(Diagnostic {
+                        scope: None,
+                        location: self.span_to_location(loc_span),
+                        kind: DiagnosticKind::UnexpectedPositionalArgument {
+                            method_name: method_name.to_string(),
+                            expected: max_len,
+                            actual: plain_surplus,
+                            defined_in: Some(defined_in.clone()),
+                        },
+                    });
+                    positional_arity_error = true;
+                }
+                // When only the folded hash overflows, the prefix slots
+                // are determinate (same reasoning as the splat-tail arm
+                // above), so `f("bad", color: "x")` against `(Integer)`
+                // still reports the mismatch on `"bad"` alongside the
+                // unexpected keyword.
             }
         }
 
@@ -3652,6 +3825,20 @@ impl<'env> TypeChecker<'env> {
                         },
                     });
                 }
+            }
+        }
+
+        if report_folded_keywords {
+            for (keyword_name, _, _, keyword_name_span) in &unfolded.keywords {
+                self.push_diagnostic(Diagnostic {
+                    scope: None,
+                    location: self.span_to_location(*keyword_name_span),
+                    kind: DiagnosticKind::UnexpectedKeywordArgument {
+                        method_name: method_name.to_string(),
+                        keyword: keyword_name.clone(),
+                        defined_in: Some(defined_in.clone()),
+                    },
+                });
             }
         }
 
@@ -4245,6 +4432,24 @@ impl<'env> TypeChecker<'env> {
     /// present, otherwise `None` (unbound). Rest gets `Array[union of remaining
     /// expected_params]`, or `Array[bot]` when no params remain after requireds.
     /// This handles `|*b|` (rest-only) correctly: rest gets `Array[expected_params[0]]`.
+    /// `block_param_types` when the call's block type resolved; every param
+    /// UNTYPED otherwise, so an unresolvable block never invents a binding
+    /// (e.g. `Array[bot]` for `*rest`) that could surface a new diagnostic.
+    fn unresolved_or_block_param_types(
+        &self,
+        expected_block: Option<&Block>,
+        requireds_count: usize,
+        rest_present: bool,
+    ) -> (Vec<Option<Ty>>, Option<Ty>) {
+        match expected_block {
+            Some(block) => self.block_param_types(block.params(), requireds_count, rest_present),
+            None => (
+                vec![Some(Ty::UNTYPED); requireds_count],
+                rest_present.then_some(Ty::UNTYPED),
+            ),
+        }
+    }
+
     pub(super) fn block_param_types(
         &self,
         expected_params: &[Ty],
@@ -4326,6 +4531,16 @@ impl<'env> TypeChecker<'env> {
     }
 
     /// Push a block scope and bind block parameters. Returns true if scope was pushed.
+    ///
+    /// The scope is pushed for every `BlockNode`, even when the block type
+    /// cannot be resolved (untyped receiver, sig without a block, unresolved
+    /// method on self). The body is walked regardless, and prism's
+    /// `LocalVariableWriteNode#depth` counts every enclosing block, so the
+    /// scope stack must have a matching `ScopeKind::Block` or an outer-lvar
+    /// write inside the block overshoots the stack (`set_local_variable_at_depth`)
+    /// and is dropped. Params bind UNTYPED in that case, mirroring the
+    /// hintless arm of `check_lambda_node`. Only a `&blk` argument
+    /// (`BlockArgumentNode`, no body) skips the push.
     pub(super) fn setup_block_scope<'pr>(
         &mut self,
         node: CallSite<'_, 'pr>,
@@ -4338,15 +4553,11 @@ impl<'env> TypeChecker<'env> {
         let Some(block) = block_node.as_block_node() else {
             return false;
         };
-        let Some(target) = target else {
-            return false;
-        };
-        let Some(expected_block) = self.lookup_block_type(node, target, call_hint) else {
-            return false;
-        };
+        let expected_block =
+            target.and_then(|target| self.lookup_block_type(node, target, call_hint));
 
         self.ctx.push_scope(ScopeKind::Block);
-        if let Some(self_ty) = expected_block.self_type {
+        if let Some(self_ty) = expected_block.as_ref().and_then(|b| b.self_type) {
             // A `[self: self]` block binding substitutes to SELF_TYPE via
             // `substitution_for_call_receiver`. Concretize it before storing as
             // the override: `current_self_type()` must never become the opaque
@@ -4363,8 +4574,11 @@ impl<'env> TypeChecker<'env> {
             {
                 let requireds = params.requireds();
                 let rest_present = params.rest().is_some();
-                let (param_types, rest_ty) =
-                    self.block_param_types(expected_block.params(), requireds.len(), rest_present);
+                let (param_types, rest_ty) = self.unresolved_or_block_param_types(
+                    expected_block.as_ref(),
+                    requireds.len(),
+                    rest_present,
+                );
                 for (index, param) in requireds.iter().enumerate() {
                     if let Some(required) = param.as_required_parameter_node()
                         && let Some(Some(expected_type)) = param_types.get(index).copied()
@@ -4392,7 +4606,8 @@ impl<'env> TypeChecker<'env> {
                 // bind (UNTYPED when the block yields nothing) so a nested
                 // implicit `it` can't fall through `lookup_local_variable` to an
                 // enclosing block's `it`.
-                let (param_types, _) = self.block_param_types(expected_block.params(), 1, false);
+                let (param_types, _) =
+                    self.unresolved_or_block_param_types(expected_block.as_ref(), 1, false);
                 let it_ty = param_types
                     .first()
                     .copied()
@@ -4415,7 +4630,7 @@ impl<'env> TypeChecker<'env> {
                 // can't fall through to an enclosing binding.
                 let count = numbered.maximum() as usize;
                 let (param_types, _) =
-                    self.block_param_types(expected_block.params(), count, false);
+                    self.unresolved_or_block_param_types(expected_block.as_ref(), count, false);
                 for index in 0..count {
                     let ty = param_types
                         .get(index)

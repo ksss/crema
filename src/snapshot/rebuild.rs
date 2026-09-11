@@ -375,6 +375,17 @@ pub(crate) struct Decoder<'t> {
     /// rebuild, where every real decl is already covered by G's own
     /// entries.
     g: Option<&'t GSnapshotBackend>,
+    /// Lazy per-entry decode (warm point probes): leave
+    /// `MBodyMember::Declaration` refs out of the parent's `members`
+    /// instead of materializing the nested subtree. Every nested decl
+    /// has its own flattened G entry, and no warm reader walks the
+    /// inline copy (`fingerprint` never enters G-origin `context_decls`,
+    /// see its `is_a_layer_origin` filter; the ActiveRecord synthesis
+    /// that does walk it is cold-only and reads through `class_all`,
+    /// i.e. `with_nested_cache`). Materializing
+    /// the subtree turned 362 touched classes into 5,264 decodes on the
+    /// gitlab workload.
+    omit_nested: bool,
 }
 
 impl<'t> Decoder<'t> {
@@ -385,6 +396,16 @@ impl<'t> Decoder<'t> {
             nested_out: None,
             depth: 0,
             g: None,
+            omit_nested: false,
+        }
+    }
+
+    /// Decoder for a warm per-entry probe: nested decl refs are omitted
+    /// from the decoded parent (see [`Self::omit_nested`]).
+    pub(crate) fn lazy(tables: &'t DecodeTables) -> Self {
+        Decoder {
+            omit_nested: true,
+            ..Self::new(tables)
         }
     }
 
@@ -398,6 +419,7 @@ impl<'t> Decoder<'t> {
             nested_out: Some(nested_out),
             depth: 0,
             g: None,
+            omit_nested: false,
         }
     }
 
@@ -1339,6 +1361,7 @@ impl<'t> Decoder<'t> {
     ) -> Result<cd::ClassDeclaration, RebuildError> {
         let mut child_ctx: Vec<Tn> = own_ctx.to_vec();
         child_ctx.push(d.name);
+        let omit_nested = self.omit_nested;
         Ok(cd::ClassDeclaration {
             name: self.tn(d.name)?,
             type_params: self.type_params(&d.type_params)?,
@@ -1350,6 +1373,7 @@ impl<'t> Decoder<'t> {
             members: d
                 .members
                 .iter()
+                .filter(|m| !(omit_nested && matches!(m, MBodyMember::Declaration(_))))
                 .map(|m| {
                     Ok(match m {
                         MBodyMember::Member(m) => cd::ClassMember::Member(self.member(m)?),
@@ -1381,6 +1405,7 @@ impl<'t> Decoder<'t> {
     ) -> Result<cd::ModuleDeclaration, RebuildError> {
         let mut child_ctx: Vec<Tn> = own_ctx.to_vec();
         child_ctx.push(d.name);
+        let omit_nested = self.omit_nested;
         Ok(cd::ModuleDeclaration {
             name: self.tn(d.name)?,
             type_params: self.type_params(&d.type_params)?,
@@ -1392,6 +1417,7 @@ impl<'t> Decoder<'t> {
             members: d
                 .members
                 .iter()
+                .filter(|m| !(omit_nested && matches!(m, MBodyMember::Declaration(_))))
                 .map(|m| {
                     Ok(match m {
                         MBodyMember::Member(m) => cd::ModuleMember::Member(self.member(m)?),

@@ -564,8 +564,11 @@ impl GSnapshotBackend {
         Ok(out)
     }
 
+    /// Warm point probe: the decoded entry carries its own members only —
+    /// nested decls stay behind their `MDeclRef` and are read from their
+    /// own entries (`Decoder::lazy`).
     fn decode_class_entry(&self, name: TypeName) -> Result<Option<ClassOrModule>, RebuildError> {
-        let mut dec = Decoder::new(&self.tables);
+        let mut dec = Decoder::lazy(&self.tables);
         let memo = AppendMap::default();
         self.decode_class_entry_with(name, &mut dec, &memo)
     }
@@ -982,16 +985,19 @@ impl GSnapshotBackend {
             let mut names: Vec<TypeName> = self.class_kinds.keys().copied().collect();
             names.sort_by_cached_key(|n| self.tn_depth(n.get()));
             let mut dec = Decoder::with_nested_cache(&self.tables, &self.nested_decls);
+            // Never reuse `class_cache` here: a value it holds came from a
+            // lazy point probe (`Decoder::lazy`), whose parent decl omits
+            // its nested decls — decode-all must hand out the rbs-shaped
+            // inline form, so every entry is re-decoded with the nested
+            // cache. Once `class_all` is set, `class_entry` reads from it
+            // and the point cache is dead weight anyway.
             names
                 .into_iter()
                 .map(|name| {
-                    let v = match self.class_cache.get(&name) {
-                        Some(v) => v.clone(),
-                        None => self.expect_decoded(
-                            "class entry",
-                            self.decode_class_entry_with(name, &mut dec, &memo),
-                        ),
-                    };
+                    let v = self.expect_decoded(
+                        "class entry",
+                        self.decode_class_entry_with(name, &mut dec, &memo),
+                    );
                     (name, v)
                 })
                 .collect()

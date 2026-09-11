@@ -51,7 +51,7 @@ struct Cli {
 enum DocCommands {
     /// Reference for crema.toml keys
     Config,
-    /// Reference for the `.crema/extract.json` schema written by `crema extract`
+    /// Reference for the document schema printed by `crema extract`
     Extract,
     /// Reference for diagnostic codes: bare form lists every code as JSONL,
     /// or pass a code (e.g. `Ruby::NoMethod`) to get its markdown doc
@@ -159,17 +159,16 @@ enum Commands {
         tamp: bool,
     },
     /// Export check-internal facts (definitions, implements,
-    /// method-call sites, consulted symbols) as one JSON document at
-    /// `.crema/extract.json`; stdout carries a one-line machine-readable
-    /// summary. Scope and environment come from crema.toml exactly like
-    /// `crema check`. With `-e`, the document for the snippet alone goes
-    /// to stdout instead (nothing is written to `.crema/`).
+    /// method-call sites, consulted symbols) as one JSON document on
+    /// stdout. The document is large (tens of MB on a big project), so
+    /// redirect or pipe it. Scope and environment come from crema.toml
+    /// exactly like `crema check`. With `-e`, the document covers the
+    /// snippet alone.
     Extract {
         /// Extract from inline Ruby code instead of the config scope:
-        /// the whole document (`files` holding just the `-e`
-        /// pseudo-file) is printed to stdout and `.crema/extract.json`
-        /// is left untouched. The scope's RBS environment is still
-        /// built, so the snippet sees project types.
+        /// `files` holds just the `-e` pseudo-file. The scope's RBS
+        /// environment is still built, so the snippet sees project
+        /// types.
         #[arg(short = 'e')]
         eval: Option<String>,
     },
@@ -2579,12 +2578,11 @@ impl<'a> ParsedSource<'a> {
 /// The per-file phase of `crema extract` (invoked from `run_check`
 /// after env construction): run the site-collecting check on every
 /// scope file with consultation recording on, join in the per-file
-/// definitions from the environment, write the whole document to
-/// `.crema/extract.json`, and print the one-line summary.
+/// definitions from the environment, and print the whole document to
+/// stdout as one JSON value. Nothing is persisted.
 ///
 /// In `-e` mode (`eval_active`) the document is narrowed to the `-e`
-/// pseudo-file and printed to stdout instead: no `.crema/extract.json`
-/// write, no summary line, so stdout stays parsable as one JSON value.
+/// pseudo-file.
 ///
 /// Every file is checked fresh — the incremental cache is neither read
 /// nor narrowed here. Extract is opt-in and allowed to be slower than
@@ -2705,40 +2703,17 @@ fn run_extract(
         files,
     };
     let bytes = serde_json::to_vec(&output).expect("extract document serialize is infallible");
-    if eval_active {
-        // Scratch query: stdout carries the document itself, so nothing
-        // else may share it (no summary line) and nothing is persisted
-        // — an existing `.crema/extract.json` stays as it was, and a
-        // zero-config run never creates `.crema/`.
-        let mut out = std::io::stdout().lock();
-        if let Err(err) = out.write_all(&bytes).and_then(|()| out.write_all(b"\n"))
-            && err.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            eprintln!("error: failed to write extract document: {err}");
-            process::exit(2);
-        }
-        return;
-    }
-    let out_path = project_root.join(crema::extract::EXTRACT_FILE);
-    if let Some(parent) = out_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+    // stdout carries the document itself and nothing else (no summary
+    // line), in every mode: nothing is persisted, and a zero-config
+    // `-e` run never creates `.crema/`. A consumer closing the pipe
+    // early (`| head`) is not an error.
+    let mut out = std::io::stdout().lock();
+    if let Err(err) = out.write_all(&bytes).and_then(|()| out.write_all(b"\n"))
+        && err.kind() != std::io::ErrorKind::BrokenPipe
     {
-        eprintln!("error: failed to create {}: {e}", parent.display());
+        eprintln!("error: failed to write extract document: {err}");
         process::exit(2);
     }
-    if let Err(e) = crema::atomic_write::write_atomic_bytes(&out_path, &bytes) {
-        eprintln!("error: failed to write {}: {e}", out_path.display());
-        process::exit(2);
-    }
-
-    // Hand-ordered keys (path, files, bytes), values through serde_json
-    // for escaping.
-    println!(
-        "{{\"path\":{},\"files\":{},\"bytes\":{}}}",
-        serde_json::to_string(&display(&out_path)).expect("string serialize is infallible"),
-        output.files.len(),
-        bytes.len(),
-    );
 }
 
 fn main() {

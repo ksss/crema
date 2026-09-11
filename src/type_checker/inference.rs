@@ -5163,6 +5163,7 @@ impl<'env> TypeChecker<'env> {
                         value_node.location().end_offset(),
                     )],
                     keywords: vec![],
+                    kwsplats: vec![],
                     has_block: false,
                     explicit_type_args: None,
                     splat_tail: None,
@@ -5759,6 +5760,8 @@ impl<'env> TypeChecker<'env> {
         receiver_bindings: &FxHashMap<crate::type_param::TypeVarKey, Ty>,
     ) -> FxHashMap<crate::type_param::TypeVarKey, Ty> {
         let mut call_site: FxHashMap<crate::type_param::TypeVarKey, Ty> = FxHashMap::default();
+        let folded = self.fold_braceless_keywords_for(arguments, overload);
+        let arguments = folded.as_ref().unwrap_or(arguments);
         let arg_count = arguments.positional.len();
 
         for (index, &actual) in arguments.positional.iter().enumerate() {
@@ -7048,7 +7051,12 @@ impl<'env> TypeChecker<'env> {
     /// `Hash[K1,V1] | Hash[K2,V2]` still merges both branches. Anything
     /// else (untyped, mismatched class) drops silently — Steep
     /// `type_construction.rb:5241-5258` (`reject! { Any }`) parity.
-    fn absorb_kwsplat_ty(&self, ty: Ty, key_members: &mut Vec<Ty>, value_members: &mut Vec<Ty>) {
+    pub(super) fn absorb_kwsplat_ty(
+        &self,
+        ty: Ty,
+        key_members: &mut Vec<Ty>,
+        value_members: &mut Vec<Ty>,
+    ) {
         let resolved = self
             .env
             .types()

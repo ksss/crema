@@ -3,8 +3,8 @@
 //! The check pipeline computes definition, reference-resolution, and
 //! consultation information and normally discards it. `crema extract`
 //! runs the same pipeline (`run_check` in main.rs, shared with `crema
-//! check`) and writes the per-file facts to `.crema/extract.json` so
-//! external programs (Ruby + jq) can build find-references / dead-code
+//! check`) and prints the per-file facts as one JSON document on
+//! stdout so external programs (Ruby + jq) can build find-references / dead-code
 //! / coverage / layering tools without crema growing a subcommand per
 //! use case (`crema references` was such a subcommand; it was removed
 //! once `method_call[].symbol` answered the same question).
@@ -71,11 +71,8 @@ use crate::name::{Name, NameTable};
 use crate::type_name::TypeName;
 
 
-/// Version of the `.crema/extract.json` schema.
+/// Version of the extract document schema.
 pub const EXTRACT_SCHEMA_VERSION: u32 = 6;
-
-/// Relative location of the export, fixed in v1 (no `-o` override).
-pub const EXTRACT_FILE: &str = ".crema/extract.json";
 
 /// `state` variant of a [`MethodCallRecord`], after Steep's
 /// `TypeInference::MethodCall` class hierarchy (`method_call.rb`:
@@ -251,7 +248,7 @@ pub struct FileRecord {
     pub consulted: Vec<String>,
 }
 
-/// The whole `.crema/extract.json` document.
+/// The whole extract document.
 #[derive(Debug, Serialize)]
 pub struct ExtractOutput {
     pub version: u32,

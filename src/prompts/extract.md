@@ -1,30 +1,30 @@
 # crema doc extract
 
-`crema extract` runs the same pipeline as `crema check` and exports the per-file facts the check computed — definitions, implements, state-tagged method-call sites, and consulted symbols — to a single JSON document at `.crema/extract.json`. Read that file with jq or any JSON library to build tools (references, dead-code detection, call coverage, dependency graphs) without crema growing a subcommand per use case. stdout carries only a one-line summary (`{"path":".crema/extract.json","files":N,"bytes":N}`); the document always goes to the fixed path.
+`crema extract` runs the same pipeline as `crema check` and exports the per-file facts the check computed — definitions, implements, state-tagged method-call and constant-read sites, and consulted symbols — as a single JSON document on stdout. Pipe it into jq or redirect it to a file (`crema extract > extract.json`) and build tools (references, dead-code detection, call coverage, dependency graphs) on top, without crema growing a subcommand per use case. The document is large — tens of MB on a big project, one record per call site — so do not read it straight into a context window; always redirect or pipe. stdout is one JSON value and nothing else (warnings go to stderr).
 
 ## Scratch queries (`-e`)
 
-`crema extract -e '<ruby code>'` answers "what type does this expression have?" for code that is not in a file yet. It builds the same environment as a bare `crema extract` (so project types are in scope), checks only the snippet, and prints the whole document to stdout instead of writing it — `files` holds exactly one entry, keyed `"-e"`. Nothing under `.crema/` is read, written, or created, so an existing `.crema/extract.json` is left untouched and the command works in a directory with no `crema.toml` at all.
+`crema extract -e '<ruby code>'` answers "what type does this expression have?" for code that is not in a file yet. It builds the same environment as a bare `crema extract` (so project types are in scope), and checks only the snippet — `files` holds exactly one entry, keyed `"-e"`. Nothing under `.crema/` is read, written, or created, so the command works in a directory with no `crema.toml` at all.
 
 ```
 crema extract -e '[1, 2].map { _1.to_s }' | jq -r '.files["-e"].method_call[].return_type'
 ```
 
-stdout is one JSON value and nothing else (warnings go to stderr), so it pipes straight into `jq`. Type errors in the snippet are not reported here — extract discards diagnostics in every mode; run `crema check -e '<ruby code>'` for those. A snippet that fails to parse is not an error either: its entry comes back with every record array empty, indistinguishable from code that simply had nothing to record, so use `crema check -e` when an empty answer is surprising.
+Type errors in the snippet are not reported here — extract discards diagnostics in every mode; run `crema check -e '<ruby code>'` for those. A snippet that fails to parse is not an error either: its entry comes back with every record array empty, indistinguishable from code that simply had nothing to record, so use `crema check -e` when an empty answer is surprising.
 
 ## Document shape
 
 ```json
 {
-  "version": 4,
+  "version": 6,
   "root": "/absolute/path/to/project",
   "files": {
-    "lib/user.rb": { "content_hash": "…", "definitions": [], "implements": [], "method_call": [], "consulted": [] }
+    "lib/user.rb": { "content_hash": "…", "definitions": [], "implements": [], "method_call": [], "constant": [], "consulted": [] }
   }
 }
 ```
 
-- `version` — Integer. Schema version of the document; this page describes version 4.
+- `version` — Integer. Schema version of the document; this page describes version 6.
 - `root` — String. Base directory the `files` keys are relative to.
 - `files` — Object. One entry per file in the check scope, keyed by relative path. Files that fail to parse still get an entry (with whatever facts were recoverable), so the key set is the full scope.
 
@@ -38,6 +38,7 @@ All `start_byte`/`end_byte` pairs are byte offsets into the file; `end_byte` is 
 - `definitions` — Array. Symbols this file declares.
 - `implements` — Array. Ruby `def` sites and constant assignments in this file.
 - `method_call` — Array. Every call/super site in this file, tagged with a `state`.
+- `constant` — Array. Every constant read site in this file, tagged with a `state`.
 - `consulted` — Array of String. Every symbol the check of this file touched.
 
 ### definitions
@@ -79,22 +80,40 @@ One record per call/super site the check touched, tagged with a `state`. A union
 
 `method_call` records every dispatched call, including the synthetic dispatches a compound write implies: `h[k] ||= v` records both `[]` and `[]=` on the write line, and an operator write (`x += 1`, `@x += 1`) records the operator method (`+`). One exception remains: `case`/`when` narrows without recording an implied `===` (crema performs no dispatch there). A compound write on an untyped receiver has no record (only real call sites feed the `untyped` state), and a site the check itself stays silent about (e.g. a control-flow-bottom receiver) has no record either.
 
+### constant
+
+One record per constant *read* site the check touched, tagged with a `state` — the constant sibling of `method_call`'s taxonomy. Reads only: the target of an assignment (`X = 1`, `A::B = 2`) belongs to `implements`, and the superclass position of `class Sub < Base` records nothing here (an extension point, not an omission to work around).
+
+- `state` — String. One of:
+  - `typed` — the constant resolved and the check emitted no diagnostic for the read.
+  - `error` — the read resolved (so `symbol` is present) but the check diagnosed the site itself; today that is a read of a constant marked deprecated.
+  - `unknown_constant` — resolution was attempted and found nothing (the UnknownConstant diagnostic fired). No `symbol` — there is nothing to name.
+  - `untyped` — resolution was never completed: a dynamic parent (`Billing.name::Dyn`) that cannot be walked statically, or an untyped value partway down the path. This is the honesty column, as in `method_call`.
+- `start_byte`, `end_byte` — span of the constant node. A path node spans the whole `A::B::C`, not just the leaf.
+- `path` — String. The constant as written in source (`Billing::MAX`), keeping the leading `::` of an absolute path. Present in every state — it is all a failed resolution has to offer.
+- `symbol` — String, `typed` / `error` states only (key absent otherwise). The constant the read resolved to, in absolute RBS syntax (`::Billing::MAX`).
+- `type` — String. The type the check computed for the read (`::Integer`, `singleton(::Billing)`). The key is absent in the `unknown_constant` and `untyped` states — unlike `method_call`'s `return_type`, which spells an uncomputed value `null`.
+
+A constant used as a call receiver records on its own span, so `Billing.name::Dyn` yields two records: `typed` for `Billing`, and `untyped` for the whole path. Only the read itself records, once — the check's internal peeks at a receiver do not each add a record.
+
 ### consulted
 
 Deduped, sorted, positionless symbol strings: every type and method the check consulted while checking this file, including implicit dependencies that never appear as source occurrences — ancestor chains, alias expansion, and the types referenced by the file's own `def` signatures. Symbols whose lookup found nothing are included too; a miss is still a dependency. Dependency-graph and invalidation consumers must read this array, not `method_call`.
 
 ## Recipes
 
+Each recipe reads a saved document (`crema extract > extract.json`); replace `extract.json` with `<(crema extract)` or pipe directly for one-shot queries.
+
 Per-file call sites by state:
 
 ```bash
-jq -r '.files | to_entries[] | [.key, ([.value.method_call[] | select(.state == "typed")] | length), ([.value.method_call[] | select(.state != "typed")] | length)] | @tsv' .crema/extract.json
+jq -r '.files | to_entries[] | [.key, ([.value.method_call[] | select(.state == "typed")] | length), ([.value.method_call[] | select(.state != "typed")] | length)] | @tsv' extract.json
 ```
 
 All call sites landing on one method:
 
 ```bash
-jq -r '.files | to_entries[] | .key as $f | .value.method_call[] | select(.symbol == "::User#save") | "\($f):\(.start_byte)"' .crema/extract.json
+jq -r '.files | to_entries[] | .key as $f | .value.method_call[] | select(.symbol == "::User#save") | "\($f):\(.start_byte)"' extract.json
 ```
 
 Dead-definition candidates — project-declared methods no file's call sites or consulted set mention (verify candidates manually; reflective and external entry points have no call sites):
@@ -107,5 +126,5 @@ jq -r '
   | select(.kind | endswith("_method"))
   | select(.symbol as $s | $used | index($s) | not)
   | "\($f):\(.start_byte)\t\(.symbol)"
-' .crema/extract.json
+' extract.json
 ```

@@ -57,6 +57,13 @@ pub(super) struct CallArguments {
     positional: Vec<Ty>,
     positional_spans: Vec<ArgSpan>,
     keywords: Vec<(String, Ty, ArgSpan, ArgSpan)>,
+    /// `**h` elements of the braceless keyword hash, as (value type,
+    /// span). Only `fold_braceless_keywords_for` reads them: a
+    /// keyword-less overload folds them (with `keywords`) into one
+    /// positional `Hash[K, V]`. Keyword-bearing overloads ignore them
+    /// (Steep's `KeywordArgs::SplatArg` side is a separate todo), so
+    /// `f(**h)` against `(a: Integer)` still reports the missing `a`.
+    kwsplats: Vec<(Ty, ArgSpan)>,
     has_block: bool,
     explicit_type_args: Option<Vec<Ty>>,
     /// Unexpandable trailing splat: `f(a, *xs)` where `xs: Array[E]` (or
