@@ -21,5 +21,6 @@ mod zeitwerk_synthesis;
 
 pub use inflector::{Inflector, OwnedOrDefault, build_for_config};
 pub use pipeline::{
-    SourceUnit, collect, load, load_all, load_all_with_options, load_all_with_schema,
+    CollectedSource, SourceUnit, collect, collect_source, load, load_all, load_all_with_options,
+    load_all_with_schema, load_collected,
 };

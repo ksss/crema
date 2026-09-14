@@ -2,7 +2,7 @@ use ruby_prism::{ArgumentsNode, CallNode, Location, Node, SuperNode, Visit};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::ruby::annotations::TypeApplicationAnnotation;
-use crate::context::ScopeKind;
+
 use crate::definition_builder;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, ForwardingMismatchKind};
 use crate::inline_parser::TrailingAnnotation;
@@ -538,8 +538,8 @@ impl<'env> TypeChecker<'env> {
     }
 
     fn lower_annotation_args(&self, annotation: &TypeApplicationAnnotation) -> Vec<Ty> {
-        let context = super::visitor::build_lowering_context_from_class_stack(
-            self.ctx.class_stack(),
+        let context = super::visitor::build_lowering_context_from_cref_stack(
+            self.ctx.cref_stack(),
             self.env.names(),
         );
         annotation
@@ -4556,7 +4556,7 @@ impl<'env> TypeChecker<'env> {
         let expected_block =
             target.and_then(|target| self.lookup_block_type(node, target, call_hint));
 
-        self.ctx.push_scope(ScopeKind::Block);
+        self.push_block_scope();
         if let Some(self_ty) = expected_block.as_ref().and_then(|b| b.self_type) {
             // A `[self: self]` block binding substitutes to SELF_TYPE via
             // `substitution_for_call_receiver`. Concretize it before storing as

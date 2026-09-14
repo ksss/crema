@@ -7296,7 +7296,7 @@ impl<'env> TypeChecker<'env> {
         if let Some(lambda) = node.as_lambda_node() {
             let param_tys = self.lambda_walk_param_types(&lambda, hint);
             let overlay = self.lambda_param_overlay(lambda.parameters(), &param_tys);
-            self.ctx.push_scope(ScopeKind::Block);
+            self.push_block_scope();
             for (name, ty) in overlay {
                 self.ctx.set_local_variable(name, ty);
             }
@@ -7656,7 +7656,7 @@ impl<'env> TypeChecker<'env> {
         let start_byte = node.location().start_offset() as u32;
         let names = self.env.names();
         let sym = names.intern_symbol(name_str);
-        let context = constant_context_from_class_stack(self.ctx.class_stack());
+        let context = constant_context_from_class_stack(self.ctx.cref_stack());
         match self.env.resolve_constant(sym, &context) {
             Some(constant) => {
                 self.verbose_log(format_args!(
@@ -7716,7 +7716,7 @@ impl<'env> TypeChecker<'env> {
             }
             None => {
                 let position = self.byte_range_to_location(start_offset, end_offset);
-                let context = constant_context_from_class_stack(self.ctx.class_stack());
+                let context = constant_context_from_class_stack(self.ctx.cref_stack());
                 let candidate_scope = CandidateScope::Context(context);
                 let searched_namespaces = self.searched_namespaces_for_scope(&candidate_scope);
                 self.record_extract_constant(
@@ -7793,7 +7793,7 @@ impl<'env> TypeChecker<'env> {
     ) -> bool {
         let names = self.env.names();
         let sym = names.intern_symbol(name_str);
-        let context = constant_context_from_class_stack(self.ctx.class_stack());
+        let context = constant_context_from_class_stack(self.ctx.cref_stack());
         let Some(constant) = self.env.resolve_constant(sym, &context) else {
             return false;
         };
@@ -7915,7 +7915,7 @@ impl<'env> TypeChecker<'env> {
     /// `crate::diagnostic::join_did_you_mean` at output time (ADR-0032
     /// Decision 5a), so this never touches the constant table.
     pub(super) fn candidate_scope_in_current_scope(&self) -> CandidateScope {
-        let context = constant_context_from_class_stack(self.ctx.class_stack());
+        let context = constant_context_from_class_stack(self.ctx.cref_stack());
         CandidateScope::Context(context)
     }
 
@@ -7929,7 +7929,7 @@ impl<'env> TypeChecker<'env> {
     /// already been pushed, so the name being declared is dropped to look
     /// at its siblings. Building-only, see `candidate_scope_in_current_scope`.
     pub(super) fn candidate_scope_in_enclosing_scope(&self) -> CandidateScope {
-        let stack = self.ctx.class_stack();
+        let stack = self.ctx.cref_stack();
         let outer = &stack[..stack.len().saturating_sub(1)];
         CandidateScope::Context(constant_context_from_class_stack(outer))
     }
@@ -8001,9 +8001,22 @@ impl<'env> TypeChecker<'env> {
         outcome: &ConstantPathOutcome,
         leaf_kind: Option<crate::diagnostic::ConstantKind>,
     ) {
-        use crate::extract::constant_state;
         self.emit_constant_path_outcome(outcome, leaf_kind);
         let deprecated = self.check_deprecated_constant_path(path, outcome);
+        self.record_extract_constant_path_outcome(path, outcome, deprecated);
+    }
+
+    /// Record a constant-path site for extract mode from its resolution
+    /// outcome. Shared by the read finisher above and the superclass
+    /// position (`class Sub < A::B`), which emits its diagnostics
+    /// separately and never runs the deprecation check.
+    pub(super) fn record_extract_constant_path_outcome<'pr>(
+        &mut self,
+        path: &ruby_prism::ConstantPathNode<'pr>,
+        outcome: &ConstantPathOutcome,
+        deprecated: bool,
+    ) {
+        use crate::extract::constant_state;
         if self.extract.is_none() {
             return;
         }
@@ -8106,7 +8119,7 @@ impl<'env> TypeChecker<'env> {
         let context = if is_absolute {
             ConstantContext::toplevel()
         } else {
-            constant_context_from_class_stack(self.ctx.class_stack())
+            constant_context_from_class_stack(self.ctx.cref_stack())
         };
         let names = self.env.names();
         let head_sym = names.intern_symbol(&segments[0].0);

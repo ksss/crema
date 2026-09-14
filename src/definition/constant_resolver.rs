@@ -28,7 +28,7 @@
 //! including class — rbs `constant_resolver.rb` L151-156).
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::sync::{Arc, OnceLock};
 
 use crate::environment::Environment;
@@ -941,6 +941,15 @@ pub struct ConstantResolver {
     object: TypeName,
     context_constants_cache: RefCell<FxHashMap<ConstantContext, Arc<ConstantsMap>>>,
     child_constants_cache: RefCell<FxHashMap<TypeName, Arc<ConstantsMap>>>,
+    /// `::Object`'s children merged with `toplevel` — the
+    /// context-independent prefix every `constants_from_ancestors`
+    /// merge starts from (rbs L182-184). Built once per resolver
+    /// generation and cloned into each context's map instead of
+    /// re-inserting every toplevel constant per context: on gitlab
+    /// that was 900 inserts (with growth rehashes) for each of 5,715
+    /// contexts. Not a cache lane rbs has; the per-context maps it
+    /// produces are identical to rbs's.
+    ancestors_seed: OnceCell<Arc<ConstantsMap>>,
 }
 
 impl ConstantResolver {
@@ -977,6 +986,7 @@ impl ConstantResolver {
             object,
             context_constants_cache: RefCell::new(FxHashMap::default()),
             child_constants_cache: RefCell::new(FxHashMap::default()),
+            ancestors_seed: OnceCell::new(),
         }
     }
 
@@ -1189,23 +1199,35 @@ impl ConstantResolver {
             Some(crate::environment::frozen::ClassOrModule::Class(_))
         );
 
-        if entry_is_class_or_module {
-            if let Some(object_children) = self.table.children(&self.object) {
-                merge_into(consts, &object_children);
-            }
-            merge_into(consts, &self.table.toplevel());
+        // rbs L182-184 merges Object's children then toplevel into
+        // `constants`. Every caller hands in a fresh map, so the merge
+        // is a straight copy of the shared seed; keep the additive
+        // merge for a non-empty map so the semantics stay rbs's.
+        let seed = self.ancestors_seed();
+        if consts.is_empty() {
+            consts.clone_from(&seed);
         } else {
+            merge_into(consts, &seed);
+        }
+        if !entry_is_class_or_module {
             // Undefined scope: rbs raises here (L179 `or raise`).
             // crema seeds toplevel so references inside an unknown
             // module/class body resolve against top-level rather than
             // producing cascading UnknownConstant false positives.
-            if let Some(object_children) = self.table.children(&self.object) {
-                merge_into(consts, &object_children);
-            }
-            merge_into(consts, &self.table.toplevel());
             return;
         }
 
+        // rbs L188-194: when the chain reaches `::Object` from a class
+        // entry, `children(Object) + toplevel` (= the seed) is merged
+        // again so it shadows whatever the ancestors *below* Object
+        // (`BasicObject`, `Kernel`, ...) contributed. Re-inserting the
+        // whole seed is O(toplevel) per class context; only the keys
+        // those earlier ancestors wrote (plus Object's own children,
+        // whose toplevel-shadowed values live in the seed) can differ
+        // from the seed, so restoring exactly those keys yields the
+        // same final map.
+        let mut below_object: Vec<Symbol> = Vec::new();
+        let mut reached_object = false;
         let chain = self.builder.instance_ancestors(&name);
         for ancestor in chain.ancestors.iter().rev() {
             let Ancestor::Instance {
@@ -1221,20 +1243,37 @@ impl ConstantResolver {
                     let Some(children) = self.table.children(ancestor_name) else {
                         continue;
                     };
-                    merge_into(consts, &children);
-                    // rbs L188-194: when the chain reaches `::Object`
-                    // from a class entry, toplevel is folded into
-                    // Object's effective children. Inserting toplevel
-                    // here (after `children`) keeps the same final
-                    // map as rbs's per-ancestor `local` clone without
-                    // allocating a fresh per-ancestor FxHashMap.
-                    if ancestor_name == &self.object && entry_is_class {
-                        merge_into(consts, &self.table.toplevel());
+                    if entry_is_class && !reached_object {
+                        if ancestor_name == &self.object {
+                            reached_object = true;
+                            for sym in below_object.drain(..).chain(children.keys().copied()) {
+                                if let Some(entry) = seed.get(&sym) {
+                                    consts.insert(sym, *entry);
+                                }
+                            }
+                            continue;
+                        }
+                        below_object.extend(children.keys().copied());
                     }
+                    merge_into(consts, &children);
                 }
                 AncestorSource::Prepend | AncestorSource::Extend => {}
             }
         }
+    }
+
+    /// The context-independent seed of `constants_from_ancestors`:
+    /// `::Object`'s children merged with `toplevel` (rbs L182-184, in
+    /// that order so toplevel wins on collision). Computed on first use.
+    fn ancestors_seed(&self) -> Arc<ConstantsMap> {
+        Arc::clone(self.ancestors_seed.get_or_init(|| {
+            let mut seed: ConstantsMap = FxHashMap::default();
+            if let Some(object_children) = self.table.children(&self.object) {
+                merge_into(&mut seed, &object_children);
+            }
+            merge_into(&mut seed, &self.table.toplevel());
+            Arc::new(seed)
+        }))
     }
 
     /// Helper for `load_context_constants`'s `None` branch: route

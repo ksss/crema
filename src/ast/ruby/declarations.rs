@@ -63,6 +63,16 @@ pub struct ClassDecl {
     pub name_location: PrismByteRange,
     pub super_class: Option<SuperClass>,
     pub members: Vec<Member>,
+    /// crema extension, not part of the rbs `ClassDecl` contract (rbs's
+    /// `InlineParser` never builds a decl from such a body): `true` when
+    /// `members` came from a `Const = Class.new(...) do ... end` /
+    /// `Struct.new(...) do` / `Data.define(...) do` block instead of a
+    /// `class` keyword body. The block owns `self` and `def` for
+    /// `class_name`, but Ruby's cref (`Module.nesting`) inside it is the
+    /// *enclosing* scope, so the environment resolves the members'
+    /// annotation and mixin names in the decl's own context rather than
+    /// extending it with `class_name`.
+    pub block_body: bool,
 }
 
 /// The explicit superclass reference of a `ClassDecl`, if any.

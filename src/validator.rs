@@ -243,7 +243,7 @@ fn validate_alias_targets(env: &DefinitionBuilder, _sources: &SourceCache<'_>) -
 /// via `Environment::g_backend`.
 ///
 /// The diagnostic stream is deterministic regardless of `FxHashMap`
-/// iteration order because [`strongly_connected_components`] sorts its
+/// iteration order because [`strongly_connected_cycles`] sorts its
 /// own output.
 pub(crate) fn full_ancestor_cycles(ctx: &AncestryEnv) -> (AncestorCycleState, Vec<Diagnostic>) {
     let environment = ctx.env;
@@ -280,7 +280,7 @@ fn ancestor_scc_cycles(
 ) -> Vec<Arc<BakedAncestorCycle>> {
     let names = ctx.names();
     let graph = ancestor_graph(ctx, seeds);
-    strongly_connected_components(&graph, names)
+    strongly_connected_cycles(&graph, names)
         .iter()
         .filter(|component| component.len() >= 2 && keep(component))
         .map(|component| Arc::new(component_to_baked(ctx, &graph, component)))
@@ -399,14 +399,12 @@ pub(crate) fn full_ancestor_cycles_a(
     g: &GSnapshotBackend,
 ) -> (AncestorCycleState, Vec<Diagnostic>) {
     let environment = ctx.env;
-    let names = ctx.names();
-    let mut seeds: Vec<TypeName> = environment
+    let seeds: Vec<TypeName> = environment
         .class_decls()
         .a_keys()
         .chain(environment.interface_decls().a_keys())
         .cloned()
         .collect();
-    seeds.sort_by_key(|n| names.resolve(n));
     let in_a = |n: &TypeName| {
         environment.a_class_contains(n) || environment.interface_decls().a_contains_key(n)
     };
@@ -560,15 +558,14 @@ pub(crate) fn roast_g_validators(
     };
     let names = env.names();
 
-    let mut roots: Vec<TypeName> = env
+    let roots: Vec<TypeName> = env
         .class_decls()
         .keys()
         .chain(env.interface_decls().keys())
         .cloned()
         .collect();
-    roots.sort_by_key(|n| names.resolve(n));
     let graph = ancestor_graph(&ctx, roots);
-    let cycles: Vec<BakedAncestorCycle> = strongly_connected_components(&graph, names)
+    let cycles: Vec<BakedAncestorCycle> = strongly_connected_cycles(&graph, names)
         .iter()
         .filter(|component| component.len() >= 2)
         .map(|component| component_to_baked(&ctx, &graph, component))
@@ -783,13 +780,26 @@ fn append_path_in_component(
     }
 }
 
-fn strongly_connected_components(
+/// Tarjan SCC over `graph`, returning only the *cyclic* components
+/// (two or more members, or a singleton with a self-edge). Each returned
+/// component is name-sorted (so `component[0]` is its anchor) and the
+/// list is sorted by anchor name.
+///
+/// Acyclic singletons are dropped rather than returned unsorted: every
+/// caller filters them out anyway, and keeping the name-keyed
+/// (`resolve` = String allocation) sorts to the cyclic components alone
+/// makes the ordering cost O(#cycles) instead of O(#nodes). Tarjan's
+/// successor iteration order is likewise left as the graph yields it —
+/// which SCCs exist is a structural property of the graph, and neither
+/// the anchor ([`component_to_baked`] recomputes it by `min_by_key`) nor
+/// the chain ([`component_closed_walk`] name-sorts its own inputs) reads
+/// the visitation order.
+fn strongly_connected_cycles(
     graph: &FxHashMap<TypeName, Vec<TypeName>>,
     names: &NameTable,
 ) -> Vec<Vec<TypeName>> {
     struct Tarjan<'a> {
         graph: &'a FxHashMap<TypeName, Vec<TypeName>>,
-        names: &'a NameTable,
         next_index: usize,
         indices: FxHashMap<TypeName, usize>,
         lowlinks: FxHashMap<TypeName, usize>,
@@ -807,10 +817,7 @@ fn strongly_connected_components(
             self.stack.push(node);
             self.on_stack.insert(node);
 
-            let mut successors = self.graph.get(&node).cloned().unwrap_or_default();
-            successors.sort_by_key(|n| self.names.resolve(n));
-            successors.dedup();
-
+            let successors = self.graph.get(&node).cloned().unwrap_or_default();
             for next in successors {
                 if !self.indices.contains_key(&next) {
                     self.visit(next);
@@ -836,24 +843,16 @@ fn strongly_connected_components(
                     break;
                 }
             }
-            component.sort_by_key(|n| self.names.resolve(n));
-            self.components.push(component);
+            if component.len() >= 2 || has_self_edge(self.graph, node) {
+                self.components.push(component);
+            }
         }
     }
 
-    // Visitation order does not affect which SCCs are found (that is a
-    // structural property of the graph, not of traversal order) — only
-    // the presentation does, and that is already made deterministic below
-    // by sorting each component's members and then the component list
-    // itself, both O(#cycles) instead of O(#roots). So the root list here
-    // is intentionally left in whatever order `graph.keys()` yields
-    // (ADR-0028 Decision 4, S5 "sort smell" fix: `resolve`+`sort` moves
-    // from every root to just the handful of reported cycles).
     let roots: Vec<TypeName> = graph.keys().copied().collect();
 
     let mut tarjan = Tarjan {
         graph,
-        names,
         next_index: 0,
         indices: FxHashMap::default(),
         lowlinks: FxHashMap::default(),
@@ -868,6 +867,9 @@ fn strongly_connected_components(
         }
     }
 
+    for component in &mut tarjan.components {
+        component.sort_by_key(|n| names.resolve(n));
+    }
     tarjan
         .components
         .sort_by_key(|component| names.resolve(component[0]));
@@ -980,9 +982,8 @@ pub(crate) fn full_type_alias_cycles(
         graph.insert(*root, type_alias_successors(env, root));
     }
 
-    let state: TypeAliasCycleState = strongly_connected_components(&graph, names)
+    let state: TypeAliasCycleState = strongly_connected_cycles(&graph, names)
         .iter()
-        .filter(|component| component.len() >= 2 || has_self_edge(&graph, component[0]))
         .map(|component| Arc::new(build_type_alias_cycle(env, component)))
         .collect();
     let diagnostics = state
@@ -1006,7 +1007,7 @@ pub(crate) fn full_type_alias_cycles(
 pub(crate) struct BakedTypeAliasCycle {
     pub(crate) participants: Vec<TypeName>,
     /// Resolved name of the lexicographically smallest participant — the
-    /// sort/identity key that reproduces `strongly_connected_components`'s
+    /// sort/identity key that reproduces `strongly_connected_cycles`'s
     /// component-order output, mirroring [`BakedAncestorCycle::type_name`]'s
     /// role. Named `anchor` rather than `type_name` because this
     /// validator's diagnostic has no singular "type_name" field of its
@@ -1089,9 +1090,8 @@ pub(crate) fn incremental_type_alias_cycles(
 
     let seeds: Vec<TypeName> = invalidated.iter().copied().collect();
     let graph = reachable_subgraph(seeds, |name| type_alias_successors(env, name));
-    for component in strongly_connected_components(&graph, names) {
-        let is_cycle = component.len() >= 2 || has_self_edge(&graph, component[0]);
-        if !is_cycle || !component.iter().any(|p| invalidated.contains(p)) {
+    for component in strongly_connected_cycles(&graph, names) {
+        if !component.iter().any(|p| invalidated.contains(p)) {
             continue;
         }
         merged.push(Arc::new(build_type_alias_cycle(env, &component)));

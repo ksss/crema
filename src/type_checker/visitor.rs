@@ -22,7 +22,7 @@ use crate::class_new_recognizer::is_class_dot_new;
 use crate::data_struct_recognizer::data_struct_construction_kind;
 use crate::definition::ConstantOrigin;
 use crate::definition_builder;
-use crate::diagnostic::{ConstantKind, Diagnostic, DiagnosticKind};
+use crate::diagnostic::{CandidateScope, ConstantKind, Diagnostic, DiagnosticKind};
 use crate::environment::DeclKindLocal;
 use crate::inline_parser::TrailingAnnotation;
 use crate::location::SourceLocation;
@@ -147,13 +147,32 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             && let Some(cr) = super_node.as_constant_read_node()
         {
             let super_name = String::from_utf8_lossy(cr.name().as_slice()).to_string();
+            let start = super_node.location().start_offset();
+            let end = super_node.location().end_offset();
             match self.try_resolve_constant_read(&super_name, &super_node) {
-                Some(_) => None,
-                None => {
-                    let position = self.byte_range_to_location(
-                        super_node.location().start_offset(),
-                        super_node.location().end_offset(),
+                Some(constant) => {
+                    // extract v7: the superclass position records like
+                    // a read, with the check's own resolution.
+                    self.record_extract_constant(
+                        start,
+                        end,
+                        crate::extract::constant_state::TYPED,
+                        super_name,
+                        Some(&constant),
+                        Some(constant.ty),
                     );
+                    None
+                }
+                None => {
+                    self.record_extract_constant(
+                        start,
+                        end,
+                        crate::extract::constant_state::UNKNOWN_CONSTANT,
+                        super_name.clone(),
+                        None,
+                        None,
+                    );
+                    let position = self.byte_range_to_location(start, end);
                     let candidate_scope = self.candidate_scope_in_current_scope();
                     let searched_namespaces = self.searched_namespaces_in_current_scope();
                     Some((super_name, position, candidate_scope, searched_namespaces))
@@ -170,10 +189,10 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
         // diagnostic so the order matches the bare-ConstantReadNode
         // path (decl name first, then superclass) — see
         // `test_unknown_constant_constantpath_superclass_emits_head`.
-        let super_path_outcome = node
-            .superclass()
-            .and_then(|s| s.as_constant_path_node())
-            .map(|p| self.resolve_constant_path_outcome(&p));
+        let super_path = node.superclass().and_then(|s| s.as_constant_path_node());
+        let super_path_outcome = super_path
+            .as_ref()
+            .map(|p| self.resolve_constant_path_outcome(p));
         let decl_path_outcome = node
             .constant_path()
             .as_constant_path_node()
@@ -272,8 +291,11 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             });
         }
 
-        if let Some(outcome) = super_path_outcome {
-            self.emit_constant_path_outcome(&outcome, Some(ConstantKind::Class));
+        if let (Some(path), Some(outcome)) = (super_path.as_ref(), super_path_outcome.as_ref()) {
+            self.emit_constant_path_outcome(outcome, Some(ConstantKind::Class));
+            // Diagnostics only above (no deprecation check runs here), so
+            // the record can never be `error`.
+            self.record_extract_constant_path_outcome(path, outcome, false);
         }
         if let Some(outcome) = decl_path_outcome {
             self.emit_constant_path_outcome(&outcome, None);
@@ -385,7 +407,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             for target in synthetic_targets {
                 let saved_class_stack = self.ctx.replace_class_stack(vec![target]);
                 self.check_def_node_in_current_context(node);
-                self.ctx.replace_class_stack(saved_class_stack);
+                self.ctx.restore_class_stack(saved_class_stack);
             }
             return;
         }
@@ -984,6 +1006,110 @@ impl<'env> TypeChecker<'env> {
         self.freeze_self_type_for_lvar_binding(ty)
     }
 
+    /// Enter a closure (block / lambda / proc body): push the `Block`
+    /// scope and pin every visible outer lvar to its current type.
+    /// Steep's `type_env.pin_local_variables(nil)` at the block-call
+    /// and lambda sites (`type_construction.rb`).
+    ///
+    /// Literal bindings are widened first (`1` → `::Integer`, `true` →
+    /// `bool`, member-wise through unions / optionals). crema binds
+    /// `r = 1` to the literal `1` where Steep already widens at the
+    /// lvasgn, so pinning the raw binding would flag `r = 2` inside the
+    /// closure as incompatible.
+    ///
+    /// A *bare* literal binding is also rewritten in place to the widened
+    /// type — Steep's pin plants `[type, type]` with the already-widened
+    /// `type` — so a read before any write, and the untouched arm of a
+    /// conditional inside the closure, agree with what a pinned write
+    /// rebinds to (otherwise the branch join yields `1 | ::Integer`).
+    /// A literal *union* is not rewritten: at the `Ty` level a joined
+    /// literal binding (`r = 1; r = 2 if c`) is indistinguishable from a
+    /// declared enum-like parameter (`(:covariant | :invariant)`), and
+    /// widening the latter in place turns every later use into
+    /// `::Symbol` (steep repo `variable_variance.rb`, 2026-09-11). Only
+    /// the pin — which is checked against, never read — is deep-widened.
+    ///
+    /// The pin itself is additionally `self`-frozen the way
+    /// `freeze_lvar_bound_type` freezes every closure-crossing write:
+    /// `spy = self` binds the opaque `self`, the write inside the block
+    /// arrives as the concrete class, and the subtype check must compare
+    /// like with like. The freeze is not written back to the outer
+    /// binding — outside the closure `self` identity stays tracked.
+    pub(super) fn push_block_scope(&mut self) {
+        let visible = self.ctx.visible_local_variables();
+        let mut pins: FxHashMap<Name, Ty> = FxHashMap::default();
+        for (name, ty) in visible {
+            let widened = self.widen_literal_deep(ty);
+            if widened != ty && matches!(self.env.types().resolve(ty), Type::Literal(_)) {
+                self.ctx.rebind_visible_local_variable(name, widened);
+            }
+            pins.insert(name, self.freeze_self_type_for_lvar_binding(widened));
+        }
+        self.ctx.push_block_scope_with_pins(pins);
+    }
+
+    /// `widen_literal` extended member-wise through unions / optionals,
+    /// with `true` / `false` widened to `bool` rather than to their
+    /// singleton classes (`x = false; each { x = true }` must be a
+    /// same-type write).
+    fn widen_literal_deep(&self, ty: Ty) -> Ty {
+        match self.env.types().resolve(ty) {
+            Type::Literal(crate::types::Literal::Bool(_)) => Ty::BOOL,
+            Type::Union(members) => {
+                let widened: Vec<Ty> = members
+                    .iter()
+                    .map(|&m| self.widen_literal_deep(m))
+                    .collect();
+                crate::types::union_of_many(&widened, self.env.types())
+            }
+            Type::Optional(inner) => {
+                let inner = self.widen_literal_deep(*inner);
+                crate::types::union_of(inner, Ty::NIL, self.env.types())
+            }
+            _ => self.widen_literal(ty),
+        }
+    }
+
+    /// Closure-crossing lvar write (prism `depth >= 1`) against a pinned
+    /// outer variable. Returns `Some(pinned)` when a pin applies: the
+    /// write is rebound to the pinned type (Steep's
+    /// `assign_local_variable`: `enforced_type || var_type`) and an
+    /// `IncompatibleAssignment` is reported on the write node's byte
+    /// range when `ty` is not a subtype of it (`type_construction.rb`
+    /// lvasgn arm). Untyped on either side is silent. `None` means no
+    /// pin — the caller binds `ty` as usual.
+    ///
+    /// The range is taken as bytes and only turned into a
+    /// `SourceLocation` on the diagnostic path: `byte_range_to_location`
+    /// scans the source for char offsets and clones the file path, and
+    /// this helper runs on every lvar write (measured 2026-09-11: doing
+    /// that eagerly cost ~8% User time on `crema check lib` in steep).
+    fn bind_pinned_lvar_write(
+        &mut self,
+        name: Name,
+        ty: Ty,
+        depth: u32,
+        byte_range: (usize, usize),
+    ) -> Option<Ty> {
+        let pinned = self.ctx.pinned_local_variable_type(name, depth)?;
+        if !ty.is_untyped() && !pinned.is_untyped() && !self.subtyper().check(ty, pinned) {
+            let location = self.byte_range_to_location(byte_range.0, byte_range.1);
+            self.push_diagnostic(Diagnostic {
+                scope: None,
+                location,
+                kind: DiagnosticKind::IncompatibleAssignment {
+                    lhs_type: self.display_type(pinned),
+                    // Class-widened like the pin itself, so both sides
+                    // of the message speak the RBS vocabulary
+                    // (`::String <: ::Integer`, as Steep prints it).
+                    rhs_type: self.display_type(self.widen_literal_deep(ty)),
+                },
+            });
+        }
+        self.ctx.set_local_variable_at_depth(name, pinned, depth);
+        Some(pinned)
+    }
+
     fn check_def_node_in_current_context<'pr>(&mut self, node: &DefNode<'pr>) {
         if let Some(receiver) = node.receiver() {
             self.check_node(&receiver, None);
@@ -1137,6 +1263,13 @@ impl<'env> TypeChecker<'env> {
         let name_str = String::from_utf8_lossy(node.name().as_slice());
         let name = self.checker_names().intern(&name_str);
         let ty = self.freeze_lvar_bound_type(ty, node.depth());
+        let byte_range = (node.location().start_offset(), node.location().end_offset());
+        if self
+            .bind_pinned_lvar_write(name, ty, node.depth(), byte_range)
+            .is_some()
+        {
+            return;
+        }
         self.ctx.set_local_variable_at_depth(name, ty, node.depth());
     }
 
@@ -1466,6 +1599,13 @@ impl<'env> TypeChecker<'env> {
     /// declaration body. `singleton_class_depth` is reset around the
     /// body, mirroring `visit_class_node`, so a stray `class << self`
     /// arm inside the block starts at depth 0.
+    ///
+    /// The push is `push_class_outside_cref`: Ruby's `class_eval` on
+    /// the block changes `self` and the `def` target but not the cref,
+    /// so `INNER = 1` inside the block defines the constant in the
+    /// enclosing scope and `INNER` reads resolve from there (rbs's
+    /// `InlineParser` drops such writes entirely; Steep with sig-only
+    /// resolves them at the outer scope as well).
     fn walk_class_construction_block_body<'pr>(&mut self, call: &CallNode<'pr>, lhs_name: &str) {
         if let Some(args) = call.arguments() {
             for arg in args.arguments().iter() {
@@ -1473,7 +1613,7 @@ impl<'env> TypeChecker<'env> {
             }
         }
 
-        self.ctx.push_class(lhs_name, self.env.names());
+        self.ctx.push_class_outside_cref(lhs_name, self.env.names());
         let saved_singleton_class_depth = self.ctx.replace_singleton_class_depth(0);
 
         if let Some(block_arg) = call.block()
@@ -1567,7 +1707,7 @@ impl<'env> TypeChecker<'env> {
             }
         };
         let context =
-            build_lowering_context_from_class_stack(self.ctx.class_stack(), self.env.names());
+            build_lowering_context_from_cref_stack(self.ctx.cref_stack(), self.env.names());
         let ty = self
             .env
             .lower_ast_type(&ast_type, &context, &TypeParamScope::default());
@@ -1641,7 +1781,7 @@ impl<'env> TypeChecker<'env> {
         let type_text = type_text.to_string();
         let ast_type = ast_builder::parse_trailing_type_text(&type_text, self.env.names())?;
         let context =
-            build_lowering_context_from_class_stack(self.ctx.class_stack(), self.env.names());
+            build_lowering_context_from_cref_stack(self.ctx.cref_stack(), self.env.names());
         let ty = self
             .env
             .lower_ast_type(&ast_type, &context, &TypeParamScope::default());
@@ -2104,6 +2244,32 @@ impl<'env> TypeChecker<'env> {
     pub(super) fn check_constant_write<'pr>(&mut self, node: &ConstantWriteNode<'pr>) -> Ty {
         self.ctx.invalidate_const_pure_calls();
         let name_str = String::from_utf8_lossy(node.name().as_slice()).to_string();
+        let position = self
+            .byte_range_to_location(node.name_loc().start_offset(), node.name_loc().end_offset());
+        // `class << self; S = 1` defines `S` on the singleton class
+        // (Ruby cref), which no RBS declaration can spell — so it is
+        // unknown by construction, with nothing searched and no extract
+        // record (no absolute symbol exists for it, same as `||=`).
+        // Reads inside `class << self` are untouched: their cref chain
+        // continues to the enclosing class, so a declared `Foo::S`
+        // still resolves. Path writes (`Foo::T = 1`) name their target
+        // and go through `check_constant_path_write` instead.
+        if self.ctx.in_singleton_class() {
+            self.push_diagnostic(Diagnostic {
+                scope: None,
+                location: position,
+                kind: DiagnosticKind::UnknownConstant {
+                    name: name_str.clone(),
+                    path: name_str,
+                    kind: ConstantKind::Constant,
+                    did_you_mean: Vec::new(),
+                    searched_namespaces: Vec::new(),
+                    candidate_scope: CandidateScope::None,
+                },
+            });
+            let ty = self.check_node(&node.value(), None);
+            return cap_write_value_bottom(ty);
+        }
         // Extract bookkeeping first, before the `Class.new do` fast
         // path below returns early, so that route records once too.
         self.record_extract_constant_write(
@@ -2111,7 +2277,7 @@ impl<'env> TypeChecker<'env> {
             node.location().end_offset(),
             Some(name_str.clone()),
         );
-        // A constant write defines a new binding in the *current* lexical
+        // A constant write defines a new binding in the *current* cref
         // scope; the read-side resolver walks parent scopes and would
         // treat a same-named constant in an outer namespace as "already
         // declared". Restrict the declaration check to the innermost
@@ -2119,15 +2285,11 @@ impl<'env> TypeChecker<'env> {
         // even when a parent namespace happens to declare the name.
         let names = self.env.names();
         let sym = names.intern_symbol(&name_str);
-        let scope = self.ctx.class_stack().last();
+        let scope = self.ctx.cref_stack().last();
         let resolved = self.env.resolve_constant_in_namespace(scope, sym);
         if resolved.is_none() {
             let candidate_scope = self.candidate_scope_in_namespace(scope);
             let searched_namespaces = self.searched_namespaces_in_namespace(scope);
-            let position = self.byte_range_to_location(
-                node.name_loc().start_offset(),
-                node.name_loc().end_offset(),
-            );
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: position,
@@ -2876,6 +3038,21 @@ impl<'env> TypeChecker<'env> {
             node.location().start_offset(),
             node.location().end_offset(),
         );
+        let name_str = String::from_utf8_lossy(name_bytes);
+        let name = self.checker_names().intern(&name_str);
+        let depth = node.depth();
+        // A pinned outer lvar lends its pinned type to the RHS as the
+        // hint (Steep `type_construction.rb` lvasgn: `hint =
+        // enforced_type` when there is no hint, or when the enforced
+        // type is the more specific of the two). This is what types
+        // `ctx = [ctx, name]` inside a block as the tuple the pinned
+        // alias expects instead of `Array[...]`.
+        let pinned = self.ctx.pinned_local_variable_type(name, depth);
+        let hint = match (hint, pinned) {
+            (None, Some(pinned)) => Some(pinned),
+            (Some(h), Some(pinned)) if self.subtyper().check(pinned, h) => Some(pinned),
+            (hint, _) => hint,
+        };
         // When the lvasgn has claimed a trailing `#: T`, flip the
         // parens-routed suppression flag so a Parens (or any node that
         // recurses through `check_statements_with_hint` with the
@@ -2907,13 +3084,19 @@ impl<'env> TypeChecker<'env> {
             self.emit_false_assertion_if_incompatible(value_type, asserted, position);
         }
 
-        let name_str = String::from_utf8_lossy(name_bytes);
-        let name = self.checker_names().intern(&name_str);
-        let depth = node.depth();
         // Stage 3: assertion type wins over the natural inferred type when
         // present, even when Stage 2 emitted a FalseAssertion — matches
         // Steep `constr.add_typing(node, type: type)`.
         let bound_ty = self.freeze_lvar_bound_type(assertion_ty.unwrap_or(value_type), depth);
+        // Closure-crossing write against a pinned outer lvar: the pin
+        // check runs on the bound (asserted-or-inferred) type, so a
+        // `#: T` write inside a block reports IncompatibleAssignment
+        // against the pin and never a second FalseAssertion for the
+        // same mismatch (Steep, measured 2026-09-11).
+        let byte_range = (node.location().start_offset(), node.location().end_offset());
+        if let Some(pinned) = self.bind_pinned_lvar_write(name, bound_ty, depth, byte_range) {
+            return pinned;
+        }
         if value_type == Ty::BOTTOM && bound_ty == Ty::BOTTOM {
             self.ctx
                 .set_local_variable_at_depth_from_bot_rhs(name, bound_ty, depth);
@@ -3000,6 +3183,10 @@ impl<'env> TypeChecker<'env> {
             name_location,
         );
         let bound_ty = self.freeze_lvar_bound_type(bound_ty, depth);
+        let byte_range = (node.location().start_offset(), node.location().end_offset());
+        if let Some(pinned) = self.bind_pinned_lvar_write(name, bound_ty, depth, byte_range) {
+            return pinned;
+        }
         self.ctx.set_local_variable_at_depth(name, bound_ty, depth);
         bound_ty
     }
@@ -4045,12 +4232,19 @@ fn is_data_struct_named_lhs_pattern(call: &CallNode<'_>) -> bool {
     block_arg.as_block_node().is_some()
 }
 
-/// Convert the type checker's `class_stack` (parsed `TypeName`s like
+/// Convert the type checker's `cref_stack` (parsed `TypeName`s like
 /// `::A`, `::A::B`) into the `&[Option<Name>]` shape that
 /// `type_builder::build_type` walks for relative-name resolution. Each
 /// entry's path is interned against the environment `NameTable` so it
 /// participates in the resolver's `all_names`-driven lookup.
-pub(super) fn build_lowering_context_from_class_stack(
+///
+/// The input is the cref, not `class_stack`: a bare type name written
+/// in an annotation resolves through Ruby's lexical nesting
+/// (`Module.nesting`), which a `Const = Class.new do ... end` block
+/// does not extend even though `self` / `def` inside it belong to the
+/// new class. rbs's `InlineParser` and Steep resolve such names at the
+/// enclosing scope; `::Ctor::Widget` must not shadow `::Widget` there.
+pub(super) fn build_lowering_context_from_cref_stack(
     stack: &[TypeName],
     names: &crate::name::NameTable,
 ) -> Vec<Option<Name>> {

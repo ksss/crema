@@ -31,9 +31,9 @@
 //! - `constant` — every constant *read* site the check touched, tagged
 //!   with a `state` variant (v5, the constant sibling of
 //!   `method_call`'s taxonomy): `typed` / `error` /
-//!   `unknown_constant` / `untyped`. Read sites only: writes (`X = 1`
-//!   targets, or-writes) and the superclass position (`class Sub <
-//!   Base`) are out of scope. See [`ConstantRecord`].
+//!   `unknown_constant` / `untyped`. Read sites plus the superclass
+//!   position (`class Sub < Base`, v7); writes (`X = 1` targets,
+//!   or-writes) are out of scope. See [`ConstantRecord`].
 //! - `consulted` — every symbol the check touched (deduped, no
 //!   positions): the checker's environment queries plus the types each
 //!   def signature references (annotation lowering resolves those in
@@ -72,7 +72,7 @@ use crate::type_name::TypeName;
 
 
 /// Version of the extract document schema.
-pub const EXTRACT_SCHEMA_VERSION: u32 = 6;
+pub const EXTRACT_SCHEMA_VERSION: u32 = 7;
 
 /// `state` variant of a [`MethodCallRecord`], after Steep's
 /// `TypeInference::MethodCall` class hierarchy (`method_call.rb`:
@@ -156,9 +156,10 @@ pub mod constant_state {
     pub const UNTYPED: &str = "untyped";
 }
 
-/// One constant read site (v5). Read sites only — write targets and the
-/// superclass position never record (the latter is a future extension
-/// point, not a bug). Field order is the JSON key order.
+/// One constant read site (v5), or the superclass position of a
+/// `class Sub < Base` declaration (v7 — the check resolves it in the
+/// enclosing scope exactly like a read). Write targets never record.
+/// Field order is the JSON key order.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstantRecord {
     /// Variant tag — see [`constant_state`].

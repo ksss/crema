@@ -114,42 +114,100 @@ pub fn load_all_with_schema<'a>(
     inflector: &Inflector,
     schema: Option<activerecord::PreparsedSchema>,
 ) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-    let mut collected = Vec::new();
-    for unit in sources {
-        if unit.parse_result.errors().next().is_some() {
-            continue;
-        }
-        let collected_index = collected.len();
-        let source_file = unit
-            .file
-            .map(|file| draft.names().intern(&file.to_string_lossy()));
-        let mut collector = Collector::new(
-            draft.names(),
-            collected_index,
-            source_file,
-            unit.source,
-            unit.file,
-            unit.parse_result,
-            options,
-            inflector,
-        );
-        collector.visit(&unit.parse_result.node());
-        diagnostics.extend(collector.diagnostics);
-        collected.push(CollectedSource {
-            source: unit.source,
-            file: unit.file,
-            top_level: collector.top_level,
-            active_record_associations: collector.active_record_associations,
-            active_record_scopes: collector.active_record_scopes,
-            active_record_enum_mappings: collector.active_record_enum_mappings,
-            paranoia_models: collector.paranoia_models,
-            concerns: collector.concerns,
-            concern_sites: collector.concern_sites,
-        });
-    }
+    let collected = sources
+        .iter()
+        .enumerate()
+        .map(|(source_index, unit)| {
+            if unit.parse_result.errors().next().is_some() {
+                return None;
+            }
+            let source_file = unit
+                .file
+                .map(|file| draft.names().intern(&file.to_string_lossy()));
+            Some(collect_source(
+                draft.names(),
+                source_index,
+                source_file,
+                unit.source,
+                unit.file,
+                unit.parse_result,
+                options,
+                inflector,
+            ))
+        })
+        .collect();
+    load_collected(collected, draft, options, inflector, schema)
+}
 
-    for source in &collected {
+/// The collect half of `load_all_with_schema` for one file: walk the
+/// AST and return everything the insert half needs, owned (no AST
+/// borrow). Runs on a parallel-ingest worker (ADR-0033), so `names` may
+/// be a worker table: `source_file` must be pre-interned by the caller
+/// and no `Name` is minted here. `source_index` is the position the
+/// caller will give this result in the `Vec` passed to
+/// [`load_collected`]; concern expansion resolves the concern's file
+/// through it.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_source<'a>(
+    names: &NameTable,
+    source_index: usize,
+    source_file: Option<Name>,
+    source: &'a [u8],
+    file: Option<&'a Path>,
+    parse_result: &ruby_prism::ParseResult<'_>,
+    options: InfusionOptions,
+    inflector: &Inflector,
+) -> CollectedSource<'a> {
+    let mut collector = Collector::new(
+        names,
+        source_index,
+        source_file,
+        source,
+        file,
+        parse_result,
+        options,
+        inflector,
+    );
+    collector.visit(&parse_result.node());
+    CollectedSource {
+        source,
+        file,
+        top_level: collector.top_level,
+        active_record_associations: collector.active_record_associations,
+        active_record_scopes: collector.active_record_scopes,
+        active_record_enum_mappings: collector.active_record_enum_mappings,
+        paranoia_models: collector.paranoia_models,
+        concerns: collector.concerns,
+        concern_sites: collector.concern_sites,
+        diagnostics: collector.diagnostics,
+    }
+}
+
+/// The insert half of `load_all_with_schema`: draft insertion, concern
+/// expansion, schema emission and ActiveRecord / paranoia / zeitwerk
+/// synthesis, single-threaded. `collected[i]` is the result of
+/// [`collect_source`] called with `source_index == i`, or `None` for a
+/// file that was not collected (Prism error), so the indices concern
+/// expansion carries stay valid.
+pub fn load_collected<'a>(
+    collected: Vec<Option<CollectedSource<'a>>>,
+    draft: &mut EnvironmentDraft,
+    options: InfusionOptions,
+    inflector: &Inflector,
+    schema: Option<activerecord::PreparsedSchema>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut collected = collected;
+    for source in collected.iter_mut().flatten() {
+        diagnostics.append(&mut source.diagnostics);
+    }
+    let collected_at = |index: usize| -> &CollectedSource<'a> {
+        collected[index]
+            .as_ref()
+            .expect("concern source_index must point at a collected file")
+    };
+
+    for source in collected.iter().flatten() {
         for decl in &source.top_level {
             draft.insert_ruby_decl(decl, source.source, source.file, &mut diagnostics);
         }
@@ -166,7 +224,7 @@ pub fn load_all_with_schema<'a>(
 
     let mut concerns = FxHashMap::default();
     let mut concern_names = FxHashSet::default();
-    for source in &collected {
+    for source in collected.iter().flatten() {
         for concern in &source.concerns {
             concern_names.insert(concern.name);
             concerns.insert(concern.name, concern);
@@ -182,21 +240,25 @@ pub fn load_all_with_schema<'a>(
     let mut expansion_contributions: FxHashSet<(TypeName, Name)> = FxHashSet::default();
     let mut active_record_associations = collected
         .iter()
+        .flatten()
         .flat_map(|source| source.active_record_associations.iter().cloned())
         .collect::<Vec<_>>();
     let mut active_record_scopes = collected
         .iter()
+        .flatten()
         .flat_map(|source| source.active_record_scopes.iter().cloned())
         .collect::<Vec<_>>();
     let mut active_record_enum_mappings = collected
         .iter()
+        .flatten()
         .flat_map(|source| source.active_record_enum_mappings.iter().cloned())
         .collect::<Vec<_>>();
     let mut paranoia_models = collected
         .iter()
+        .flatten()
         .flat_map(|source| source.paranoia_models.iter().copied())
         .collect::<Vec<_>>();
-    for source in &collected {
+    for source in collected.iter().flatten() {
         for site in &source.concern_sites {
             let Some(concern) = resolve_concern(&concerns, &site.module_names) else {
                 continue;
@@ -245,7 +307,7 @@ pub fn load_all_with_schema<'a>(
                 active_record_associations.extend(associations);
                 active_record_scopes.extend(scopes);
                 active_record_enum_mappings.extend(enum_mappings);
-                let concern_source = &collected[synthetic.source_index];
+                let concern_source = collected_at(synthetic.source_index);
                 if let Some(f) = concern_source.file {
                     expansion_contributions
                         .insert((site.target, draft.names().intern(&f.to_string_lossy())));
@@ -274,7 +336,7 @@ pub fn load_all_with_schema<'a>(
                 let Some(decl) = synthetic.to_declaration(draft.names()) else {
                     continue;
                 };
-                let concern_source = &collected[synthetic.source_index];
+                let concern_source = collected_at(synthetic.source_index);
                 if let Some(f) = concern_source.file {
                     expansion_contributions
                         .insert((site.target, draft.names().intern(&f.to_string_lossy())));
@@ -302,6 +364,7 @@ pub fn load_all_with_schema<'a>(
         }
         let batch_files: FxHashSet<Name> = collected
             .iter()
+            .flatten()
             .filter_map(|source| {
                 source
                     .file
@@ -351,7 +414,10 @@ fn activesupport_options() -> InfusionOptions {
     }
 }
 
-struct CollectedSource<'a> {
+/// One file's collect-half output, handed from [`collect_source`] to
+/// [`load_collected`]. Owned throughout (no AST borrow), so it can cross
+/// the ingest worker → main boundary.
+pub struct CollectedSource<'a> {
     source: &'a [u8],
     file: Option<&'a Path>,
     top_level: Vec<Declaration>,
@@ -361,6 +427,9 @@ struct CollectedSource<'a> {
     paranoia_models: Vec<TypeName>,
     concerns: Vec<ConcernDef>,
     concern_sites: Vec<ConcernSite>,
+    /// Collection-time diagnostics, drained by `load_collected` in
+    /// file order before any insert-time diagnostic is pushed.
+    diagnostics: Vec<Diagnostic>,
 }
 
 struct Collector<'a> {
@@ -636,6 +705,10 @@ struct SyntheticClassMethodsExtend {
 
 struct ClassMethodsCollector<'a> {
     names: &'a NameTable,
+    /// Pre-interned `file`, stamped on attr members. Never interned here:
+    /// on a parallel-ingest worker `names` is a table that must not
+    /// mint positional `Name`s (see `NameTable::merge`).
+    source_file: Option<Name>,
     source: &'a [u8],
     file: Option<&'a Path>,
     line_index: &'a LineIndex,
@@ -839,6 +912,7 @@ impl SyntheticClassMethodsExtend {
                 name_location: self.location,
                 super_class: None,
                 members: vec![member],
+                block_body: false,
             }))),
             InfusionOwnerKind::Module => Some(Declaration::Module(Arc::new(ModuleDecl {
                 module_name: self.target,
@@ -852,6 +926,7 @@ impl SyntheticClassMethodsExtend {
 impl<'a> ClassMethodsCollector<'a> {
     fn new(
         names: &'a NameTable,
+        source_file: Option<Name>,
         source: &'a [u8],
         file: Option<&'a Path>,
         line_index: &'a LineIndex,
@@ -859,6 +934,7 @@ impl<'a> ClassMethodsCollector<'a> {
     ) -> Self {
         Self {
             names,
+            source_file,
             source,
             file,
             line_index,
@@ -1000,7 +1076,7 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
             name_nodes,
             type_text,
             annotation_range,
-            source_file: self.file.map(|p| self.names.intern(&p.to_string_lossy())),
+            source_file: self.source_file,
         };
         let member = match call_kind {
             AttributeCallSiteKind::Reader => Member::AttrReader(AttrReaderMember { attribute }),
@@ -1541,6 +1617,7 @@ impl<'a> Collector<'a> {
             .append_type_name(parent.body.owner, class_methods_segment);
         let mut collector = ClassMethodsCollector::new(
             self.names,
+            self.source_file,
             self.source,
             self.file,
             &self.line_index,
@@ -1768,6 +1845,7 @@ impl<'a> Collector<'a> {
                 name_location: body.name_location,
                 super_class: None,
                 members,
+                block_body: false,
             }))),
             InfusionOwnerKind::Module => Some(Declaration::Module(Arc::new(ModuleDecl {
                 module_name: body.owner,
@@ -2739,5 +2817,138 @@ end
                 "::A::ClassMethods".to_string(),
             ]
         );
+    }
+}
+
+/// `collect_source` on a parallel-ingest worker table (ADR-0033): the
+/// walk must not mint a positional `Name`, and its content-addressed
+/// ids must survive `NameTable::merge` regardless of the order the
+/// worker interned things in.
+#[cfg(test)]
+mod worker_collect_tests {
+    use super::*;
+
+    // `attr_reader` inside `class_methods do ... end` is the one attr
+    // site the infusion collector builds itself (`ClassMethodsCollector`),
+    // which used to re-intern the file path instead of using the
+    // pre-interned `source_file`. An attr in the class body alone would
+    // not reach it.
+    const SOURCE: &[u8] = b"\
+module Trackable
+  extend ActiveSupport::Concern
+  class_methods do
+    attr_reader :foo
+  end
+end
+
+class User < ApplicationRecord
+  include Trackable
+  attr_reader :bar
+  has_many :bars
+end
+";
+
+    fn rails_options() -> InfusionOptions {
+        InfusionOptions {
+            activesupport: true,
+            activemodel: true,
+            activerecord: true,
+            paranoia: false,
+        }
+    }
+
+    fn collect_on_worker<'a>(worker: &NameTable, source_file: Name) -> CollectedSource<'a> {
+        let parse_result = ruby_prism::parse(SOURCE);
+        assert!(parse_result.errors().next().is_none());
+        collect_source(
+            worker,
+            0,
+            Some(source_file),
+            SOURCE,
+            Some(Path::new("app/models/user.rb")),
+            &parse_result,
+            rails_options(),
+            inflector::default_en(),
+        )
+    }
+
+    #[test]
+    fn worker_collect_mints_no_positional_name() {
+        let main = NameTable::new();
+        let source_file = main.intern("app/models/user.rb");
+        let worker = NameTable::new();
+        let collected = collect_on_worker(&worker, source_file);
+        let class_methods = collected
+            .concerns
+            .iter()
+            .find_map(|concern| concern.class_methods.as_ref())
+            .expect("Trackable.class_methods must be collected");
+        let attr = class_methods
+            .members
+            .iter()
+            .find_map(|member| match member {
+                Member::AttrReader(attr) => Some(&attr.attribute),
+                _ => None,
+            })
+            .expect("attr_reader :foo must be collected as a ClassMethods member");
+        assert_eq!(attr.source_file, Some(source_file));
+        // Panics ("must not carry positional `Name` entries") if the
+        // walk interned the path on the worker table.
+        main.merge(worker);
+    }
+
+    #[test]
+    fn worker_collect_ids_survive_merge_in_either_intern_order() {
+        let orders: [&[&str]; 2] = [&["Bar", "User", "foo"], &["foo", "User", "Bar"]];
+        for order in orders {
+            let main = NameTable::new();
+            let source_file = main.intern("app/models/user.rb");
+            let worker = NameTable::new();
+            for s in order {
+                worker.intern_symbol(s);
+            }
+            let collected = collect_on_worker(&worker, source_file);
+            main.merge(worker);
+
+            let class_names: Vec<String> = collected
+                .top_level
+                .iter()
+                .filter_map(|decl| match decl {
+                    Declaration::Class(class) => Some(main.resolve(class.class_name)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(class_names, vec!["::User".to_string()], "order={order:?}");
+            let concern_names: Vec<String> = collected
+                .concerns
+                .iter()
+                .map(|concern| {
+                    let class_methods = concern
+                        .class_methods
+                        .as_ref()
+                        .expect("Trackable.class_methods must be collected");
+                    format!(
+                        "{} {}",
+                        main.resolve(concern.name),
+                        main.resolve(class_methods.module_name)
+                    )
+                })
+                .collect();
+            assert_eq!(
+                concern_names,
+                vec!["::Trackable ::Trackable::ClassMethods".to_string()],
+                "order={order:?}"
+            );
+            let associations: Vec<String> = collected
+                .active_record_associations
+                .iter()
+                .map(|assoc| format!("{} {}", main.resolve(assoc.owner), assoc.name))
+                .collect();
+            assert_eq!(
+                associations,
+                vec!["::User bars".to_string()],
+                "order={order:?}"
+            );
+        }
     }
 }

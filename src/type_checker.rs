@@ -35,8 +35,8 @@ pub(crate) fn is_special_lvar_name(name: &[u8]) -> bool {
 
 /// Raw `(start_byte, end_byte)` source span carried by the type-check
 /// path in place of a `SourceLocation`. Materialization to a
-/// `SourceLocation` costs an O(offset) `byte_to_char_offset` scan from
-/// the source start (run twice — once per side) plus a `PathBuf` clone;
+/// `SourceLocation` costs an O(line length) `LineIndex::char_offset`
+/// count (run twice — once per side) plus a `PathBuf` clone;
 /// holding the raw byte pair lets the hot paths skip both costs when
 /// no diagnostic actually fires. Used for argument spans
 /// (`positional_spans`, keyword `_, _, ArgSpan, ArgSpan`), call-site
@@ -633,7 +633,7 @@ impl<'env> TypeChecker<'env> {
     /// the def records. `path` is the LHS as written (`BAR`, `A::B`,
     /// `::A::B`); the symbol is the inline collector's
     /// `qualify_under(innermost class, path)` — rooted paths kept,
-    /// everything else concatenated under the class stack's last entry
+    /// everything else concatenated under the cref stack's last entry
     /// (top-level is rooted `::X`, not `::Object::X`: rbs spells
     /// top-level constants that way and `definitions` agrees). Called
     /// from the head of `check_constant_write` /
@@ -657,7 +657,7 @@ impl<'env> TypeChecker<'env> {
         let symbol = if path.starts_with("::") {
             path
         } else {
-            match self.ctx.current_class_typename() {
+            match self.ctx.cref_stack().last() {
                 Some(tn) => format!("{}::{path}", self.env.names().display_type_name(*tn)),
                 None => format!("::{path}"),
             }
@@ -714,11 +714,12 @@ impl<'env> TypeChecker<'env> {
     /// resolved constant when the walk produced one (`typed` / `error`
     /// states); `ty` is the type the check computed for the read.
     /// Called only from the side-effecting read paths
-    /// (`check_constant_read` and the constant-path read finisher) —
-    /// never from the silent `&self` resolvers, so `infer_receiver_type`
-    /// re-peeks cannot duplicate a site, and never from write /
-    /// superclass / declaration-head contexts (their emits don't route
-    /// through the read paths). Bookkeeping only: no env queries.
+    /// (`check_constant_read`, the constant-path read finisher) and the
+    /// superclass position of `visit_class_node` (v7) — never from the
+    /// silent `&self` resolvers, so `infer_receiver_type` re-peeks
+    /// cannot duplicate a site, and never from write / declaration-head
+    /// contexts (their emits don't route through the read paths).
+    /// Bookkeeping only: no env queries.
     pub(super) fn record_extract_constant(
         &self,
         start_offset: usize,
@@ -943,7 +944,13 @@ impl<'env> TypeChecker<'env> {
         start_byte: usize,
         end_byte: usize,
     ) -> crate::location::SourceLocation {
-        Diagnostic::location_for_byte_range(self.file.clone(), &self.source, start_byte, end_byte)
+        Diagnostic::location_for_byte_range_with_index(
+            self.file.clone(),
+            &self.source,
+            &self.line_index,
+            start_byte,
+            end_byte,
+        )
     }
 
     /// Lazily materialize an [`ArgSpan`] into a `SourceLocation`. Called only

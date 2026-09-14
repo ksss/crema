@@ -103,6 +103,7 @@ pub(crate) fn synthesize(
 
     let all_names = collect_declared_class_module_names(draft);
     let model_names = models.iter().copied().collect::<FxHashSet<_>>();
+    let nested_class_methods = collect_nested_class_methods(draft, &model_names);
     let context = Arc::from([draft.names().absolute_root()]);
     for model in models {
         let owner = model_owner(draft, model, batch_files, expansion_contributions);
@@ -116,6 +117,7 @@ pub(crate) fn synthesize(
             enum_mappings,
             &all_names,
             &model_names,
+            &nested_class_methods,
             inflector,
         );
     }
@@ -656,6 +658,7 @@ fn synthesize_model(
     enum_mappings: &[ActiveRecordEnumMapping],
     all_names: &FxHashSet<TypeName>,
     model_names: &FxHashSet<TypeName>,
+    nested_class_methods: &NestedClassMethods,
     inflector: &Inflector,
 ) {
     let names = draft.names();
@@ -663,7 +666,7 @@ fn synthesize_model(
     let collection_proxy = nested_name(names, model, "ActiveRecord_Associations_CollectionProxy");
     let generated_relation_methods = nested_name(names, model, "GeneratedRelationMethods");
     let generated_association_methods = nested_name(names, model, "GeneratedAssociationMethods");
-    let class_method_names = collect_class_method_names(draft, model);
+    let class_method_names = collect_class_method_names(draft, model, nested_class_methods);
     let association_methods = collect_association_methods(
         draft.names(),
         model,
@@ -841,7 +844,20 @@ fn relation_members(
     ]
 }
 
-fn collect_class_method_names(draft: &EnvironmentDraft, model: TypeName) -> Vec<Symbol> {
+/// Untyped singleton method names of every model declared *nested*
+/// inside another class/module body (`module Admin; class User < ...;
+/// def self.foo`), keyed by the model's resolved name. The A draft holds
+/// nested declarations only inside the parent's member tree (flattening
+/// happens in `build`), so these are reachable only by walking every
+/// entry; building the map once per `synthesize` keeps that walk O(env)
+/// instead of O(models × env).
+type NestedClassMethods = FxHashMap<TypeName, FxHashSet<Symbol>>;
+
+fn collect_class_method_names(
+    draft: &EnvironmentDraft,
+    model: TypeName,
+    nested_class_methods: &NestedClassMethods,
+) -> Vec<Symbol> {
     let mut out = FxHashSet::default();
     if let Some(ClassOrModuleDraft::Class(entry)) = draft.class_decls.get(&model) {
         for (_file, _context, decl) in &entry.context_decls {
@@ -855,15 +871,15 @@ fn collect_class_method_names(draft: &EnvironmentDraft, model: TypeName) -> Vec<
             }
         }
     }
-    for entry in draft.class_decls.values() {
-        collect_nested_class_methods(draft.names(), entry, model, &mut out);
+    if let Some(nested) = nested_class_methods.get(&model) {
+        out.extend(nested.iter().copied());
     }
     // A point lookup suffices for the G side: the snapshot is a *built*
     // environment, so a model reopened or declared nested anywhere is
     // already merged into its single entry, whose `context_decls` bundle
     // every declaration site's class methods (ADR-0028 slice 2b-4). The A
-    // draft above still needs the full nested walk because it is not yet
-    // flattened. Pinned by
+    // draft is not yet flattened, so its nested sites come from the
+    // once-per-synthesize `NestedClassMethods` map above. Pinned by
     // `snapshot_ar_gem_nested_model_class_methods_byte_identical`.
     if let Some(g) = draft.g.as_ref()
         && let Some(ClassOrModule::Class(entry)) = g.class_entry(&model)
@@ -885,79 +901,92 @@ fn collect_class_method_names(draft: &EnvironmentDraft, model: TypeName) -> Vec<
 }
 
 fn collect_nested_class_methods(
-    names: &NameTable,
-    entry: &ClassOrModuleDraft,
-    target: TypeName,
-    out: &mut FxHashSet<Symbol>,
-) {
-    match entry {
-        ClassOrModuleDraft::Class(entry) => {
-            for (_file, _context, decl) in &entry.context_decls {
-                match decl {
-                    ClassDeclarationDraft::Signature(decl) => {
-                        collect_signature_nested_class_methods(&decl.members, target, out)
-                    }
-                    ClassDeclarationDraft::Ruby(decl) => {
-                        collect_ruby_nested_class_methods(names, &decl.members, target, out)
+    draft: &EnvironmentDraft,
+    models: &FxHashSet<TypeName>,
+) -> NestedClassMethods {
+    let names = draft.names();
+    let mut out = NestedClassMethods::default();
+    for entry in draft.class_decls.values() {
+        match entry {
+            ClassOrModuleDraft::Class(entry) => {
+                for (_file, _context, decl) in &entry.context_decls {
+                    match decl {
+                        ClassDeclarationDraft::Signature(decl) => {
+                            collect_signature_nested_class_methods(&decl.members, models, &mut out)
+                        }
+                        ClassDeclarationDraft::Ruby(decl) => collect_ruby_nested_class_methods(
+                            names,
+                            &decl.members,
+                            models,
+                            &mut out,
+                        ),
                     }
                 }
             }
-        }
-        ClassOrModuleDraft::Module(entry) => {
-            for (_file, _context, decl) in &entry.context_decls {
-                match decl {
-                    ModuleDeclarationDraft::Signature(decl) => {
-                        collect_signature_module_nested_class_methods(&decl.members, target, out)
-                    }
-                    ModuleDeclarationDraft::Ruby(decl) => {
-                        collect_ruby_nested_class_methods(names, &decl.members, target, out)
+            ClassOrModuleDraft::Module(entry) => {
+                for (_file, _context, decl) in &entry.context_decls {
+                    match decl {
+                        ModuleDeclarationDraft::Signature(decl) => {
+                            collect_signature_module_nested_class_methods(
+                                &decl.members,
+                                models,
+                                &mut out,
+                            )
+                        }
+                        ModuleDeclarationDraft::Ruby(decl) => collect_ruby_nested_class_methods(
+                            names,
+                            &decl.members,
+                            models,
+                            &mut out,
+                        ),
                     }
                 }
             }
         }
     }
+    out
 }
 
 fn collect_signature_module_nested_class_methods(
     members: &[ModuleMember],
-    target: TypeName,
-    out: &mut FxHashSet<Symbol>,
+    models: &FxHashSet<TypeName>,
+    out: &mut NestedClassMethods,
 ) {
     for member in members {
         let ModuleMember::Declaration(decl) = member else {
             continue;
         };
-        collect_signature_decl_nested_class_methods(decl, target, out);
+        collect_signature_decl_nested_class_methods(decl, models, out);
     }
 }
 
 fn collect_signature_nested_class_methods(
     members: &[ClassMember],
-    target: TypeName,
-    out: &mut FxHashSet<Symbol>,
+    models: &FxHashSet<TypeName>,
+    out: &mut NestedClassMethods,
 ) {
     for member in members {
         let ClassMember::Declaration(decl) = member else {
             continue;
         };
-        collect_signature_decl_nested_class_methods(decl, target, out);
+        collect_signature_decl_nested_class_methods(decl, models, out);
     }
 }
 
 fn collect_signature_decl_nested_class_methods(
     decl: &Declaration,
-    target: TypeName,
-    out: &mut FxHashSet<Symbol>,
+    models: &FxHashSet<TypeName>,
+    out: &mut NestedClassMethods,
 ) {
     match decl {
         Declaration::Class(decl) => {
-            if decl.name == target {
-                collect_signature_class_methods(&decl.members, out);
+            if models.contains(&decl.name) {
+                collect_signature_class_methods(&decl.members, out.entry(decl.name).or_default());
             }
-            collect_signature_nested_class_methods(&decl.members, target, out);
+            collect_signature_nested_class_methods(&decl.members, models, out);
         }
         Declaration::Module(decl) => {
-            collect_signature_module_nested_class_methods(&decl.members, target, out)
+            collect_signature_module_nested_class_methods(&decl.members, models, out)
         }
         Declaration::Interface(_)
         | Declaration::ClassAlias(_)
@@ -971,8 +1000,8 @@ fn collect_signature_decl_nested_class_methods(
 fn collect_ruby_nested_class_methods(
     names: &NameTable,
     members: &[RubyMember],
-    target: TypeName,
-    out: &mut FxHashSet<Symbol>,
+    models: &FxHashSet<TypeName>,
+    out: &mut NestedClassMethods,
 ) {
     for member in members {
         let RubyMember::Declaration(decl) = member else {
@@ -980,13 +1009,17 @@ fn collect_ruby_nested_class_methods(
         };
         match decl {
             crate::ast::ruby::declarations::Declaration::Class(decl) => {
-                if decl.class_name == target {
-                    collect_ruby_class_methods(names, &decl.members, out);
+                if models.contains(&decl.class_name) {
+                    collect_ruby_class_methods(
+                        names,
+                        &decl.members,
+                        out.entry(decl.class_name).or_default(),
+                    );
                 }
-                collect_ruby_nested_class_methods(names, &decl.members, target, out);
+                collect_ruby_nested_class_methods(names, &decl.members, models, out);
             }
             crate::ast::ruby::declarations::Declaration::Module(decl) => {
-                collect_ruby_nested_class_methods(names, &decl.members, target, out);
+                collect_ruby_nested_class_methods(names, &decl.members, models, out);
             }
             crate::ast::ruby::declarations::Declaration::Constant(_)
             | crate::ast::ruby::declarations::Declaration::ClassModuleAlias(_) => {}

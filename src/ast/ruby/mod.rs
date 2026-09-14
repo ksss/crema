@@ -30,17 +30,74 @@ pub type PrismByteRange = (u32, u32);
 pub struct LineIndex {
     /// `u32` to match Prism's location encoding.
     newlines: Vec<u32>,
+    /// Parallel to `newlines`: number of chars in `source[..=newlines[i]]`,
+    /// i.e. the char offset of the head of line `i + 2`. Lets
+    /// [`char_offset`](Self::char_offset) count only within one line
+    /// instead of from the start of the file on every diagnostic emit.
+    line_head_chars: Vec<u32>,
+    /// Length of the longest valid UTF-8 prefix of the source. Any prefix
+    /// extending past it is not valid UTF-8, and its char offset falls back
+    /// to the byte offset (see [`char_offset`](Self::char_offset)).
+    valid_up_to: usize,
 }
 
 impl LineIndex {
     pub fn from_source(source: &[u8]) -> Self {
         let mut newlines = Vec::new();
+        let mut line_head_chars = Vec::new();
+        let mut chars = 0u32;
         for (i, &b) in source.iter().enumerate() {
+            // Every char starts with a non-continuation byte, so counting
+            // those equals `chars().count()` on valid UTF-8.
+            if (b & 0xC0) != 0x80 {
+                chars += 1;
+            }
             if b == b'\n' {
                 newlines.push(i as u32);
+                line_head_chars.push(chars);
             }
         }
-        LineIndex { newlines }
+        let valid_up_to = match std::str::from_utf8(source) {
+            Ok(_) => source.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        LineIndex {
+            newlines,
+            line_head_chars,
+            valid_up_to,
+        }
+    }
+
+    /// Char offset of byte `offset` in `source` — the number of chars in
+    /// `source[..offset]`. `source` must be the slice this index was built
+    /// from. O(line length): the chars before the current line come from
+    /// the precomputed per-line table.
+    ///
+    /// Semantics mirror `from_utf8(&source[..offset]).map(chars().count())
+    /// .unwrap_or(offset)`: once the prefix contains an invalid UTF-8 byte
+    /// the result is the byte offset itself, so a file with one bad byte
+    /// reports char == byte for everything after it. Offsets past EOF
+    /// saturate to `source.len()`. Offsets inside a multi-byte char are
+    /// outside the contract (Prism never produces them) but do not panic.
+    pub fn char_offset(&self, source: &[u8], offset: usize) -> u32 {
+        let offset = offset.min(source.len());
+        if offset > self.valid_up_to {
+            return offset as u32;
+        }
+        let line = self.newlines.partition_point(|&n| (n as usize) < offset);
+        let (head_byte, head_chars) = if line == 0 {
+            (0, 0)
+        } else {
+            (
+                self.newlines[line - 1] as usize + 1,
+                self.line_head_chars[line - 1],
+            )
+        };
+        let within_line = source[head_byte..offset]
+            .iter()
+            .filter(|&&b| (b & 0xC0) != 0x80)
+            .count() as u32;
+        head_chars + within_line
     }
 
     /// 1-based line number containing `offset`. Saturates to the last

@@ -850,6 +850,7 @@ fn schema_declarations(
                 name_location: table.location,
                 super_class: None,
                 members,
+                block_body: false,
             })));
         }
     }

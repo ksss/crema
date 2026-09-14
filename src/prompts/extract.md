@@ -16,7 +16,7 @@ Type errors in the snippet are not reported here — extract discards diagnostic
 
 ```json
 {
-  "version": 6,
+  "version": 7,
   "root": "/absolute/path/to/project",
   "files": {
     "lib/user.rb": { "content_hash": "…", "definitions": [], "implements": [], "method_call": [], "constant": [], "consulted": [] }
@@ -24,7 +24,7 @@ Type errors in the snippet are not reported here — extract discards diagnostic
 }
 ```
 
-- `version` — Integer. Schema version of the document; this page describes version 6.
+- `version` — Integer. Schema version of the document; this page describes version 7.
 - `root` — String. Base directory the `files` keys are relative to.
 - `files` — Object. One entry per file in the check scope, keyed by relative path. Files that fail to parse still get an entry (with whatever facts were recoverable), so the key set is the full scope.
 
@@ -56,7 +56,7 @@ A method defined in one file but re-declared or aliased in another appears under
 
 One record per Ruby `def` / `def self.` site and per constant assignment (`FOO = 1`, `A::B = 2`) — the implementation counterpart of `definitions`, which only sees the declaration space. In a project whose signatures live in separate `.rbs` files, a `.rb` file has empty `definitions`; `implements` is how "which file implements this symbol" stays answerable. To map an implementation to its declaration, join `implements[].symbol` against `definitions[].symbol` across files.
 
-- `symbol` — String. The enclosing class/module plus the name (the lexical position of the site, not the declaration it was checked against): a `def bar` in `class Sub` records `::Sub#bar` even when only a superclass declares `bar`. A site with no declaration anywhere is still recorded. Top-level defs record as `::Object` instance methods, which is what Ruby makes them; top-level constants record rooted (`X = 1` is `::X`), which is how RBS spells them. A constant path is concatenated as written, never resolved: `A::B = 2` inside `class Foo` is `::Foo::A::B`, and `::A::B = 2` stays `::A::B`. A constant assigned inside `class << self` or a `Class.new do … end` block is placed under the enclosing class (`::Foo::S`, `::Ctor::INNER`), matching the check's own scope and inline `definitions`.
+- `symbol` — String. The enclosing class/module plus the name (the lexical position of the site, not the declaration it was checked against): a `def bar` in `class Sub` records `::Sub#bar` even when only a superclass declares `bar`. A site with no declaration anywhere is still recorded. Top-level defs record as `::Object` instance methods, which is what Ruby makes them; top-level constants record rooted (`X = 1` is `::X`), which is how RBS spells them. A constant path is concatenated as written, never resolved: `A::B = 2` inside `class Foo` is `::Foo::A::B`, and `::A::B = 2` stays `::A::B`. A constant assigned inside a `Class.new do … end` (or `Struct.new` / `Data.define`) block follows Ruby's cref and lands in the scope enclosing the block, not under the new class (`Ctor = Class.new do INNER = 1 end` at top level is `::INNER`), matching the check's own scope and inline `definitions`. A `class` / `module` keyword inside such a block follows the same rule (`Ctor = Class.new do class Widget; end; end` defines `::Widget`, and its defs record as `::Widget#…` / `::Widget.…`). RBS type names and mixin names written inside the block (`#: Widget`, `include Helper`) resolve in that enclosing scope too, never under the new class. A bare constant assigned inside `class << self` has no record: Ruby defines it on the singleton class, which RBS cannot spell.
 - `kind` — String: `instance_method` / `singleton_method` / `constant` (same vocabulary as `definitions` records). `def self.foo` and defs inside `class << self` are `singleton_method`.
 - `start_byte`, `end_byte` — span of the whole `def` node (keyword through `end`) or the whole assignment (name through the end of the right-hand side).
 
@@ -82,7 +82,7 @@ One record per call/super site the check touched, tagged with a `state`. A union
 
 ### constant
 
-One record per constant *read* site the check touched, tagged with a `state` — the constant sibling of `method_call`'s taxonomy. Reads only: the target of an assignment (`X = 1`, `A::B = 2`) belongs to `implements`, and the superclass position of `class Sub < Base` records nothing here (an extension point, not an omission to work around).
+One record per constant *read* site the check touched, tagged with a `state` — the constant sibling of `method_call`'s taxonomy. The superclass position of `class Sub < Base` records here too, on the span of `Base`: the check resolves it in the enclosing lexical scope before the class opens, so the record shows which class the declaration actually inherits from (`class UserMention < UserMention` inside `module Wikis` resolves to `::Wikis::UserMention` — itself — under the RBS lookup rule, and the record says so). A dynamic superclass (`class Dyn < Class.new(Base)`) has no superclass record; the reads inside the expression record as usual. The target of an assignment (`X = 1`, `A::B = 2`) belongs to `implements`, not here.
 
 - `state` — String. One of:
   - `typed` — the constant resolved and the check emitted no diagnostic for the read.

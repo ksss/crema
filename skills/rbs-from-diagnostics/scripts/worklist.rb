@@ -4,6 +4,7 @@
 # Rank unresolved constants from a `crema check` JSONL by cascade weight.
 #
 #   ruby worklist.rb crema.jsonl [--top N]
+#   ruby worklist.rb crema.jsonl --methods PATH
 #
 # For every `Ruby::UnknownConstant` record the raw count is the number of
 # records sharing its `path` (the constant path as written). The cascade
@@ -20,9 +21,18 @@
 # against the classes found; a reference that resolves to nothing is kept
 # as written so it can be matched against the JSONL `path`.
 #
-# Output is TSV: path, unknown_constant, cascade_no_method, total, roots.
-# `roots` lists up to three `file:line` sites where the path appears in a
-# superclass / include / extend / prepend position.
+# Output is TSV: path, unknown_constant, cascade_no_method, total, roots,
+# smoke. `roots` lists up to three `file:line` sites where the path
+# appears in a superclass / include / extend / prepend position. `smoke`
+# is the file with the most cascading NoMethod records: the file to
+# re-check first after a patch. A path written with and without a leading
+# `::` is one row.
+#
+# `--methods PATH` prints the cascade of one path instead: the NoMethod
+# method names on every class under PATH's roots, with counts. That is the
+# list of methods a patch for PATH has to account for, which a grep for
+# `PATH.method` cannot see because the calls are made on the subclasses
+# with an implicit receiver.
 
 require "json"
 require "prism"
@@ -156,8 +166,12 @@ def check_dirs
   m[1].scan(/"([^"]+)"/).flatten
 end
 
-jsonl = ARGV.shift or abort "usage: worklist.rb crema.jsonl [--top N]"
+jsonl = ARGV.shift or abort "usage: worklist.rb crema.jsonl [--top N | --methods PATH]"
 top = 40
+methods_for = nil
+if (i = ARGV.index("--methods"))
+  methods_for = ARGV[i + 1] or abort "worklist.rb: --methods expects a constant path"
+end
 if (i = ARGV.index("--top"))
   top = Integer(ARGV[i + 1] || abort("usage: worklist.rb crema.jsonl [--top N]"), exception: false) ||
         abort("worklist.rb: --top expects an integer, got #{ARGV[i + 1].inspect}")
@@ -165,15 +179,21 @@ end
 
 unknown = Hash.new { |h, k| h[k] = [] }
 no_method = Hash.new(0)
+no_method_names = Hash.new { |h, k| h[k] = Hash.new(0) } # receiver => method_name => count
+no_method_files = Hash.new { |h, k| h[k] = Hash.new(0) } # receiver => file => count
 files = {}
 File.foreach(jsonl) do |line|
   r = JSON.parse(line)
   files[r["file"]] = true if r["file"]
   case r["code"]
-  when "Ruby::UnknownConstant" then unknown[r["path"]] << r
+  when "Ruby::UnknownConstant" then unknown[r["path"].delete_prefix("::")] << r
   when "Ruby::NoMethod"
     # A union receiver (`::X | nil`) still cascades from each member.
-    r["receiver_type"].to_s.split(" | ").each { |t| no_method[t] += 1 }
+    r["receiver_type"].to_s.split(" | ").each do |t|
+      no_method[t] += 1
+      no_method_names[t][r["method_name"]] += 1
+      no_method_files[t][r["file"]] += 1
+    end
   end
 end
 
@@ -182,12 +202,28 @@ targets = check_dirs&.flat_map { |d| File.directory?(d) ? Dir.glob("#{d}/**/*.rb
 targets.each { |f| graph.parse_file(f) if File.file?(f) }
 graph.finalize!
 
+if methods_for
+  fqns = graph.closure(graph.roots_for(methods_for).map(&:first))
+  counts = Hash.new(0)
+  fqns.each do |f|
+    ["singleton(#{f})", f].each { |t| no_method_names[t].each { |m, c| counts[m] += c } }
+  end
+  puts %w[count method_name].join("\t")
+  counts.sort_by { |m, c| [-c, m] }.each { |m, c| puts [c, m].join("\t") }
+  exit
+end
+
 rows = unknown.map do |path, records|
   roots = graph.roots_for(path)
   fqns = graph.closure(roots.map(&:first))
   cascade = fqns.sum { |f| no_method["singleton(#{f})"] + no_method[f] }
-  [path, records.size, cascade, records.size + cascade, roots.first(3).map { |_, f, l| "#{f}:#{l}" }.join(",")]
+  per_file = Hash.new(0)
+  fqns.each do |f|
+    ["singleton(#{f})", f].each { |t| no_method_files[t].each { |file, c| per_file[file] += c } }
+  end
+  smoke = per_file.max_by { |file, c| [c, file] }&.first || ""
+  [path, records.size, cascade, records.size + cascade, roots.first(3).map { |_, f, l| "#{f}:#{l}" }.join(","), smoke]
 end
 
-puts %w[path unknown_constant cascade_no_method total roots].join("\t")
+puts %w[path unknown_constant cascade_no_method total roots smoke].join("\t")
 rows.sort_by { |r| [-r[3], r[0]] }.first(top).each { |r| puts r.join("\t") }

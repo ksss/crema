@@ -157,6 +157,13 @@ enum Commands {
         /// This output is ideal for use as a baseline.
         #[arg(long = "tamp")]
         tamp: bool,
+
+        /// Number of threads for the parallel phases (parse + inline
+        /// collection). Defaults to `CREMA_THREADS` if set, else every
+        /// available core. `1` runs single-threaded, which is the
+        /// yardstick for timing comparisons.
+        #[arg(long = "threads", value_name = "N")]
+        threads: Option<usize>,
     },
     /// Export check-internal facts (definitions, implements,
     /// method-call sites, consulted symbols) as one JSON document on
@@ -171,6 +178,13 @@ enum Commands {
         /// types.
         #[arg(short = 'e')]
         eval: Option<String>,
+
+        /// Number of threads for the parallel phases (parse + inline
+        /// collection). Defaults to `CREMA_THREADS` if set, else every
+        /// available core. `1` runs single-threaded, which is the
+        /// yardstick for timing comparisons.
+        #[arg(long = "threads", value_name = "N")]
+        threads: Option<usize>,
     },
     /// Reference documentation (crema.toml keys, diagnostic codes)
     Doc {
@@ -717,7 +731,17 @@ fn collect_rb_files(dir: &Path, out: &mut Vec<PathBuf>) {
             }
         };
         let path = entry.path();
-        if path.is_dir() {
+        // `entry.file_type()` reads the type `read_dir` already
+        // returned — usually free of an extra stat, unlike
+        // `path.is_dir()` (always one). Symlinks fall back to a stat
+        // so a symlinked directory is still recursed into (same shape
+        // as `snapshot::freshness::collect`).
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_symlink() => path.is_dir(),
+            Ok(ft) => ft.is_dir(),
+            Err(_) => path.is_dir(),
+        };
+        if is_dir {
             collect_rb_files(&path, out);
         } else if path.extension().is_some_and(|ext| ext == "rb") {
             out.push(path);
@@ -989,7 +1013,13 @@ fn collect_rbs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // Same `file_type()` + symlink fallback as `collect_rb_files`.
+        let is_dir = match entry.file_type() {
+            Ok(ft) if ft.is_symlink() => path.is_dir(),
+            Ok(ft) => ft.is_dir(),
+            Err(_) => path.is_dir(),
+        };
+        if is_dir {
             collect_rbs_files(&path, out);
         } else if path.extension().is_some_and(|ext| ext == "rbs") {
             out.push(path);
@@ -1325,6 +1355,7 @@ struct CheckInvocation {
     no_g_snapshot: bool,
     refresh_g_snapshot: bool,
     tamp: bool,
+    threads: Option<usize>,
 }
 
 /// Which per-file phase `run_check` runs after the shared env phase.
@@ -1356,6 +1387,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         no_g_snapshot,
         refresh_g_snapshot,
         tamp,
+        threads,
     } = args;
     // Captured once, ahead of `eval`'s move into the `sources`
     // construction below (ADR-0029 §5) — every later gate reads
@@ -1885,6 +1917,20 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     }
 
     let snapshot_timing = std::env::var_os("CREMA_DEBUG_SNAPSHOT_TIMING").is_some_and(|v| v == "1");
+    // Pool size for the parallel phases (ADR-0033): `--threads N`
+    // wins, then `CREMA_THREADS=<n>` (what the perf gate exports so
+    // User time keeps measuring algorithmic cost single-threaded),
+    // then rayon's default (available parallelism). `build_global`
+    // fails only if a pool already exists, which is fine to ignore.
+    let threads = threads.or_else(|| {
+        std::env::var_os("CREMA_THREADS")
+            .and_then(|v| v.to_str().and_then(|v| v.parse::<usize>().ok()))
+    });
+    if let Some(n) = threads {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+    }
     let d_setup = t_run.elapsed();
     let t_ingest = std::time::Instant::now();
     // Buffer for environment-level diagnostics (parser / inline /
@@ -1905,36 +1951,6 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         if let Err(e) = result {
             eprintln!("warning: failed to load sig {}: {}", path.display(), e);
         }
-    }
-
-    // Read all sources: Layer 3 (below) type-checks every
-    // requested file every run.
-    // ADR-0029 §5: `-e` code is appended on top of the scope
-    // files rather than replacing them — the scope still gets
-    // built into the environment exactly like a bare `crema
-    // check`, and the eval pseudo-file participates in the same
-    // Pass 0/1 (its declarations join the in-memory environment
-    // so a self-contained snippet can define + call its own
-    // classes). What `-e` never does is *persist*: every
-    // snapshot write below is gated on `!eval_active`. It keeps
-    // the pseudo-path `-e` both for diagnostic display and for
-    // Location tracking (the build-layer validator resolves `-e`
-    // via the in-memory source cache below).
-    let mut sources: Vec<(PathBuf, Arc<[u8]>)> = files
-        .iter()
-        .map(|file| {
-            let source = match std::fs::read(file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: cannot read {}: {}", file.display(), e);
-                    process::exit(2);
-                }
-            };
-            (file.clone(), Arc::from(source))
-        })
-        .collect();
-    if let Some(code) = eval {
-        sources.push((PathBuf::from("-e"), Arc::from(code.into_bytes())));
     }
 
     fn flush_env_diagnostics<W: std::io::Write>(
@@ -1993,84 +2009,190 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     .with_filter(diagnostic_filter)
     .with_display_base(display_base)
     .with_tamped(tamp);
+
+    // Read all sources: Layer 3 (below) type-checks every
+    // requested file every run.
+    // ADR-0029 §5: `-e` code is appended on top of the scope
+    // files rather than replacing them — the scope still gets
+    // built into the environment exactly like a bare `crema
+    // check`, and the eval pseudo-file participates in the same
+    // Pass 0/1 (its declarations join the in-memory environment
+    // so a self-contained snippet can define + call its own
+    // classes). What `-e` never does is *persist*: every
+    // snapshot write below is gated on `!eval_active`. It keeps
+    // the pseudo-path `-e` both for diagnostic display and for
+    // Location tracking (the build-layer validator resolves `-e`
+    // via the in-memory source cache below). The file path is
+    // threaded through even in `-e` mode so inline mixins carry a
+    // Location keyed on the `-e` pseudo-path.
+    //
+    // Pass 0 (read + prism parse) and the inline collector run on
+    // the rayon pool (ADR-0033). Every check target's AST is needed
+    // for Layer 3 regardless of warm/cold. Reading scales poorly (a
+    // static split saturates at ~1.4x on APFS and ~1.6x on Linux,
+    // and spreading it over the pool measured slower than one thread
+    // on APFS) and takes about as long as the parallel parse +
+    // collect, so the two are overlapped rather than summed: main
+    // reads in walk order and hands batches to the pool as their
+    // bytes land, so the read hides behind the parse on either OS.
+    // Each pool thread collects against its own `NameTable`:
+    // `Symbol` / `TypeName` ids are content-addressed (ADR-0025),
+    // so a worker's declarations are valid in main's table once the
+    // worker's interners are merged in below, and the one
+    // positional `Name` a worker needs (the file path) is interned
+    // here, on main, before dispatch. Results are put back in walk
+    // order by index, so the sequential insert loop below sees
+    // files in the same order the old single-thread loop did.
+    let inline_mode = resolved.inline;
+    let eval_code: Option<Arc<[u8]>> = eval.map(|code| Arc::from(code.into_bytes()));
+    let eval_path = PathBuf::from("-e");
+    let n = files.len() + usize::from(eval_code.is_some());
+    let path_at = |i: usize| -> &Path {
+        if i < files.len() {
+            files[i].as_path()
+        } else {
+            eval_path.as_path()
+        }
+    };
+    // One slot per file: the reading thread fills it, the parse task
+    // borrows it for as long as the AST lives (through the check loop).
+    let slots: Vec<std::sync::OnceLock<Arc<[u8]>>> =
+        (0..n).map(|_| std::sync::OnceLock::new()).collect();
+    let units: Vec<crema::inline_parser::SourceFile<'_>> = (0..n)
+        .map(|i| crema::inline_parser::SourceFile::intern(path_at(i), draft.names()))
+        .collect();
+    // One slot per pool thread, addressed by `current_thread_index`,
+    // plus one at the end for main (which is not a pool thread) —
+    // each lock is only ever taken by its own thread, so it is
+    // uncontended.
+    let pool_threads = rayon::current_num_threads();
+    let workers: Vec<std::sync::Mutex<IngestWorker<'_>>> = (0..=pool_threads)
+        .map(|_| std::sync::Mutex::new(IngestWorker::default()))
+        .collect();
+
+    // Files are handed to the pool in batches of 32 rather than one
+    // task per file (6,941 spawns -> ~220 on the gitlab workload).
+    // Measured: -4% User time at 6 threads, same wall time. The bulk
+    // of the extra CPU a parallel run shows over a single-threaded
+    // one is not spawn overhead but the E-cores' slower parse counted
+    // in CPU-seconds.
+    //
+    // `in_place_scope` keeps the read loop on main; the pool only
+    // ever runs parse + collect. With a one-thread pool
+    // (`CREMA_THREADS=1`) the batches run inline on main as well
+    // instead of hopping to the lone worker: measured on the steep
+    // workload, AST / declaration memory allocated on a worker and
+    // dropped on main costs the check phase ~3% (mimalloc frees
+    // across threads), and the single-thread path is the perf
+    // gate's and the Steep / Sorbet comparison's yardstick.
+    const INGEST_BATCH: usize = 32;
+    let single_thread = pool_threads == 1;
+    let infusion_collect = infusion_active.then_some(InfusionCollectOptions {
+        options: resolved.infusion,
+        inflector: &inflector_owner,
+    });
+    rayon::in_place_scope(|s| {
+        let mut batch: Vec<(usize, &[u8], crema::inline_parser::SourceFile<'_>)> =
+            Vec::with_capacity(INGEST_BATCH);
+        for (i, unit) in units.iter().enumerate() {
+            let bytes: Arc<[u8]> = match &eval_code {
+                Some(code) if i == files.len() => Arc::clone(code),
+                _ => match std::fs::read(unit.path) {
+                    Ok(bytes) => Arc::from(bytes),
+                    Err(e) => {
+                        eprintln!("error: cannot read {}: {}", unit.path.display(), e);
+                        process::exit(2);
+                    }
+                },
+            };
+            let source: &[u8] = &slots[i].get_or_init(|| bytes)[..];
+            batch.push((i, source, *unit));
+            if batch.len() == INGEST_BATCH || i + 1 == n {
+                let batch = std::mem::replace(&mut batch, Vec::with_capacity(INGEST_BATCH));
+                if single_thread {
+                    run_ingest_batch(&workers, inline_mode, infusion_collect, batch);
+                } else {
+                    let workers = &workers;
+                    s.spawn(move |_| {
+                        run_ingest_batch(workers, inline_mode, infusion_collect, batch)
+                    });
+                }
+            }
+        }
+    });
+
+    let sources: Vec<(PathBuf, Arc<[u8]>)> = (0..n)
+        .map(|i| {
+            let bytes = slots[i]
+                .get()
+                .expect("every source slot is filled by the read loop");
+            (path_at(i).to_path_buf(), Arc::clone(bytes))
+        })
+        .collect();
+    // Nothing is emitted before this point, so registering the
+    // sources after the read is equivalent to registering them
+    // before it.
     for (file, source) in &sources {
         emitter.register_source(file.clone(), Arc::clone(source));
     }
-
-    // Pass 0 (parse, shared): every check target's AST is needed
-    // for Layer 3 regardless of warm/cold. Inline-annotation
-    // collection (which mutates the draft) branches below by
-    // mode. The file path is threaded through even in `-e` mode
-    // so inline mixins carry a Location keyed on the `-e`
-    // pseudo-path; the build validator reads the in-memory
-    // source from `source_cache` below to produce accurate
-    // `file:line` on arity diagnostics.
-    let mut parsed_sources = Vec::with_capacity(sources.len());
-    for (file, source) in &sources {
-        let source = &source[..];
-        let parse_result = ruby_prism::parse(source);
-
-        // Prism returns an AST even when the source is
-        // syntactically invalid. Walking that recovery AST is
-        // unsafe: receiver-less CallNodes like `{a!: }` (which
-        // Ruby itself rejects with SyntaxError) get type-checked
-        // as real calls and surface as NoMethod diagnostics on
-        // input ruby itself refuses to run. Mirror Steep's
-        // policy ("Ruby rejects → type checker stays silent")
-        // by emitting one `Ruby::SyntaxError` (anchored at the
-        // first prism error) and skipping inline collection
-        // and type checking for this file. Build / validator
-        // still see other files' declarations.
-        if let Some(first_err) = parse_result.errors().next() {
-            let offset = first_err.location().start_offset();
-            let message = first_err.message().to_string();
-            let location = crema::diagnostic::Diagnostic::location_for_byte_range(
-                file.clone(),
-                source,
-                offset,
-                first_err.location().end_offset(),
-            );
-            let diag = crema::diagnostic::Diagnostic::at(
-                location,
-                DiagnosticKind::SyntaxError { message },
-            );
-            env_diags.push(diag);
-            continue;
+    let mut ingested: Vec<Option<IngestedFile<'_>>> = (0..n).map(|_| None).collect();
+    for worker in workers {
+        let IngestWorker { names, results } =
+            worker.into_inner().expect("ingest worker slot poisoned");
+        draft.names().merge(names);
+        for (i, result) in results {
+            ingested[i] = Some(result);
         }
+    }
 
-        parsed_sources.push(ParsedSource {
-            file: file.as_path(),
-            source,
-            parse_result: Some(parse_result),
-            content_hash: None,
-        });
+    let mut parsed_sources = Vec::with_capacity(n);
+    let mut collected = Vec::with_capacity(n);
+    // Indexed by walk index (a `None` per syntax-error file), which is
+    // the `source_index` the workers stamped on their concern records.
+    let mut infusion_collected: Vec<Option<crema::infusion_collector::CollectedSource<'_>>> =
+        (0..n).map(|_| None).collect();
+    for (i, ingested) in ingested.into_iter().enumerate() {
+        match ingested.expect("every file is ingested exactly once") {
+            IngestedFile::SyntaxError(diag) => env_diags.push(diag),
+            IngestedFile::Parsed {
+                source,
+                ast,
+                decls,
+                diags,
+                infusion,
+            } => {
+                parsed_sources.push(ParsedSource {
+                    file: sources[i].0.as_path(),
+                    source,
+                    parse_result: Some(ast.0),
+                    content_hash: None,
+                });
+                collected.push((decls, diags));
+                infusion_collected[i] = infusion;
+            }
+        }
     }
 
     if snapshot_timing {
-        eprintln!("ingest: read+parse {}us", t_ingest.elapsed().as_micros());
+        eprintln!(
+            "ingest: read+parse+collect {}us",
+            t_ingest.elapsed().as_micros()
+        );
     }
     let t_inline = std::time::Instant::now();
-    // Mutate the draft for every file, the eval pseudo-file
-    // included (ADR-0029 §5 rework — eval declarations live
-    // in the in-memory environment; only snapshot persistence
-    // is eval-gated).
-    for parsed in &parsed_sources {
-        let inline_diags = if resolved.inline {
-            crema::inline_parser::load_inline_annotations(
-                parsed.source,
-                parsed.ast(),
-                Some(parsed.file),
-                &mut draft,
-            )
-        } else {
-            crema::inline_parser::parse_inline_annotations(
-                parsed.source,
-                parsed.ast(),
-                Some(parsed.file),
-                &mut draft,
-            )
-        };
-        env_diags.extend(inline_diags);
+    // Insert the collected declarations into the draft, single-threaded
+    // and in walk order, for every file — the eval pseudo-file
+    // included (ADR-0029 §5 rework — eval declarations live in the
+    // in-memory environment; only snapshot persistence is eval-gated).
+    // Sig mode (`inline = false`) collects for the diagnostics only
+    // and inserts nothing, as `parse_inline_annotations` did.
+    for (parsed, (decls, mut diags)) in parsed_sources.iter().zip(collected) {
+        if inline_mode {
+            for decl in &decls {
+                draft.insert_ruby_decl(decl, parsed.source, Some(parsed.file), &mut diags);
+            }
+        }
+        env_diags.extend(diags);
     }
 
     if infusion_active {
@@ -2112,8 +2234,8 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         } else {
             None
         };
-        env_diags.extend(crema::infusion_collector::load_all_with_schema(
-            &infusion_sources,
+        env_diags.extend(crema::infusion_collector::load_collected(
+            infusion_collected,
             &mut draft,
             resolved.infusion,
             &inflector_owner,
@@ -2133,7 +2255,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
 
     if snapshot_timing {
         eprintln!(
-            "ingest: inline+infusion {}us",
+            "ingest: insert+infusion {}us",
             t_inline.elapsed().as_micros()
         );
     }
@@ -2575,6 +2697,156 @@ impl<'a> ParsedSource<'a> {
     }
 }
 
+/// A prism `ParseResult` that may be moved off the thread that parsed it.
+///
+/// `ParseResult` holds `NonNull` pointers into the C parser and node
+/// tree, which makes it `!Send` by default. Everything those pointers
+/// reach is heap-owned by the result itself (freed in its `Drop`); prism
+/// keeps no thread-local or global parser state. The parallel ingest
+/// moves each result exactly once — a worker parses, main takes over as
+/// the sole owner for infusion / the release pre-pass / the check loop —
+/// so the move is sound. `Sync` is deliberately not claimed: nothing
+/// shares an AST across threads. If a later ADR makes check workers
+/// re-parse their own files, this wrapper goes away with the handoff.
+struct SendParseResult<'a>(ruby_prism::ParseResult<'a>);
+
+// SAFETY: see the type doc — heap-only state, single owner at a time,
+// moved (never shared) across the worker → main boundary.
+unsafe impl Send for SendParseResult<'_> {}
+
+/// What one parallel-ingest worker produces for one check target.
+enum IngestedFile<'a> {
+    /// Prism reported an error: one `Ruby::SyntaxError`, and the file
+    /// takes no further part in the run (no inline collection, no
+    /// type check; see `ingest_file`).
+    SyntaxError(crema::diagnostic::Diagnostic),
+    Parsed {
+        source: &'a [u8],
+        ast: SendParseResult<'a>,
+        /// Top-level declarations the inline collector found, to be
+        /// inserted into the draft on main in walk order.
+        decls: Vec<crema::ast::ruby::declarations::Declaration>,
+        /// Collection-time diagnostics (annotation syntax errors and
+        /// the like); insert-time diagnostics are appended on main.
+        diags: Vec<crema::diagnostic::Diagnostic>,
+        /// The rails infusion collect half for this file, walked on the
+        /// same worker right after the inline collector so the AST is
+        /// walked twice on the worker rather than once there and once
+        /// on main. `None` when no infusion is active (the collector is
+        /// not built at all).
+        infusion: Option<crema::infusion_collector::CollectedSource<'a>>,
+    },
+}
+
+/// What the infusion collect half needs per file, shared read-only by
+/// every ingest worker. `None` when no infusion is active.
+#[derive(Clone, Copy)]
+struct InfusionCollectOptions<'a> {
+    options: crema::config::InfusionOptions,
+    inflector: &'a crema::infusion_collector::Inflector,
+}
+
+/// One pool thread's share of the ingest: the `NameTable` it collects
+/// against and the files it finished, tagged with their walk index.
+struct IngestWorker<'a> {
+    names: crema::name::NameTable,
+    results: Vec<(usize, IngestedFile<'a>)>,
+}
+
+impl Default for IngestWorker<'_> {
+    fn default() -> Self {
+        IngestWorker {
+            names: crema::name::NameTable::new(),
+            results: Vec::new(),
+        }
+    }
+}
+
+/// Run `ingest_file` over one batch on the calling thread's own
+/// [`IngestWorker`] slot — its pool index, or the trailing slot when
+/// the caller is main (not a pool thread).
+fn run_ingest_batch<'a>(
+    workers: &[std::sync::Mutex<IngestWorker<'a>>],
+    inline_mode: bool,
+    infusion: Option<InfusionCollectOptions<'a>>,
+    batch: Vec<(usize, &'a [u8], crema::inline_parser::SourceFile<'a>)>,
+) {
+    let idx = rayon::current_thread_index().unwrap_or(workers.len() - 1);
+    let mut worker = workers[idx].lock().expect("ingest worker slot poisoned");
+    for (i, source, unit) in batch {
+        let result = ingest_file(i, source, unit, &worker.names, inline_mode, infusion);
+        worker.results.push((i, result));
+    }
+}
+
+/// Parse one check target and run the inline collector — and, when an
+/// infusion is active, the infusion collector — on it, against the
+/// worker's own `names` (ADR-0033). Pure with respect to the draft.
+/// `index` is the file's walk index; it is the `source_index` the
+/// infusion insert half resolves concern files through.
+fn ingest_file<'a>(
+    index: usize,
+    source: &'a [u8],
+    file: crema::inline_parser::SourceFile<'a>,
+    names: &crema::name::NameTable,
+    inline_mode: bool,
+    infusion: Option<InfusionCollectOptions<'a>>,
+) -> IngestedFile<'a> {
+    let parse_result = ruby_prism::parse(source);
+
+    // Prism returns an AST even when the source is syntactically
+    // invalid. Walking that recovery AST is unsafe: receiver-less
+    // CallNodes like `{a!: }` (which Ruby itself rejects with
+    // SyntaxError) get type-checked as real calls and surface as
+    // NoMethod diagnostics on input ruby itself refuses to run.
+    // Mirror Steep's policy ("Ruby rejects → type checker stays
+    // silent") by emitting one `Ruby::SyntaxError` (anchored at the
+    // first prism error) and skipping inline collection and type
+    // checking for this file. Build / validator still see other
+    // files' declarations.
+    if let Some(first_err) = parse_result.errors().next() {
+        let offset = first_err.location().start_offset();
+        let message = first_err.message().to_string();
+        let location = crema::diagnostic::Diagnostic::location_for_byte_range(
+            file.path.to_path_buf(),
+            source,
+            offset,
+            first_err.location().end_offset(),
+        );
+        return IngestedFile::SyntaxError(crema::diagnostic::Diagnostic::at(
+            location,
+            DiagnosticKind::SyntaxError { message },
+        ));
+    }
+
+    let (decls, diags) = crema::inline_parser::collect_inline_declarations(
+        source,
+        &parse_result,
+        Some(file),
+        names,
+        inline_mode,
+    );
+    let infusion = infusion.map(|infusion| {
+        crema::infusion_collector::collect_source(
+            names,
+            index,
+            Some(file.name),
+            source,
+            Some(file.path),
+            &parse_result,
+            infusion.options,
+            infusion.inflector,
+        )
+    });
+    IngestedFile::Parsed {
+        source,
+        ast: SendParseResult(parse_result),
+        decls,
+        diags,
+        infusion,
+    }
+}
+
 /// The per-file phase of `crema extract` (invoked from `run_check`
 /// after env construction): run the site-collecting check on every
 /// scope file with consultation recording on, join in the per-file
@@ -2801,6 +3073,7 @@ fn main() {
             no_g_snapshot,
             refresh_g_snapshot,
             tamp,
+            threads,
         } => run_check(
             cli_config.as_deref(),
             no_bundler,
@@ -2815,10 +3088,11 @@ fn main() {
                 no_g_snapshot,
                 refresh_g_snapshot,
                 tamp,
+                threads,
             },
             RunMode::Check,
         ),
-        Commands::Extract { eval } => run_check(
+        Commands::Extract { eval, threads } => run_check(
             cli_config.as_deref(),
             no_bundler,
             CheckInvocation {
@@ -2832,6 +3106,7 @@ fn main() {
                 no_g_snapshot: false,
                 refresh_g_snapshot: false,
                 tamp: false,
+                threads,
             },
             RunMode::Extract,
         ),

@@ -382,6 +382,28 @@ impl NameTable {
         &self.builtins
     }
 
+    /// Absorb the content-addressed interners of `other` (a worker
+    /// table from the parallel ingest, ADR-0033). `Symbol` / `TypeName`
+    /// ids are xxh3-derived (ADR-0025), so entries already present here
+    /// coincide with `other`'s and the union is a plain map merge; no
+    /// id remapping of the data the worker produced is needed.
+    ///
+    /// `Name` ids are positional, so a worker must never have interned
+    /// one: the caller pre-interns every `Name` the worker needs (file
+    /// paths) and hands them over. A non-empty overlay in `other` means
+    /// the worker minted ids main cannot resolve — refuse loudly rather
+    /// than let dangling `Name`s reach a diagnostic.
+    pub fn merge(&self, other: NameTable) {
+        assert!(
+            other.names.borrow().len() == 0,
+            "merged NameTable must not carry positional `Name` entries"
+        );
+        self.symbols.borrow_mut().merge(other.symbols.into_inner());
+        self.type_names
+            .borrow_mut()
+            .merge(other.type_names.into_inner());
+    }
+
     /// Intern a string, returning the same `Name` for equal strings.
     pub fn intern(&self, s: &str) -> Name {
         Name::from_overlay_id(self.names.borrow_mut().intern(s))

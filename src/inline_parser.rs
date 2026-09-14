@@ -35,7 +35,7 @@ use crate::data_struct_recognizer::{DataStructConstructionKind, data_struct_cons
 use crate::diagnostic::{Diagnostic, DiagnosticKind, InlineAliasKind};
 use crate::environment::draft::EnvironmentDraft;
 use crate::environment::ruby_decl::{build_annotation_syntax_error, parse_rbs_type};
-use crate::name::NameTable;
+use crate::name::{Name, NameTable};
 use crate::rbs_raw::Parser as RbsParser;
 use crate::type_name::TypeName;
 
@@ -53,6 +53,10 @@ pub(crate) use comment_association::{
 /// - `class_stack` is the lexical nesting of class / module names
 ///   (raw segment strings), used to derive each decl's absolute
 ///   `TypeName` and to gate top-level-only checks (`is_empty()`).
+/// - `cref_stack` is Ruby's cref for bare constant writes. It mirrors
+///   `class_stack` except inside a `Const = Class.new do ... end` block
+///   body, which owns `def`s (pushed on `class_stack`) but whose
+///   constants are defined in the *outer* scope (not pushed here).
 /// - `scope_stack` is the **current open class/module's member list**.
 ///   When the walker enters a class/module it pushes an empty
 ///   `Vec<Member>`; when it leaves it pops, wraps the result in a
@@ -64,13 +68,43 @@ pub(crate) use comment_association::{
 /// intentionally dropped (as they already were with the flat
 /// `RawInlineMember` enum) because there is no class on which to hang
 /// them. Top-level `CONST =` becomes a top-level [`Declaration::Constant`].
+/// A check target's on-disk identity as the inline collector needs it:
+/// the path (for `Diagnostic.file`) and that same path already interned
+/// as a [`Name`] by the caller (for `Location.source_file` on the
+/// collected members). Pre-interning keeps the collector from writing
+/// into the positional `Name` overlay of whichever `NameTable` it runs
+/// against — a parallel-ingest worker's table (ADR-0033) would otherwise
+/// mint `Name` ids main cannot resolve.
+#[derive(Clone, Copy)]
+pub struct SourceFile<'a> {
+    pub path: &'a Path,
+    pub name: Name,
+}
+
+impl<'a> SourceFile<'a> {
+    /// Intern `path` into `names` (the table the collected declarations
+    /// will be inserted into) and pair it with the path.
+    pub fn intern(path: &'a Path, names: &NameTable) -> Self {
+        SourceFile {
+            path,
+            name: names.intern(&path.to_string_lossy()),
+        }
+    }
+}
+
 struct InlineCollector<'a> {
     source: &'a [u8],
     line_index: LineIndex,
-    file: Option<&'a Path>,
+    file: Option<SourceFile<'a>>,
     comments: &'a CommentAssociation,
     names: &'a NameTable,
     class_stack: Vec<String>,
+    cref_stack: Vec<String>,
+    /// For each `cref_stack` entry, the index of its member list in
+    /// `scope_stack`. A `Class.new do` block pushes a `scope_stack`
+    /// frame without a cref frame, so declarations written inside it
+    /// ([`attach_declaration`]) go to the cref's list, not the block's.
+    cref_scope_frames: Vec<usize>,
     /// Declarations emitted at the file's top level (outside any class
     /// or module). Populated by [`attach_declaration`] when
     /// `scope_stack` is empty.
@@ -154,7 +188,7 @@ impl<'a> InlineCollector<'a> {
     fn new(
         source: &'a [u8],
         line_index: LineIndex,
-        file: Option<&'a Path>,
+        file: Option<SourceFile<'a>>,
         comments: &'a CommentAssociation,
         names: &'a NameTable,
         inline_mode: bool,
@@ -166,6 +200,8 @@ impl<'a> InlineCollector<'a> {
             comments,
             names,
             class_stack: vec![],
+            cref_stack: vec![],
+            cref_scope_frames: vec![],
             top_level: vec![],
             scope_stack: vec![],
             diagnostics: vec![],
@@ -173,6 +209,14 @@ impl<'a> InlineCollector<'a> {
             singleton_class_depth: 0,
             inline_mode,
         }
+    }
+
+    fn path(&self) -> Option<&'a Path> {
+        self.file.map(|f| f.path)
+    }
+
+    fn file_name(&self) -> Option<Name> {
+        self.file.map(|f| f.name)
     }
 
     /// Push a leaf member (def / attr / mixin) into the currently-open
@@ -189,12 +233,18 @@ impl<'a> InlineCollector<'a> {
             .push(m);
     }
 
-    /// Attach a finished declaration to its parent: either the enclosing
-    /// class/module's member list, or the top-level list when there is
-    /// no enclosing scope.
+    /// Attach a finished declaration to its parent: the member list of
+    /// the enclosing *cref* (Ruby defines classes, modules and constants
+    /// into the cref), or the top-level list when there is none. Inside
+    /// a `Const = Class.new do ... end` block the innermost `scope_stack`
+    /// frame is the block's class, which is not a cref frame, so the
+    /// declaration is hoisted past it — the environment builder derives
+    /// each declaration's resolution context from this tree, and a
+    /// `::Widget` nested under `::Ctor` would resolve its body's names
+    /// through `::Ctor` first.
     fn attach_declaration(&mut self, decl: Declaration) {
-        match self.scope_stack.last_mut() {
-            Some(parent) => parent.push(Member::Declaration(decl)),
+        match self.cref_scope_frames.last() {
+            Some(&frame) => self.scope_stack[frame].push(Member::Declaration(decl)),
             None => self.top_level.push(decl),
         }
     }
@@ -212,7 +262,7 @@ impl<'a> InlineCollector<'a> {
 
     fn diagnostic_location(&self, range: PrismByteRange) -> crate::location::SourceLocation {
         Diagnostic::location_for_byte_range(
-            self.file.map(|p| p.to_path_buf()).unwrap_or_default(),
+            self.path().map(|p| p.to_path_buf()).unwrap_or_default(),
             self.source,
             range.0 as usize,
             range.1 as usize,
@@ -283,7 +333,7 @@ impl<'a> InlineCollector<'a> {
                     if let Err(err) = RbsParser::parse_inline_trailing(body.as_bytes()) {
                         self.diagnostics.push(build_annotation_syntax_error(
                             self.source,
-                            self.file,
+                            self.path(),
                             range,
                             err,
                         ));
@@ -298,7 +348,7 @@ impl<'a> InlineCollector<'a> {
             name_nodes,
             type_text,
             annotation_range,
-            source_file: self.file.map(|p| self.names.intern(&p.to_string_lossy())),
+            source_file: self.file_name(),
         };
         if self.in_singleton_class() {
             self.push_singleton_attr_methods(&attribute, call_kind);
@@ -482,7 +532,7 @@ impl<'a> InlineCollector<'a> {
             Err(err) => {
                 self.diagnostics.push(build_annotation_syntax_error(
                     self.source,
-                    self.file,
+                    self.path(),
                     range,
                     err,
                 ));
@@ -572,7 +622,7 @@ impl<'a> InlineCollector<'a> {
                 }],
                 type_text,
                 annotation_range,
-                source_file: self.file.map(|p| self.names.intern(&p.to_string_lossy())),
+                source_file: self.file_name(),
             };
             let member = match kind {
                 DataStructConstructionKind::Struct if options.readonly_attributes => {
@@ -732,8 +782,10 @@ impl<'a> InlineCollector<'a> {
     /// Walk a block body that should be treated as a class body — used
     /// by both `Const = Class.new(...) do ... end` and
     /// `Const = Struct.new(...)/Data.define(...) do ... end`. Pushes the
-    /// class onto `class_stack` (so nested writes and unqualified leaf
-    /// names resolve under it), resets `singleton_class_depth`, and
+    /// class onto `class_stack` only — not `cref_stack`, since Ruby's
+    /// `class_eval` on the block leaves the cref at the outer scope, so
+    /// a bare `INNER = 1` inside registers as the outer scope's
+    /// constant — resets `singleton_class_depth`, and
     /// dispatches the body through the default `Visit` traversal so
     /// `def`, `attr_*`, and `include`/`extend`/`prepend` calls register
     /// against the class. Also sweeps enclosed `@ivar: T` annotations
@@ -797,6 +849,7 @@ impl<'a> InlineCollector<'a> {
                 byte_range: class_new.super_class_byte_range,
             }),
             members,
+            block_body: true,
         }
     }
 
@@ -832,6 +885,7 @@ impl<'a> InlineCollector<'a> {
                 &attributes,
             )),
             members,
+            block_body: true,
         }
     }
 
@@ -902,7 +956,13 @@ impl<'a> InlineCollector<'a> {
 
 impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
     fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
-        if push_class_abs_path(&mut self.class_stack, &node.constant_path()).is_none() {
+        if push_class_abs_path_under(
+            &mut self.class_stack,
+            self.cref_stack.last().map(String::as_str),
+            &node.constant_path(),
+        )
+        .is_none()
+        {
             let loc = node.constant_path().location();
             self.diagnostics.push(Diagnostic {
                 scope: None,
@@ -911,6 +971,8 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             });
             return;
         }
+        self.cref_stack
+            .push(self.class_stack.last().unwrap().clone());
 
         let class_name = self.current_class_typename().unwrap();
         let name_location = prism_location_range(node.constant_path().location());
@@ -973,12 +1035,15 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
         self.scope_stack.push(Vec::new());
+        self.cref_scope_frames.push(self.scope_stack.len() - 1);
         ruby_prism::visit_class_node(self, node);
         self.collect_enclosed_instance_variable_members(node.location());
         let mut members = self.scope_stack.pop().unwrap();
+        self.cref_scope_frames.pop();
         self.singleton_class_depth = saved_singleton_class_depth;
         members.sort_by_key(Member::location_start);
         self.class_stack.pop();
+        self.cref_stack.pop();
 
         let class_decl = if let Some(data_struct) = data_struct_super {
             self.data_struct_class_decl(
@@ -994,6 +1059,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
                 name_location,
                 super_class,
                 members,
+                block_body: false,
             }
         };
 
@@ -1001,7 +1067,13 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
     }
 
     fn visit_module_node(&mut self, node: &ModuleNode<'pr>) {
-        if push_class_abs_path(&mut self.class_stack, &node.constant_path()).is_none() {
+        if push_class_abs_path_under(
+            &mut self.class_stack,
+            self.cref_stack.last().map(String::as_str),
+            &node.constant_path(),
+        )
+        .is_none()
+        {
             let loc = node.constant_path().location();
             self.diagnostics.push(Diagnostic {
                 scope: None,
@@ -1010,6 +1082,8 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             });
             return;
         }
+        self.cref_stack
+            .push(self.class_stack.last().unwrap().clone());
 
         let module_name = self.current_class_typename().unwrap();
         let name_location = prism_location_range(node.constant_path().location());
@@ -1018,13 +1092,16 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
         self.scope_stack.push(Vec::new());
+        self.cref_scope_frames.push(self.scope_stack.len() - 1);
         self.collect_leading_module_self_members(module_start_line);
         ruby_prism::visit_module_node(self, node);
         self.collect_enclosed_instance_variable_members(node.location());
         let mut members = self.scope_stack.pop().unwrap();
+        self.cref_scope_frames.pop();
         self.singleton_class_depth = saved_singleton_class_depth;
         members.sort_by_key(Member::location_start);
         self.class_stack.pop();
+        self.cref_stack.pop();
 
         self.attach_declaration(Declaration::Module(Arc::new(ModuleDecl {
             module_name,
@@ -1119,7 +1196,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
                 // `UnusedInlineAnnotation` that would fire for an
                 // annotation that happened to be skipped.
                 let diag =
-                    build_annotation_syntax_error(self.source, self.file, range, parser_error);
+                    build_annotation_syntax_error(self.source, self.path(), range, parser_error);
                 self.diagnostics.push(diag);
             }
             TrailingResolution::Unused(trailing) => {
@@ -1146,7 +1223,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             method_type,
             leading_comment,
             origin: DefMemberOrigin::Real,
-            source_file: self.file.map(|p| self.names.intern(&p.to_string_lossy())),
+            source_file: self.file_name(),
             ivar_param_pairs,
         }));
 
@@ -1213,9 +1290,24 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         if self.is_node_skipped(node.location()) {
             return;
         }
+        // `class << self; S = 1` defines `S` on the singleton class
+        // (Ruby cref), which RBS cannot declare — drop it like the
+        // other singleton-scope shapes, with the inline-only diagnostic.
+        // rbs's `InlineParser` registers it as `Foo::S` only because it
+        // does not track `class << self` at all (docs/inline.md); crema
+        // already diverges there for `def` (singleton method kind).
+        if self.in_singleton_class() {
+            self.mark_enclosed_leading_lines(node.location());
+            if self.inline_mode {
+                self.diagnostics.push(self.singleton_scope_diagnostic(
+                    node.location(),
+                    DiagnosticKind::SingletonScopeConstantDefinition,
+                ));
+            }
+            return;
+        }
         let const_name = String::from_utf8_lossy(node.name().as_slice()).to_string();
-        let qualified_path =
-            qualify_under(self.class_stack.last().map(String::as_str), &const_name);
+        let qualified_path = qualify_under(self.cref_stack.last().map(String::as_str), &const_name);
         let qualified_name = self.names.parse_type_name(&qualified_path);
         self.process_constant_assignment(
             ConstantAssignmentName {
@@ -1377,14 +1469,13 @@ impl<'a> InlineCollector<'a> {
             return;
         }
 
-        let old_name_location = self.file.map(|file| {
-            let file_name = self.names.intern(&file.to_string_lossy());
-            crate::location::RubyLocation {
+        let old_name_location = self
+            .file_name()
+            .map(|file_name| crate::location::RubyLocation {
                 file: file_name,
                 start_byte: byte_range.0,
                 end_byte: byte_range.1,
-            }
-        });
+            });
         let annotation = crate::ast::ruby::annotations::AliasAnnotation::new(
             kind,
             crate::ast::ruby::annotations::AliasAnnotationFields {
@@ -1534,11 +1625,24 @@ pub(crate) fn class_decl_path_string(constant_path: &Node<'_>) -> Option<String>
 /// After a successful push every element of `stack` is an absolute path
 /// string with a leading `::`.  Rooted paths (`class ::A::B`) ignore nesting.
 pub(crate) fn push_class_abs_path(stack: &mut Vec<String>, constant_path: &Node<'_>) -> Option<()> {
+    let enclosing = stack.last().cloned();
+    push_class_abs_path_under(stack, enclosing.as_deref(), constant_path)
+}
+
+/// [`push_class_abs_path`] with an explicit `enclosing` cref: usually
+/// `stack.last()`, but inside a `Const = Class.new do ... end` block the
+/// inline collector passes the block's *outer* scope (Ruby's `class`
+/// keyword defines into the cref, which `class_eval` leaves alone).
+fn push_class_abs_path_under(
+    stack: &mut Vec<String>,
+    enclosing: Option<&str>,
+    constant_path: &Node<'_>,
+) -> Option<()> {
     let path_str = class_decl_path_string(constant_path)?;
     let abs = if path_str.starts_with("::") {
         path_str
     } else {
-        qualify_under(stack.last().map(String::as_str), &path_str)
+        qualify_under(enclosing, &path_str)
     };
     stack.push(abs);
     Some(())
@@ -1647,6 +1751,7 @@ pub fn inline_diagnostics_only(
     if parse_result.errors().next().is_some() {
         return Vec::new();
     }
+    let file = file.map(|path| SourceFile::intern(path, names));
     collect_inline_declarations(source, parse_result, file, names, true).1
 }
 
@@ -1681,8 +1786,14 @@ fn load_inline_annotations_impl(
     if parse_result.errors().next().is_some() {
         return Vec::new();
     }
-    let (top_level, mut diagnostics) =
-        collect_inline_declarations(source, parse_result, file, draft.names(), inline_mode);
+    let source_file = file.map(|path| SourceFile::intern(path, draft.names()));
+    let (top_level, mut diagnostics) = collect_inline_declarations(
+        source,
+        parse_result,
+        source_file,
+        draft.names(),
+        inline_mode,
+    );
 
     if inline_mode {
         for decl in &top_level {
@@ -1697,10 +1808,10 @@ fn load_inline_annotations_impl(
 /// [`load_inline_annotations`] above and by tests that need to observe
 /// the pre-resolution form (e.g. that `SuperClass.type_name` is
 /// relative before `EnvironmentDraft::build` runs).
-pub(crate) fn collect_inline_declarations(
+pub fn collect_inline_declarations(
     source: &[u8],
     parse_result: &ruby_prism::ParseResult<'_>,
-    file: Option<&Path>,
+    file: Option<SourceFile<'_>>,
     names: &NameTable,
     inline_mode: bool,
 ) -> (Vec<Declaration>, Vec<Diagnostic>) {
@@ -1968,14 +2079,13 @@ impl<'a> InlineCollector<'a> {
         &self,
         mut annotation: crate::ast::ruby::annotations::InstanceVariableAnnotation,
     ) -> crate::ast::ruby::annotations::InstanceVariableAnnotation {
-        annotation.source_location = self.file.map(|file| {
-            let file_name = self.names.intern(&file.to_string_lossy());
-            crate::location::RubyLocation {
-                file: file_name,
-                start_byte: annotation.location.0,
-                end_byte: annotation.location.1,
-            }
-        });
+        annotation.source_location =
+            self.file_name()
+                .map(|file_name| crate::location::RubyLocation {
+                    file: file_name,
+                    start_byte: annotation.location.0,
+                    end_byte: annotation.location.1,
+                });
         annotation
     }
 

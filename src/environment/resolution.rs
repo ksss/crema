@@ -55,8 +55,10 @@ use crate::ast::ruby::declarations::{
     Declaration as RubyDeclaration, ModuleDecl as RubyModuleDecl, SuperClass as RubySuperClass,
 };
 use crate::ast::ruby::members::{
-    ExtendMember as RubyExtendMember, IncludeMember as RubyIncludeMember, Member as RubyMember,
-    MixinMember as RubyMixinMember, PrependMember as RubyPrependMember,
+    BlockEntry, DoubleSplatRestEntry, ExplicitAnnotation, ExtendMember as RubyExtendMember,
+    IncludeMember as RubyIncludeMember, Member as RubyMember, MethodTypeAnnotation,
+    MixinMember as RubyMixinMember, PositionalEntry, PrependMember as RubyPrependMember,
+    SplatRestEntry, TypeAnnotations,
 };
 use crate::ast::types::{
     AliasType, BlockType, ClassInstanceType, ClassSingletonType, Function, FunctionParam,
@@ -1374,10 +1376,24 @@ pub(crate) fn collect_ruby_class_names(
     parent_context: &[TypeName],
 ) {
     let self_tn = decl.class_name;
-    let inner_context = extend_context(parent_context, self_tn);
+    let inner_context = ruby_class_inner_context(decl, parent_context);
     all_names.insert(self_tn);
     for member in &decl.members {
         collect_ruby_member_names(member, names, all_names, aliases, &inner_context);
+    }
+}
+
+/// The context a Ruby class decl's members resolve in. rbs
+/// `resolve_ruby_decl` always uses `[context, full_name]`; crema's
+/// `Class.new` / `Struct.new` / `Data.define` block decls
+/// (`ClassDecl::block_body`) keep the enclosing `context`, because Ruby's
+/// cref inside such a block is the scope around the block, not the new
+/// class (`Module.nesting` there does not include it).
+fn ruby_class_inner_context(decl: &RubyClassDecl, context: &[TypeName]) -> Vec<TypeName> {
+    if decl.block_body {
+        context.to_vec()
+    } else {
+        extend_context(context, decl.class_name)
     }
 }
 
@@ -1446,8 +1462,7 @@ pub(crate) fn resolve_ruby_class_recursive(
     nested: &mut FlattenedDecls,
     file: DeclOrigin,
 ) -> Arc<RubyClassDecl> {
-    let self_ns = decl.class_name;
-    let inner_context = extend_context(context, self_ns);
+    let inner_context = ruby_class_inner_context(decl, context);
 
     // SuperClass.type_name carries the source-form name written in the
     // Ruby source (relative or absolute). Resolve against the *outer*
@@ -1469,6 +1484,7 @@ pub(crate) fn resolve_ruby_class_recursive(
         name_location: decl.name_location,
         super_class: resolved_super,
         members: resolved_members,
+        block_body: decl.block_body,
     })
 }
 
@@ -1562,14 +1578,28 @@ fn resolve_ruby_member(
         RubyMember::SingletonPrepend(m) => RubyMember::SingletonPrepend(RubyPrependMember {
             mixin: resolve_ruby_mixin(&m.mixin, context, resolver, names),
         }),
-        // Def and Attribute carry deferred-parse annotation text only.
-        // Their internal type-name references live inside the `#:` /
-        // `# @rbs` annotation bodies that Phase 4d does not parse.
-        RubyMember::Def(d) => RubyMember::Def(d.clone()),
+        // rbs `resolve_ruby_member` `DefMember` arm: `method_type.map_type_name`
+        // against the enclosing context. The def's annotation is already
+        // parsed at collect time, so its type names are absolutized here
+        // like a signature `def`'s — the definition builder then lowers
+        // absolute names without consulting its owner-derived context.
+        RubyMember::Def(d) => {
+            let mut resolved = d.clone();
+            resolved.method_type =
+                resolve_ruby_method_type_annotation(&d.method_type, context, resolver, names);
+            RubyMember::Def(resolved)
+        }
+        // Attributes carry deferred-parse annotation text only (`#: T`
+        // after `attr_reader :x`); the text is parsed at lowering time.
         RubyMember::AttrReader(a) => RubyMember::AttrReader(a.clone()),
         RubyMember::AttrWriter(a) => RubyMember::AttrWriter(a.clone()),
         RubyMember::AttrAccessor(a) => RubyMember::AttrAccessor(a.clone()),
-        RubyMember::InstanceVariable(a) => RubyMember::InstanceVariable(a.clone()),
+        // rbs `resolve_ruby_member` `InstanceVariableMember` arm.
+        RubyMember::InstanceVariable(a) => {
+            let mut resolved = a.clone();
+            resolved.annotation.ty = resolve_type(&a.annotation.ty, context, resolver, names);
+            RubyMember::InstanceVariable(resolved)
+        }
         RubyMember::ModuleSelf(a) => {
             // Rewrite the annotation's `name` to its absolute form so
             // `ancestor_builder::module_self_types_or_default`'s
@@ -1587,6 +1617,101 @@ fn resolve_ruby_member(
             RubyMember::ModuleSelf(resolved)
         }
     }
+}
+
+/// Port of the `method_type.map_type_name` half of rbs `resolve_ruby_member`'s
+/// `DefMember` arm: rewrite every type name inside a Ruby def's annotation
+/// to its absolute form. Explicit shapes (`#:` / `# @rbs (T) -> U`) hold a
+/// signature-style `MethodType` and reuse [`resolve_method_type`]; the
+/// doc-style shape resolves each annotated slot's `Type` in place.
+fn resolve_ruby_method_type_annotation(
+    annotation: &MethodTypeAnnotation,
+    context: &[TypeName],
+    resolver: &TypeNameResolver,
+    names: &NameTable,
+) -> MethodTypeAnnotation {
+    let type_annotations = match &annotation.type_annotations {
+        TypeAnnotations::Array(explicit) => TypeAnnotations::Array(
+            explicit
+                .iter()
+                .map(|e| match e {
+                    ExplicitAnnotation::Colon(colon) => {
+                        let mut resolved = colon.clone();
+                        resolved.method_type =
+                            resolve_method_type(&colon.method_type, context, resolver, names);
+                        ExplicitAnnotation::Colon(resolved)
+                    }
+                    ExplicitAnnotation::MethodTypes(mts) => {
+                        let mut resolved = mts.clone();
+                        resolved.overloads = mts
+                            .overloads
+                            .iter()
+                            .map(|o| MethodDefinitionOverload {
+                                method_type: resolve_method_type(
+                                    &o.method_type,
+                                    context,
+                                    resolver,
+                                    names,
+                                ),
+                                annotations: o.annotations.clone(),
+                            })
+                            .collect();
+                        ExplicitAnnotation::MethodTypes(resolved)
+                    }
+                })
+                .collect(),
+        ),
+        TypeAnnotations::DocStyle(doc) => {
+            let resolve_ty = |ty: &Type| resolve_type(ty, context, resolver, names);
+            let resolve_positional = |entry: &PositionalEntry| match entry {
+                PositionalEntry::Annotated(p) => {
+                    let mut resolved = p.clone();
+                    resolved.param_type = resolve_ty(&p.param_type);
+                    PositionalEntry::Annotated(resolved)
+                }
+                PositionalEntry::ByName(name) => PositionalEntry::ByName(name.clone()),
+            };
+            let resolve_positionals = |entries: &[PositionalEntry]| -> Vec<PositionalEntry> {
+                entries.iter().map(resolve_positional).collect()
+            };
+            let resolve_keywords =
+                |entries: &[(String, PositionalEntry)]| -> Vec<(String, PositionalEntry)> {
+                    entries
+                        .iter()
+                        .map(|(name, entry)| (name.clone(), resolve_positional(entry)))
+                        .collect()
+                };
+            let mut resolved = (**doc).clone();
+            resolved.return_type_annotation = doc.return_type_annotation.as_ref().map(|r| {
+                let mut resolved = (**r).clone();
+                resolved.return_type = resolve_ty(&r.return_type);
+                Box::new(resolved)
+            });
+            resolved.required_positionals = resolve_positionals(&doc.required_positionals);
+            resolved.optional_positionals = resolve_positionals(&doc.optional_positionals);
+            resolved.trailing_positionals = resolve_positionals(&doc.trailing_positionals);
+            resolved.required_keywords = resolve_keywords(&doc.required_keywords);
+            resolved.optional_keywords = resolve_keywords(&doc.optional_keywords);
+            if let Some(SplatRestEntry::Annotated(s)) = &doc.rest_positionals {
+                let mut splat = s.clone();
+                splat.param_type = resolve_ty(&s.param_type);
+                resolved.rest_positionals = Some(SplatRestEntry::Annotated(splat));
+            }
+            if let Some(DoubleSplatRestEntry::Annotated(s)) = &doc.rest_keywords {
+                let mut splat = s.clone();
+                splat.param_type = resolve_ty(&s.param_type);
+                resolved.rest_keywords = Some(DoubleSplatRestEntry::Annotated(splat));
+            }
+            if let Some(BlockEntry::Annotated(b)) = &doc.block {
+                let mut block = b.clone();
+                block.function = resolve_function_type(&b.function, context, resolver, names);
+                resolved.block = Some(BlockEntry::Annotated(block));
+            }
+            TypeAnnotations::DocStyle(Box::new(resolved))
+        }
+        TypeAnnotations::None => TypeAnnotations::None,
+    };
+    MethodTypeAnnotation { type_annotations }
 }
 
 /// Port of rbs `Environment#resolve_ruby_decl`'s `ClassModuleAliasDecl` arm

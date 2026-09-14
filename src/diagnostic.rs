@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
-use crate::ast::ruby::byte_offset_to_line;
+use crate::ast::ruby::{LineIndex, byte_offset_to_line};
 use crate::config::{DiagnosticConfig, Format};
 use crate::definition::ConstantContext;
 use crate::definition_builder::DefinitionBuilder;
@@ -322,6 +322,10 @@ pub enum DiagnosticKind {
     /// Inline `class << expr` where `expr` is not `self` opens an anonymous
     /// singleton class, which RBS cannot represent.
     NonSelfSingletonScope,
+    /// A bare constant assignment (`S = 1`) inside inline `class << self`
+    /// defines the constant on the singleton class, which RBS cannot
+    /// represent. (Ruby cref: `Foo.singleton_class::S`, not `Foo::S`.)
+    SingletonScopeConstantDefinition,
     /// Mirrors `RBS::DuplicatedMethodDefinitionError` (`lib/rbs/errors.rb` L251).
     /// `overloading: true` entries are exempt (intentional multi-overload merge).
     DuplicatedMethodDefinition {
@@ -887,16 +891,32 @@ impl Diagnostic {
         }
     }
 
+    /// One-shot wrapper that builds a fresh [`LineIndex`] internally —
+    /// fine for callers that emit a handful of diagnostics per file. Hot
+    /// emitters (`TypeChecker`) reuse their own index via
+    /// [`location_for_byte_range_with_index`](Self::location_for_byte_range_with_index)
+    /// so the char-offset semantics live in exactly one place.
     pub fn location_for_byte_range(
         file: PathBuf,
         source: &[u8],
         start_byte: usize,
         end_byte: usize,
     ) -> SourceLocation {
+        let line_index = LineIndex::from_source(source);
+        Self::location_for_byte_range_with_index(file, source, &line_index, start_byte, end_byte)
+    }
+
+    pub fn location_for_byte_range_with_index(
+        file: PathBuf,
+        source: &[u8],
+        line_index: &LineIndex,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> SourceLocation {
         let start_byte = start_byte.min(source.len());
         let end_byte = end_byte.min(source.len());
-        let start_char = byte_to_char_offset(source, start_byte);
-        let end_char = byte_to_char_offset(source, end_byte);
+        let start_char = line_index.char_offset(source, start_byte);
+        let end_char = line_index.char_offset(source, end_byte);
         SourceLocation {
             file,
             range: LocationRange::new(start_char, start_byte as u32, end_char, end_byte as u32),
@@ -948,7 +968,8 @@ impl Diagnostic {
             DiagnosticKind::TopLevelMethodDefinition => "<top-level-method>",
             DiagnosticKind::NestedSingletonScope
             | DiagnosticKind::TopLevelSingletonScope
-            | DiagnosticKind::NonSelfSingletonScope => "<singleton-scope>",
+            | DiagnosticKind::NonSelfSingletonScope
+            | DiagnosticKind::SingletonScopeConstantDefinition => "<singleton-scope>",
             DiagnosticKind::MixinTypeArgumentArityMismatch { target, .. } => target,
             DiagnosticKind::DuplicatedDeclaration { name, .. } => name,
             DiagnosticKind::UnknownTypeName { name } => name,
@@ -1225,6 +1246,7 @@ impl Diagnostic {
             DiagnosticKind::NestedSingletonScope => {}
             DiagnosticKind::TopLevelSingletonScope => {}
             DiagnosticKind::NonSelfSingletonScope => {}
+            DiagnosticKind::SingletonScopeConstantDefinition => {}
             DiagnosticKind::DuplicatedMethodDefinition {
                 method_name,
                 duplicate_source,
@@ -1456,13 +1478,6 @@ fn duplicate_source_json(src: &DuplicateSource) -> Value {
     }
 }
 
-fn byte_to_char_offset(source: &[u8], offset: usize) -> u32 {
-    let offset = offset.min(source.len());
-    std::str::from_utf8(&source[..offset])
-        .map(|s| s.chars().count() as u32)
-        .unwrap_or(offset as u32)
-}
-
 macro_rules! diagnostic_codes {
     ($($pat:pat => $code:literal, $description:literal, $slug:literal),* $(,)?) => {
         /// Machine-readable error code (Steep-compatible).
@@ -1588,6 +1603,9 @@ impl DiagnosticKind {
         DiagnosticKind::NonSelfSingletonScope => "Ruby::NonSelfSingletonScope",
             "An inline singleton scope targets a non-self expression, which RBS cannot represent.",
             "Ruby_NonSelfSingletonScope",
+        DiagnosticKind::SingletonScopeConstantDefinition => "Ruby::SingletonScopeConstantDefinition",
+            "An inline constant assignment inside `class << self` defines the constant on the singleton class, which RBS cannot represent.",
+            "Ruby_SingletonScopeConstantDefinition",
         DiagnosticKind::PrivateMethodCall { .. } => "Crema::PrivateMethodCall",
             "A private method is called with an explicit receiver.",
             "Crema_PrivateMethodCall",
@@ -2187,6 +2205,12 @@ impl fmt::Display for DiagnosticKind {
                 write!(
                     f,
                     "Non-self expression in `class << ...` opens an anonymous singleton class, which has no representation in RBS"
+                )
+            }
+            DiagnosticKind::SingletonScopeConstantDefinition => {
+                write!(
+                    f,
+                    "Constant assignment inside `class << self` defines the constant on the singleton class, which has no representation in RBS"
                 )
             }
             DiagnosticKind::PrivateMethodCall { method_name, .. } => write!(

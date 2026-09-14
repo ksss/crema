@@ -23,6 +23,16 @@ struct Scope {
     bindings: FxHashMap<Name, Ty>,
     bot_rhs_bindings: FxHashSet<Name>,
     self_type_override: Option<Ty>,
+    /// Outer lvars pinned on entry to this `Block` scope: the type each
+    /// visible lvar had when the closure was entered. Steep's
+    /// `enforced_type` slot (`type_env.rb` `local_variable_types`
+    /// `name => [type, enforced_type]`, planted by
+    /// `pin_local_variables`). A write from inside the closure that
+    /// targets a scope outside this one is checked against, and
+    /// rebinds to, the pinned type. Lives and dies with the scope, so
+    /// `snapshot_scopes` / `join_branches` (which only rewrite
+    /// `bindings`) leave it alone. Always empty for non-`Block` scopes.
+    pinned: FxHashMap<Name, Ty>,
 }
 
 #[derive(Debug)]
@@ -35,9 +45,27 @@ struct MethodFrame {
     is_singleton_method: bool,
 }
 
+/// Saved class nesting returned by [`Context::replace_class_stack`] and
+/// handed back to [`Context::restore_class_stack`].
+pub struct ClassStackFrames {
+    class_stack: Vec<TypeName>,
+    cref_stack: Vec<TypeName>,
+    class_stack_in_cref: Vec<bool>,
+}
+
 /// Tracks class nesting and a scope chain during AST traversal.
 pub struct Context {
     class_stack: Vec<TypeName>,
+    /// Ruby's cref — the lexical scope constants are defined in and
+    /// looked up from. Usually identical to `class_stack`, but a
+    /// `Const = Class.new do ... end` block body is walked as `class
+    /// Const` for `self` / `def` ownership while its cref stays the
+    /// *outer* scope (Ruby: `INNER = 1` inside the block defines
+    /// `::INNER`, not `::Const::INNER`). `class_stack_in_cref[i]` says
+    /// whether `class_stack[i]` was mirrored here, so `pop_class` can
+    /// keep the two aligned.
+    cref_stack: Vec<TypeName>,
+    class_stack_in_cref: Vec<bool>,
     method_name: Option<String>,
     method_type: Option<MethodType>,
     /// rbs `TypeDef#defined_in` of the enclosing method's first overload.
@@ -91,6 +119,8 @@ impl Context {
     pub fn new() -> Self {
         Context {
             class_stack: vec![],
+            cref_stack: vec![],
+            class_stack_in_cref: vec![],
             method_name: None,
             method_type: None,
             defined_in: None,
@@ -103,6 +133,7 @@ impl Context {
                 bindings: FxHashMap::default(),
                 bot_rhs_bindings: FxHashSet::default(),
                 self_type_override: None,
+                pinned: FxHashMap::default(),
             }],
             pure_call_env: PureCallEnv::new(),
             saved_method_frames: Vec::new(),
@@ -145,27 +176,74 @@ impl Context {
         &self.class_stack
     }
 
-    pub fn replace_class_stack(&mut self, class_stack: Vec<TypeName>) -> Vec<TypeName> {
-        std::mem::replace(&mut self.class_stack, class_stack)
+    /// Ruby's cref, outer-first — the stack constant reads resolve
+    /// against and bare constant writes define into. See the field doc
+    /// for where it diverges from [`class_stack`](Self::class_stack).
+    pub fn cref_stack(&self) -> &[TypeName] {
+        &self.cref_stack
+    }
+
+    /// Replace the whole class nesting (synthetic method contexts). The
+    /// cref follows the replacement — a synthesized target is a real
+    /// class body for every purpose — and is restored with it.
+    pub fn replace_class_stack(&mut self, class_stack: Vec<TypeName>) -> ClassStackFrames {
+        let in_cref = vec![true; class_stack.len()];
+        ClassStackFrames {
+            class_stack: std::mem::replace(&mut self.class_stack, class_stack.clone()),
+            cref_stack: std::mem::replace(&mut self.cref_stack, class_stack),
+            class_stack_in_cref: std::mem::replace(&mut self.class_stack_in_cref, in_cref),
+        }
+    }
+
+    pub fn restore_class_stack(&mut self, saved: ClassStackFrames) {
+        self.class_stack = saved.class_stack;
+        self.cref_stack = saved.cref_stack;
+        self.class_stack_in_cref = saved.class_stack_in_cref;
     }
 
     pub fn push_class(&mut self, name: &str, names: &NameTable) {
-        let qualified = match self.class_stack.last() {
+        let type_name = self.qualified_class_name(name, names);
+        self.class_stack.push(type_name);
+        self.cref_stack.push(type_name);
+        self.class_stack_in_cref.push(true);
+    }
+
+    /// Push a class that owns `self` / `def` but is *not* a cref frame:
+    /// the `Const = Class.new do ... end` block body. Constant reads and
+    /// bare writes inside keep resolving against the enclosing cref.
+    pub fn push_class_outside_cref(&mut self, name: &str, names: &NameTable) {
+        let type_name = self.qualified_class_name(name, names);
+        self.class_stack.push(type_name);
+        self.class_stack_in_cref.push(false);
+    }
+
+    /// Qualify a declaration name under the enclosing *cref*, not the
+    /// enclosing `self`-owner: `class Widget` inside a `Const = Class.new
+    /// do ... end` block defines `::Widget` (Ruby's `class` keyword, like
+    /// a bare constant write, defines into the cref).
+    fn qualified_class_name(&self, name: &str, names: &NameTable) -> TypeName {
+        let qualified = match self.cref_stack.last() {
             Some(parent) => format!("{}::{}", names.resolve(parent), name),
             None => format!("::{}", name),
         };
-        self.class_stack.push(names.parse_type_name(&qualified));
+        names.parse_type_name(&qualified)
     }
 
     /// Push a class whose absolute path is already resolved (leading `::`),
     /// e.g. a rooted declaration name `class ::A::B`. Unlike [`push_class`],
     /// the path is not qualified under the enclosing class.
     pub fn push_class_absolute(&mut self, abs_path: &str, names: &NameTable) {
-        self.class_stack.push(names.parse_type_name(abs_path));
+        let type_name = names.parse_type_name(abs_path);
+        self.class_stack.push(type_name);
+        self.cref_stack.push(type_name);
+        self.class_stack_in_cref.push(true);
     }
 
     pub fn pop_class(&mut self) {
         self.class_stack.pop();
+        if self.class_stack_in_cref.pop() == Some(true) {
+            self.cref_stack.pop();
+        }
     }
 
     pub fn enter_method(
@@ -317,7 +395,85 @@ impl Context {
             bindings: FxHashMap::default(),
             bot_rhs_bindings: FxHashSet::default(),
             self_type_override: None,
+            pinned: FxHashMap::default(),
         });
+    }
+
+    /// Every lvar visible from the innermost scope, with the binding a
+    /// read would see (innermost wins, `Method` is a hard boundary —
+    /// same walk as [`Self::lookup_local_variable`]). Feeds
+    /// [`Self::pin_local_variables`] on closure entry.
+    pub fn visible_local_variables(&self) -> Vec<(Name, Ty)> {
+        let mut seen: FxHashSet<Name> = FxHashSet::default();
+        let mut out = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for (&name, &ty) in &scope.bindings {
+                if seen.insert(name) {
+                    out.push((name, ty));
+                }
+            }
+            if scope.kind == ScopeKind::Method {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Overwrite the binding a read of `name` would currently see (the
+    /// innermost one, `Method` bounded — the slot
+    /// [`Self::visible_local_variables`] reported). No-op when unbound.
+    pub fn rebind_visible_local_variable(&mut self, name: Name, ty: Ty) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(slot) = scope.bindings.get_mut(&name) {
+                *slot = ty;
+                return;
+            }
+            if scope.kind == ScopeKind::Method {
+                return;
+            }
+        }
+    }
+
+    /// Push the `Block` scope for a closure being entered, carrying
+    /// `pins` (name → pinned type, computed by the caller from
+    /// [`Self::visible_local_variables`]).
+    pub fn push_block_scope_with_pins(&mut self, pins: FxHashMap<Name, Ty>) {
+        self.scopes.push(Scope {
+            kind: ScopeKind::Block,
+            bindings: FxHashMap::default(),
+            bot_rhs_bindings: FxHashSet::default(),
+            self_type_override: None,
+            pinned: pins,
+        });
+    }
+
+    /// The pinned type a write to `name` at `depth` must respect, if the
+    /// write crosses a closure boundary that pinned it. `depth` follows
+    /// prism (`LocalVariableWriteNode#depth`, the number of enclosing
+    /// blocks between the write and the owning scope); depth 0 never
+    /// pins. Among the `Block` scopes the write crosses, the one nearest
+    /// the owning scope wins — that is the first closure entered after
+    /// the variable came into existence, matching Steep's
+    /// `pin_local_variables` leaving an existing `enforced_type` alone.
+    pub fn pinned_local_variable_type(&self, name: Name, depth: u32) -> Option<Ty> {
+        if depth == 0 {
+            return None;
+        }
+        let mut remaining = depth;
+        let mut target = None;
+        for i in (0..self.scopes.len()).rev() {
+            if remaining == 0 {
+                target = Some(i);
+                break;
+            }
+            if self.scopes[i].kind == ScopeKind::Block {
+                remaining -= 1;
+            }
+        }
+        let target = target?;
+        self.scopes[target + 1..]
+            .iter()
+            .find_map(|scope| scope.pinned.get(&name).copied())
     }
 
     pub fn set_self_type_override(&mut self, ty: Ty) {
