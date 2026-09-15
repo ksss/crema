@@ -3839,6 +3839,29 @@ impl<'env> TypeChecker<'env> {
         union_of(right_value_ty, falsy_value, self.env.types())
     }
 
+    /// Type of a literal expression (`1` / `"s"` / `:a`). Steep
+    /// `test_literal_type` (`type_construction.rb`, `:int` / `:sym` /
+    /// `:str` arms): the literal type survives only under a hint that is
+    /// not untyped and admits it (`g(:a)` against `(:a | :b)`, `def
+    /// src; 1; end` against `-> (1 | 2 | 3)`); everywhere else the
+    /// expression is class-typed (`r = 1` binds `::Integer`, `f(1)`
+    /// reports `::Integer`). Steep returns `unwrap(hint)` in the keep
+    /// case; crema keeps the literal itself, because the tuple / record
+    /// index specializers (`calls.rs` `record_key_specialization`) read
+    /// the key from the argument's type — `lit <: hint` either way, so
+    /// subtype outcomes are identical. The synthesized type itself is
+    /// narrower than Steep's (`:a` where Steep has `:a | :b`), which
+    /// shows in displayed / propagated types, e.g. a mismatching tuple
+    /// argument prints `[1, ::Integer]` where Steep prints
+    /// `[::Integer, ::Integer]`.
+    fn literal_expression_type(&self, lit: Literal, hint: Option<Ty>) -> Ty {
+        let literal_ty = self.env.types().intern(Type::Literal(lit));
+        match hint {
+            Some(h) if !h.is_untyped() && self.subtyper().check(literal_ty, h) => literal_ty,
+            _ => self.widen_literal_to_base(literal_ty),
+        }
+    }
+
     pub(super) fn infer_type<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>) -> Ty {
         match node {
             Node::IntegerNode { .. } => {
@@ -3846,10 +3869,7 @@ impl<'env> TypeChecker<'env> {
                     let integer = int_node.value();
                     let (negative, digits) = integer.to_u32_digits();
                     let val = prism_digits_to_decimal_string(negative, digits);
-                    return self
-                        .env
-                        .types()
-                        .intern(Type::Literal(Literal::Integer(val)));
+                    return self.literal_expression_type(Literal::Integer(val), hint);
                 }
                 self.env
                     .class_instance_type(self.env.names().builtins().integer)
@@ -3860,7 +3880,7 @@ impl<'env> TypeChecker<'env> {
             Node::StringNode { .. } => {
                 if let Some(str_node) = node.as_string_node() {
                     let s = String::from_utf8_lossy(str_node.unescaped()).to_string();
-                    return self.env.types().intern(Type::Literal(Literal::String(s)));
+                    return self.literal_expression_type(Literal::String(s), hint);
                 }
                 self.env
                     .class_instance_type(self.env.names().builtins().string)
@@ -3871,7 +3891,7 @@ impl<'env> TypeChecker<'env> {
             Node::SymbolNode { .. } => {
                 if let Some(sym_node) = node.as_symbol_node() {
                     let s = String::from_utf8_lossy(sym_node.unescaped()).to_string();
-                    return self.env.types().intern(Type::Literal(Literal::Symbol(s)));
+                    return self.literal_expression_type(Literal::Symbol(s), hint);
                 }
                 self.env
                     .class_instance_type(self.env.names().builtins().symbol)
@@ -5528,29 +5548,49 @@ impl<'env> TypeChecker<'env> {
             }
             CallTarget::UnionMethod { components, .. } => {
                 // Per-component return types, unioned (ADR-0021). Arguments
-                // are normally collected hintless: hint-driven overload
-                // selection across the union belongs to the MethodType.union
-                // slice (child todo `high_union_receiver_method_type_union`).
-                // `bar(...)` is the exception: the forwarded caller sig is
-                // the call site's argument shape, not a bidirectional hint.
-                let arguments = if self.call_has_forwarding_args(call)
+                // are collected per component under that component's hint
+                // overload, as the check pass (`check_call_arguments`'s
+                // union arm) already does — a literal key against
+                // `RBS::Location[:name, ...]#[]` keeps its literal only
+                // under the overload's hint, and the union members carry
+                // different key sets. `bar(...)` is the exception: the
+                // forwarded caller sig is the call site's argument shape,
+                // not a bidirectional hint.
+                let forwarded = if self.call_has_forwarding_args(call)
                     && let Some(caller_mt) = self.ctx.forward_arg_type()
                 {
                     let Some(arguments) = self.collect_forwarded_call_arguments(call, &caller_mt)
                     else {
                         return Ty::UNTYPED;
                     };
-                    arguments
+                    Some(arguments)
                 } else {
-                    self.collect_call_arguments(super::calls::CallSite::Call(call))
+                    None
                 };
                 let returns: Vec<Ty> = components
                     .iter()
                     .map(|c| {
+                        let hinted;
+                        let arguments = match forwarded.as_ref() {
+                            Some(a) => a,
+                            None => {
+                                let hint_overload = self.pick_hint_overload(
+                                    &c.method_def,
+                                    super::calls::CallSite::Call(call),
+                                    &c.bindings,
+                                    c.receiver_type,
+                                );
+                                hinted = self.collect_call_arguments_hinted(
+                                    super::calls::CallSite::Call(call),
+                                    hint_overload.as_ref(),
+                                );
+                                &hinted
+                            }
+                        };
                         let raw = self.infer_return_type(
                             &c.method_def,
                             &c.bindings,
-                            &arguments,
+                            arguments,
                             c.receiver_type,
                             Some(call),
                             hint,

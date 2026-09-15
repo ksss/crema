@@ -246,16 +246,17 @@ crema doc diagnostic Ruby::NoMethod
 
 ### Prebuilt binaries
 
-The GitHub Release ships one prebuilt archive, built on Amazon Linux 2023
-for x86_64. It runs on any x86_64 Linux with glibc 2.34 or newer. On other
-platforms (macOS, ARM Linux), build from source instead (see below).
+The GitHub Release ships prebuilt archives built on Amazon Linux 2023, one
+for `x86_64` and one for `aarch64`. They run on any Linux of the matching
+architecture with glibc 2.34 or newer. On macOS, build from source instead
+(see below).
 
-Download the archive, verify its checksum, then install the `crema`
-binary somewhere on your `PATH`.
+Download the archive for your architecture, verify its checksum, then
+install the `crema` binary somewhere on your `PATH`.
 
 ```sh
 version=v0.2.0
-target=amazonlinux-2023-x86_64
+target="amazonlinux-2023-$(uname -m)"
 
 curl -LO "https://github.com/ksss/crema/releases/download/${version}/crema-${version}-${target}.tar.gz"
 curl -LO "https://github.com/ksss/crema/releases/download/${version}/checksums.txt"

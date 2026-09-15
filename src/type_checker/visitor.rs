@@ -1011,25 +1011,15 @@ impl<'env> TypeChecker<'env> {
     /// Steep's `type_env.pin_local_variables(nil)` at the block-call
     /// and lambda sites (`type_construction.rb`).
     ///
-    /// Literal bindings are widened first (`1` → `::Integer`, `true` →
-    /// `bool`, member-wise through unions / optionals). crema binds
-    /// `r = 1` to the literal `1` where Steep already widens at the
-    /// lvasgn, so pinning the raw binding would flag `r = 2` inside the
-    /// closure as incompatible.
+    /// The pin is the visible type itself: literal expressions are
+    /// already class-typed at synthesis unless a hint asked for the
+    /// literal (`infer_type`, Steep `test_literal_type`), so `r = 1`
+    /// binds `::Integer` and a pinned `r = 2` inside the closure is a
+    /// same-type write. `true` / `false` are the exception (their
+    /// synthesis is not widened) and pin as `bool`, so `x = false; each
+    /// { x = true }` is not flagged.
     ///
-    /// A *bare* literal binding is also rewritten in place to the widened
-    /// type — Steep's pin plants `[type, type]` with the already-widened
-    /// `type` — so a read before any write, and the untouched arm of a
-    /// conditional inside the closure, agree with what a pinned write
-    /// rebinds to (otherwise the branch join yields `1 | ::Integer`).
-    /// A literal *union* is not rewritten: at the `Ty` level a joined
-    /// literal binding (`r = 1; r = 2 if c`) is indistinguishable from a
-    /// declared enum-like parameter (`(:covariant | :invariant)`), and
-    /// widening the latter in place turns every later use into
-    /// `::Symbol` (steep repo `variable_variance.rb`, 2026-09-11). Only
-    /// the pin — which is checked against, never read — is deep-widened.
-    ///
-    /// The pin itself is additionally `self`-frozen the way
+    /// The pin is additionally `self`-frozen the way
     /// `freeze_lvar_bound_type` freezes every closure-crossing write:
     /// `spy = self` binds the opaque `self`, the write inside the block
     /// arrives as the concrete class, and the subtype check must compare
@@ -1039,35 +1029,13 @@ impl<'env> TypeChecker<'env> {
         let visible = self.ctx.visible_local_variables();
         let mut pins: FxHashMap<Name, Ty> = FxHashMap::default();
         for (name, ty) in visible {
-            let widened = self.widen_literal_deep(ty);
-            if widened != ty && matches!(self.env.types().resolve(ty), Type::Literal(_)) {
-                self.ctx.rebind_visible_local_variable(name, widened);
-            }
-            pins.insert(name, self.freeze_self_type_for_lvar_binding(widened));
+            let pin = match self.env.types().resolve(ty) {
+                Type::Literal(crate::types::Literal::Bool(_)) => Ty::BOOL,
+                _ => ty,
+            };
+            pins.insert(name, self.freeze_self_type_for_lvar_binding(pin));
         }
         self.ctx.push_block_scope_with_pins(pins);
-    }
-
-    /// `widen_literal` extended member-wise through unions / optionals,
-    /// with `true` / `false` widened to `bool` rather than to their
-    /// singleton classes (`x = false; each { x = true }` must be a
-    /// same-type write).
-    fn widen_literal_deep(&self, ty: Ty) -> Ty {
-        match self.env.types().resolve(ty) {
-            Type::Literal(crate::types::Literal::Bool(_)) => Ty::BOOL,
-            Type::Union(members) => {
-                let widened: Vec<Ty> = members
-                    .iter()
-                    .map(|&m| self.widen_literal_deep(m))
-                    .collect();
-                crate::types::union_of_many(&widened, self.env.types())
-            }
-            Type::Optional(inner) => {
-                let inner = self.widen_literal_deep(*inner);
-                crate::types::union_of(inner, Ty::NIL, self.env.types())
-            }
-            _ => self.widen_literal(ty),
-        }
     }
 
     /// Closure-crossing lvar write (prism `depth >= 1`) against a pinned
@@ -1099,10 +1067,14 @@ impl<'env> TypeChecker<'env> {
                 location,
                 kind: DiagnosticKind::IncompatibleAssignment {
                     lhs_type: self.display_type(pinned),
-                    // Class-widened like the pin itself, so both sides
-                    // of the message speak the RBS vocabulary
-                    // (`::String <: ::Integer`, as Steep prints it).
-                    rhs_type: self.display_type(self.widen_literal_deep(ty)),
+                    // A mismatching literal RHS is already class-typed
+                    // at synthesis (the pin is its hint); `true` /
+                    // `false` are not, and print as `bool` like the pin
+                    // does.
+                    rhs_type: self.display_type(match self.env.types().resolve(ty) {
+                        Type::Literal(crate::types::Literal::Bool(_)) => Ty::BOOL,
+                        _ => ty,
+                    }),
                 },
             });
         }

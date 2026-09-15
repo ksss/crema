@@ -16,8 +16,19 @@ module B
 end
 ```
 
+A single declaration can also close the cycle on itself. Superclass and mixin names resolve in the enclosing namespace, so a nested class named after its intended parent picks itself:
+
+```rbs
+class UserMention
+end
+module Reports
+  class UserMention < UserMention   # resolves to ::Reports::UserMention
+  end
+end
+```
+
 ## Typical fix
-Remove one ancestor edge, extract shared behavior into a third module, or correct the mistaken include/prepend target.
+Remove one ancestor edge, extract shared behavior into a third module, or correct the mistaken include/prepend target. For a self-referencing superclass, qualify the parent (`< ::UserMention`).
 
 ## Recommended severity
 Recommended severity: error.

@@ -64,6 +64,18 @@ impl<'env> TypeChecker<'env> {
             ));
         }
 
+        // `def self.x` inside a `[self: T]` block defines a singleton method
+        // on the runtime self (the `T` instance), so its body keeps `T`
+        // (Steep parity). Capture the enclosing override before the `Method`
+        // scope is pushed — `current_self_type_override` stops at that
+        // boundary — and re-pin it on the method scope. An instance `def`
+        // takes the lexical class instead and gets no override.
+        let singleton_self_override = if is_singleton {
+            self.ctx.current_self_type_override()
+        } else {
+            None
+        };
+
         let has_forwarding_param = params_have_forwarding(&node.parameters());
         let forward_leading_positional = node
             .parameters()
@@ -81,6 +93,8 @@ impl<'env> TypeChecker<'env> {
         );
         if is_def_on_instance {
             self.ctx.set_self_type_override(Ty::UNTYPED);
+        } else if let Some(ty) = singleton_self_override {
+            self.ctx.set_self_type_override(ty);
         }
         self.bind_parameters(node);
         true

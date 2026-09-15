@@ -269,10 +269,12 @@ pub(crate) type AncestorCycleState = Vec<Arc<BakedAncestorCycle>>;
 /// BFS-from-`seeds` + Tarjan SCC body shared by [`full_ancestor_cycles`] /
 /// [`incremental_ancestor_cycles`] (flag-off) and
 /// [`full_ancestor_cycles_a`] / [`incremental_ancestor_cycles_a`]
-/// (G-backend-attached). A found component becomes a state entry when it
-/// is cyclic (`len >= 2`) and passes `keep` — callers use `keep` to add
-/// the "must touch `invalidated`" (incremental) or "must have an A
-/// participant" (G-backend) conditions on top of plain cyclicity.
+/// (G-backend-attached). [`strongly_connected_cycles`] already yields
+/// only cyclic components (`len >= 2`, or a single node with a
+/// self-edge); a component becomes a state entry when it also passes
+/// `keep` — callers use `keep` to add the "must touch `invalidated`"
+/// (incremental) or "must have an A participant" (G-backend) conditions
+/// on top of plain cyclicity.
 fn ancestor_scc_cycles(
     ctx: &AncestryEnv,
     seeds: Vec<TypeName>,
@@ -282,7 +284,7 @@ fn ancestor_scc_cycles(
     let graph = ancestor_graph(ctx, seeds);
     strongly_connected_cycles(&graph, names)
         .iter()
-        .filter(|component| component.len() >= 2 && keep(component))
+        .filter(|component| keep(component))
         .map(|component| Arc::new(component_to_baked(ctx, &graph, component)))
         .collect()
 }
@@ -567,7 +569,6 @@ pub(crate) fn roast_g_validators(
     let graph = ancestor_graph(&ctx, roots);
     let cycles: Vec<BakedAncestorCycle> = strongly_connected_cycles(&graph, names)
         .iter()
-        .filter(|component| component.len() >= 2)
         .map(|component| component_to_baked(&ctx, &graph, component))
         .collect();
 
@@ -634,23 +635,57 @@ fn ancestor_successors(ctx: &AncestryEnv, name: &TypeName) -> Vec<TypeName> {
         return Vec::new();
     }
 
-    let mut successors: Vec<TypeName> = Vec::new();
+    // Each edge carries whether a clause was actually written for it.
+    // `AncestorBuilder` manufactures two edges nothing in the source
+    // spells out — `class_super_or_default`'s Object fallback for a
+    // super-less class and `module_self_types_or_default`'s Object
+    // fallback for a module with no `: T` — and only those may form a
+    // self-edge that stays silent (`class Object; end` without
+    // `BasicObject`). A written clause resolving to the declaring type
+    // itself is what rbs rejects with `RecursiveAncestorError` (`X < X`).
+    let mut successors: Vec<(TypeName, bool)> = Vec::new();
     if in_class {
         let one = ctx.ancestors.one_instance_ancestors_arc(&normalized);
+        // Same predicate as the builder: a clause naming a non-absolute
+        // (unresolved) target takes the Object fallback too, so it counts
+        // as synthetic here as well.
+        let is_absolute = |name: TypeName| ctx.names().type_name_is_absolute(name);
+        let (super_written, self_types_written) = match environment
+            .class_decls()
+            .get(&normalized)
+            .expect("in_class checked above")
+        {
+            ClassOrModule::Class(entry) => (
+                match entry.primary_decl() {
+                    ClassDeclaration::Signature(c) => {
+                        c.super_class.as_ref().is_some_and(|s| is_absolute(s.name))
+                    }
+                    ClassDeclaration::Ruby(c) => c
+                        .super_class
+                        .as_ref()
+                        .is_some_and(|s| is_absolute(s.type_name)),
+                },
+                false,
+            ),
+            ClassOrModule::Module(entry) => (
+                false,
+                entry.self_types().iter().any(|st| is_absolute(st.name)),
+            ),
+        };
         if let Some(Ancestor::Instance { name: sup, .. }) = &one.super_class {
-            successors.push(*sup);
+            successors.push((*sup, super_written));
         }
         for m in &one.included_modules {
-            successors.push(m.name);
+            successors.push((m.name, true));
         }
         for m in &one.included_interfaces {
-            successors.push(m.name);
+            successors.push((m.name, true));
         }
         for m in &one.prepended_modules {
-            successors.push(m.name);
+            successors.push((m.name, true));
         }
         for m in &one.self_types {
-            successors.push(m.name);
+            successors.push((m.name, self_types_written));
         }
     } else {
         // Interface entries fold only `included_interfaces`; rbs's
@@ -659,23 +694,23 @@ fn ancestor_successors(ctx: &AncestryEnv, name: &TypeName) -> Vec<TypeName> {
         // self_types.
         let one = ctx.ancestors.one_interface_ancestors_arc(&normalized);
         for m in &one.included_interfaces {
-            successors.push(m.name);
+            successors.push((m.name, true));
         }
     }
 
     successors
         .into_iter()
-        .filter_map(|next| {
+        .filter_map(|(next, written)| {
             let next_normalized = environment.normalize_module_name(&next);
             let next_in_graph = environment.class_decls().contains_key(&next_normalized)
                 || environment.interface_decls().contains_key(&next_normalized);
             if !next_in_graph {
                 return None;
             }
-            // Keep the existing single-node ancestor self-edge policy:
-            // synthetic Object self-super and explicit self-include stay
-            // silent, while multi-node SCCs are reported below.
-            if next_normalized == normalized {
+            // A synthetic (fallback) self-edge is a builder artifact, not
+            // a declared cycle; drop it so it never reaches Tarjan. Written
+            // self-edges stay and surface as single-node components.
+            if next_normalized == normalized && !written {
                 return None;
             }
             Some(next_normalized)
@@ -734,6 +769,12 @@ fn component_closed_walk(
         current = target;
     }
     append_path_in_component(graph, component, current, anchor, names, &mut walk);
+    if walk.len() == 1 {
+        // Single-node component: the only edge is the self-edge, which
+        // `append_path_in_component` skips (start == goal). Close the walk
+        // explicitly so the chain reads `X < X` like rbs.
+        walk.push(anchor);
+    }
     walk
 }
 

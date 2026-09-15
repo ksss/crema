@@ -102,29 +102,39 @@ Deduped, sorted, positionless symbol strings: every type and method the check co
 
 ## Recipes
 
-Each recipe reads a saved document (`crema extract > extract.json`); replace `extract.json` with `<(crema extract)` or pipe directly for one-shot queries.
+Each recipe pipes the document straight out of `crema extract`. Redirect it to a file once (`crema extract > extract.json`) and read that instead when several queries share one snapshot.
 
 Per-file call sites by state:
 
 ```bash
-jq -r '.files | to_entries[] | [.key, ([.value.method_call[] | select(.state == "typed")] | length), ([.value.method_call[] | select(.state != "typed")] | length)] | @tsv' extract.json
+crema extract | jq -r '.files | to_entries[] | [.key, ([.value.method_call[] | select(.state == "typed")] | length), ([.value.method_call[] | select(.state != "typed")] | length)] | @tsv'
 ```
 
 All call sites landing on one method:
 
 ```bash
-jq -r '.files | to_entries[] | .key as $f | .value.method_call[] | select(.symbol == "::User#save") | "\($f):\(.start_byte)"' extract.json
+crema extract | jq -r '.files | to_entries[] | .key as $f | .value.method_call[] | select(.symbol == "::User#save") | "\($f):\(.start_byte)"'
 ```
 
 Dead-definition candidates — project-declared methods no file's call sites or consulted set mention (verify candidates manually; reflective and external entry points have no call sites):
 
 ```bash
-jq -r '
+crema extract | jq -r '
   ([.files[].method_call[].symbol // empty] + [.files[].consulted[]] | unique) as $used
   | .files | to_entries[] | .key as $f
   | .value.definitions[]
   | select(.kind | endswith("_method"))
   | select(.symbol as $s | $used | index($s) | not)
   | "\($f):\(.start_byte)\t\(.symbol)"
-' extract.json
+'
+```
+
+Overall type-resolution coverage — `typed` and `error` sites reached a definition, `no_method_error` / `unknown_constant` / `untyped` did not:
+
+```bash
+crema extract | jq -r '
+  [.files[] | (.method_call + .constant)[] | .state] as $s
+  | ([$s[] | select(. == "typed" or . == "error")] | length) as $resolved
+  | "\($resolved) / \($s | length) sites  \($resolved * 1000 / ($s | length) | round / 10)%"
+'
 ```

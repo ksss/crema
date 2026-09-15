@@ -419,21 +419,6 @@ impl Context {
         out
     }
 
-    /// Overwrite the binding a read of `name` would currently see (the
-    /// innermost one, `Method` bounded — the slot
-    /// [`Self::visible_local_variables`] reported). No-op when unbound.
-    pub fn rebind_visible_local_variable(&mut self, name: Name, ty: Ty) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(slot) = scope.bindings.get_mut(&name) {
-                *slot = ty;
-                return;
-            }
-            if scope.kind == ScopeKind::Method {
-                return;
-            }
-        }
-    }
-
     /// Push the `Block` scope for a closure being entered, carrying
     /// `pins` (name → pinned type, computed by the caller from
     /// [`Self::visible_local_variables`]).
@@ -486,18 +471,35 @@ impl Context {
         }
     }
 
-    /// Returns the innermost `[self: T]` override, if any block scope carries one.
+    /// Returns the innermost `[self: T]` override, if any scope carries one.
+    /// `Method` is a hard boundary (same walk as
+    /// [`Self::visible_local_variables`]): a `def` body does not inherit the
+    /// self of an enclosing `[self: T]` block. Ruby defines the method on the
+    /// lexical class (cref), so the body's self is that class's instance
+    /// regardless of the block it was written in. A `Method` scope that
+    /// carries its own override (set at `def` entry) is still honoured.
     pub fn current_self_type_override(&self) -> Option<Ty> {
-        self.scopes.iter().rev().find_map(|s| s.self_type_override)
+        Self::self_type_override_within(&self.scopes)
+    }
+
+    /// The `[self: T]` override in effect at the innermost of `scopes`,
+    /// walking outward and stopping at the first `Method` scope.
+    fn self_type_override_within(scopes: &[Scope]) -> Option<Ty> {
+        for scope in scopes.iter().rev() {
+            if scope.self_type_override.is_some() {
+                return scope.self_type_override;
+            }
+            if scope.kind == ScopeKind::Method {
+                return None;
+            }
+        }
+        None
     }
 
     pub fn self_type_override_at_binding(&self, name: Name) -> Option<(Ty, Option<Ty>)> {
         for (index, scope) in self.scopes.iter().enumerate().rev() {
             if let Some(&ty) = scope.bindings.get(&name) {
-                let self_type_override = self.scopes[..=index]
-                    .iter()
-                    .rev()
-                    .find_map(|s| s.self_type_override);
+                let self_type_override = Self::self_type_override_within(&self.scopes[..=index]);
                 return Some((ty, self_type_override));
             }
             if scope.kind == ScopeKind::Method {

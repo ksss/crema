@@ -4660,9 +4660,9 @@ impl<'env> TypeChecker<'env> {
     /// `&mut self` diagnostic pass (`check_call_arguments`, which acts on
     /// `Missing`) and the `&self` return-type pass (`infer_call_return_type`,
     /// which maps `Found`/`Missing` to a type) so the entry condition and
-    /// specializer order live in one place. The peek is hintless on purpose —
-    /// the specializers inspect the argument's literal (Symbol / Integer), not
-    /// its hint-driven widening.
+    /// specializer order live in one place. The key argument is synthesized
+    /// under the receiver's key classes as its hint (see below) so the
+    /// specializers can inspect the argument's literal (Symbol / Integer).
     pub(super) fn element_access_specialization<'pr>(
         &self,
         receiver: Ty,
@@ -4692,7 +4692,32 @@ impl<'env> TypeChecker<'env> {
         if !self.has_element_access_shape(receiver) {
             return None;
         }
-        let args = self.collect_call_arguments(CallSite::Call(node));
+        // The key argument is synthesized under the receiver's key
+        // classes (`::Integer` for a tuple, every record key class for a
+        // record) as its hint, so a literal key keeps its literal type
+        // for the specializers below (a literal expression is class-typed
+        // unless its hint admits it). Steep's `record_shape`
+        // (`interface/builder.rb`) composes per-key literal overloads —
+        // what the specializers stand in for — over a `Hash#[] (K) -> V`
+        // fallback whose `K` is the keys' `back_type`; the hint here is
+        // that `K`, broadened to every key class so a wrong-class key
+        // (`rec["name"]` on `{name: String}`) still reaches the
+        // specializer and reports `UnknownRecordKey` / `UnknownTupleIndex`
+        // instead of falling through to the widened `Hash#[]`.
+        let args = match self.element_access_key_hint(receiver) {
+            Some(key_hint) => {
+                let overload = MethodType {
+                    type_params: vec![],
+                    type_: FunctionType::Typed(Function {
+                        required_positionals: vec![key_hint],
+                        ..Function::empty(Ty::UNTYPED)
+                    }),
+                    block: None,
+                };
+                self.collect_call_arguments_hinted(CallSite::Call(node), Some(&overload))
+            }
+            None => self.collect_call_arguments(CallSite::Call(node)),
+        };
 
         // Union receiver: dispatch per member. `resolve_call_target` peels
         // Unions for the method-lookup path (ADR-0021), but this entry runs
@@ -4739,6 +4764,41 @@ impl<'env> TypeChecker<'env> {
         self.tuple_index_specialization(receiver, method, &args)
             .or_else(|| self.tuple_end_specialization(receiver, method, &args))
             .or_else(|| self.record_key_specialization(receiver, method, &args))
+    }
+
+    /// Key classes of a tuple / record receiver (union members
+    /// flattened): the hint for `element_access_specialization`'s key
+    /// argument. `::Integer` for a tuple; every `RecordKey` class
+    /// (`::Symbol | ::String | ::Integer | bool`) for a record. `None`
+    /// when no member is structural.
+    fn element_access_key_hint(&self, receiver: Ty) -> Option<Ty> {
+        let builtins = self.env.names().builtins();
+        let integer = self.env.class_instance_type(builtins.integer);
+        let key_class = |ty: Ty| match self.env.types().resolve(ty) {
+            Type::Tuple(_) => Some(vec![integer]),
+            Type::Record { .. } => Some(vec![
+                self.env.class_instance_type(builtins.symbol),
+                self.env.class_instance_type(builtins.string),
+                integer,
+                Ty::BOOL,
+            ]),
+            _ => None,
+        };
+        let classes: Vec<Ty> = match self.env.types().resolve(receiver) {
+            Type::Union(members) => {
+                definition_builder::flatten_alias_union_members(self.env, members)
+                    .into_iter()
+                    .filter_map(key_class)
+                    .flatten()
+                    .collect()
+            }
+            _ => key_class(receiver).into_iter().flatten().collect(),
+        };
+        if classes.is_empty() {
+            None
+        } else {
+            Some(crate::types::union_of_many(&classes, self.env.types()))
+        }
     }
 
     /// Whether any specializer could serve this receiver. A Union passes on
@@ -5010,17 +5070,36 @@ impl<'env> TypeChecker<'env> {
             return None;
         }
         // Bail out before building the receiver-aware substitution for the
-        // common multi-overload no-hash-literal call (`Array#[]`,
-        // `Kernel#format`, every defaulted-arg method). The trial loop is
-        // the only consumer that needs substitution; if we won't enter it
-        // we keep the path allocation-free.
+        // common multi-overload call (`Array#[]`, `Kernel#format`, every
+        // defaulted-arg method). The trial loop is the only consumer that
+        // needs substitution; if we won't enter it we keep the path
+        // allocation-free. Two argument shapes need the trial: a hash
+        // literal (Record hint), and a scalar literal against an overload
+        // whose parameter is literal-typed (`status=(0 | 1)`) — the
+        // literal only survives synthesis under a hint that admits it, so
+        // without the trial `status = 1` widens to `::Integer` and matches
+        // no overload. Steep hints every overload trial; crema pays for
+        // it only where a literal parameter makes the hint decisive.
+        // The literal check runs twice: on the raw overloads here (cheap,
+        // before the substitution below is built) and on the substituted
+        // ones after it, because the literal may only appear through the
+        // receiver's type arguments (`RBS::Location[:name, :type_params]`
+        // has `def []: (RequiredChildKeys) -> ...`). A raw type-variable
+        // parameter is therefore enough to go on to the substituted check.
+        let mut has_hash_literal = false;
+        let mut has_literal_arg = false;
         if method_def.defs.len() > 1 {
             let arguments = node.arguments()?;
-            if !arguments
-                .arguments()
+            let args: Vec<_> = arguments.arguments().iter().collect();
+            has_hash_literal = args
                 .iter()
-                .any(|a| a.as_hash_node().is_some() || a.as_keyword_hash_node().is_some())
-            {
+                .any(|a| a.as_hash_node().is_some() || a.as_keyword_hash_node().is_some());
+            has_literal_arg = args.iter().any(|a| Self::is_simple_literal_arg(a));
+            let literal_may_need_hint = has_literal_arg
+                && method_def
+                    .method_types()
+                    .any(|mt| self.method_type_has_literal_param(mt, true));
+            if !has_hash_literal && !literal_may_need_hint {
                 return None;
             }
         }
@@ -5041,6 +5120,13 @@ impl<'env> TypeChecker<'env> {
         if method_def.defs.len() == 1 {
             return method_def.method_types().next().map(subst_mt);
         }
+        let literal_needs_hint = has_literal_arg
+            && method_def
+                .method_types()
+                .any(|mt| self.method_type_has_literal_param(&subst_mt(mt), false));
+        if !has_hash_literal && !literal_needs_hint {
+            return None;
+        }
         // Already verified in the early-bail block above.
         let arguments = node.arguments().expect("checked above");
         let positional_count = arguments
@@ -5051,6 +5137,15 @@ impl<'env> TypeChecker<'env> {
 
         'next_overload: for raw_overload in method_def.method_types() {
             let overload = subst_mt(raw_overload);
+            // An overload that cannot take this many positionals cannot
+            // be the call's target; without this gate `(Integer) | (Integer,
+            // 0 | 1)` would hand `one(5, 1)` the first overload as hint
+            // (`positional_param_for_call` returns `None` past its arity
+            // and `argument_matches_hint` passes on `None`), and the `1`
+            // would widen to `::Integer` under the missing hint.
+            if !overload.arity_accepts(positional_count) {
+                continue 'next_overload;
+            }
             let mut positional_index = 0usize;
             for arg in arguments.arguments().iter() {
                 if let Some(keyword_hash) = arg.as_keyword_hash_node() {
@@ -5142,7 +5237,11 @@ impl<'env> TypeChecker<'env> {
         let Some(hint_ty) = hint else {
             return true;
         };
-        let actual = self.infer_type(arg, None);
+        // Synthesized under this overload's hint, as the real argument
+        // collection will be: the literal survives only when the hint
+        // admits it, and widens to its class (and fails the check)
+        // otherwise.
+        let actual = self.infer_type(arg, Some(hint_ty));
         self.subtyper().check(actual, hint_ty)
     }
 
@@ -5154,6 +5253,39 @@ impl<'env> TypeChecker<'env> {
     /// (variables, calls, complex expressions) bypass the inference
     /// entry entirely — `narrow_overloads_by_args` retains sole
     /// authority for those.
+    /// Whether any positional / keyword parameter of `mt` mentions a
+    /// literal type (directly, or as a union / optional member, through
+    /// aliases) — the parameters for which a literal argument's hint
+    /// decides overload applicability. With `or_type_variable`, an
+    /// unsubstituted type variable also counts (it may become a literal
+    /// once the receiver's type arguments are applied).
+    fn method_type_has_literal_param(&self, mt: &MethodType, or_type_variable: bool) -> bool {
+        let Some(f) = mt.func() else {
+            return false;
+        };
+        f.required_positionals
+            .iter()
+            .chain(f.optional_positionals.iter())
+            .chain(f.trailing_positionals.iter())
+            .chain(f.rest_positional.iter())
+            .chain(f.required_keywords.iter().map(|(_, t)| t))
+            .chain(f.optional_keywords.iter().map(|(_, t)| t))
+            .any(|&ty| self.type_mentions_literal(ty, or_type_variable))
+    }
+
+    fn type_mentions_literal(&self, ty: Ty, or_type_variable: bool) -> bool {
+        let ty = definition_builder::expand_alias(self.env, ty);
+        match self.env.types().resolve(ty) {
+            Type::Literal(_) => true,
+            Type::TypeVariable { .. } => or_type_variable,
+            Type::Union(members) => members
+                .iter()
+                .any(|&m| self.type_mentions_literal(m, or_type_variable)),
+            Type::Optional(inner) => self.type_mentions_literal(*inner, or_type_variable),
+            _ => false,
+        }
+    }
+
     fn is_simple_literal_arg<'pr>(arg: &Node<'pr>) -> bool {
         matches!(
             arg,
