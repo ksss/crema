@@ -52,18 +52,45 @@ fn arg_span(start_byte: usize, end_byte: usize) -> ArgSpan {
     (start_byte as u32, end_byte as u32)
 }
 
+/// Whether an overload routes a braceless keyword hash to its positional
+/// slots (Steep `SendArgs#positional_arg`: `keyword_params.empty?`). An
+/// untyped function `(?) -> untyped` has no slots to fold into.
+fn takes_no_keywords(overload: &crate::types::MethodType) -> bool {
+    !overload.is_untyped_function()
+        && overload.required_keywords().is_empty()
+        && overload.optional_keywords().is_empty()
+        && overload.rest_keyword().is_none()
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CallArguments {
     positional: Vec<Ty>,
     positional_spans: Vec<ArgSpan>,
     keywords: Vec<(String, Ty, ArgSpan, ArgSpan)>,
     /// `**h` elements of the braceless keyword hash, as (value type,
-    /// span). Only `fold_braceless_keywords_for` reads them: a
-    /// keyword-less overload folds them (with `keywords`) into one
-    /// positional `Hash[K, V]`. Keyword-bearing overloads ignore them
-    /// (Steep's `KeywordArgs::SplatArg` side is a separate todo), so
-    /// `f(**h)` against `(a: Integer)` still reports the missing `a`.
+    /// span). A keyword-less overload folds them (with `keywords`) into
+    /// one positional `Hash[K, V]` (`fold_braceless_keywords_for`). A
+    /// keyword-bearing overload consumes a Record-typed splat key by key
+    /// (`kwsplat_record_keys`, Steep's `KeywordArgs::SplatArg`) and
+    /// checks any other splat only against `**rest`, so `f(**h)` with an
+    /// opaque Hash against `(a: Integer)` still reports the missing `a`.
     kwsplats: Vec<(Ty, ArgSpan)>,
+    /// Non-Symbol-keyed pairs of the braceless keyword hash (`f("a" =>
+    /// 1)`), as (key type, value type, span). Ruby never routes these to
+    /// keyword params; a keyword-less overload folds them (with
+    /// `keywords` / `kwsplats`) into the positional `Hash[K, V]`
+    /// (`fold_braceless_keywords_for`), and a keyword-bearing overload
+    /// ignores them (Steep reports `UnexpectedKeyword`; not ported yet).
+    non_symbol_pairs: Vec<(Ty, Ty, ArgSpan)>,
+    /// The braceless keyword hash typed as one positional under the hint
+    /// overload's positional slot (`collect_call_arguments_hinted`), when
+    /// that overload takes no keywords and the slot resolves to a Record
+    /// / `Hash[K, V]` hint. Steep's `SendArgs#positional_arg` hands the
+    /// `:kwargs` node to `type_hash_record` / `type_hash` with the param
+    /// type, so literals survive and nested values are hinted exactly as
+    /// in the braced form. `fold_braceless_keywords_for` prefers this over
+    /// its no-hint Record synthesis; `None` keeps that synthesis.
+    folded: Option<Ty>,
     has_block: bool,
     explicit_type_args: Option<Vec<Ty>>,
     /// Unexpandable trailing splat: `f(a, *xs)` where `xs: Array[E]` (or
@@ -223,6 +250,14 @@ pub struct TypeChecker<'env> {
     /// see that field's doc for why the two stay as separate bools
     /// rather than a single enum.
     suppress_method_body_last_assertion: bool,
+    /// True while `walk_concern_block_body` is checking an
+    /// `included do` / `prepended do` body under one include target.
+    /// `visit_def_node` then checks a `def` in the current (already
+    /// retargeted) context instead of re-expanding it through
+    /// `synthetic_method_context_targets` — otherwise every target's walk
+    /// would re-check the def for every *other* target (N×(N−1)).
+    concern_block_target_walk: bool,
+
     /// Sibling of `suppress_method_body_last_assertion` for the
     /// parens-routed dup. Named after the prototypical trigger (an
     /// lvasgn-wrapped Parens), but the mechanism covers any RHS that
@@ -251,23 +286,30 @@ pub struct TypeChecker<'env> {
     /// `&mut self`). Lifetime is scoped by `with_overlay`; no persistence.
     overlay_stack: std::cell::RefCell<Vec<FxHashMap<crate::name::Name, Ty>>>,
     pure_overlay_stack: std::cell::RefCell<Vec<FxHashMap<PureKey, Ty>>>,
+    /// `[self: T]` of hinted lambda literals during the read-only walk
+    /// (see `with_lambda_self`); innermost last.
+    lambda_self_stack: std::cell::RefCell<Vec<Ty>>,
     /// Interner for session-local names: local variable names, block/keyword
     /// parameter names added during type checking. Kept separate from
     /// `env.names()` so the frozen environment's `NameTable` can eventually
     /// become a `RodeoReader`.
     checker_names: NameTable,
-    /// Recursion guard for `unify_interface_into_bindings`: unlike every
-    /// other `unify_into_bindings` arm, which only ever recurses into the
-    /// already-finite structure of the same `Ty` (bounded by the type
-    /// expression's own size), the interface arm reaches for a fresh `Ty`
-    /// via method-return-type dispatch that can structurally echo the
-    /// input forever for a self-referential interface (e.g. `interface
-    /// _Node[T]; def next: () -> _Node[T]; end`). Mirrors
-    /// `SubtypeChecker`'s coinductive-assumption abort limit
+    /// Recursion guard for `unify_into_bindings`. Most arms only recurse
+    /// into the already-finite structure of the same `Ty` (bounded by the
+    /// type expression's own size), but two paths reach for a *fresh* `Ty`
+    /// that can structurally echo the input forever: the interface arm's
+    /// method-return-type dispatch (`interface _Node[T]; def next: () ->
+    /// _Node[T]; end`) and alias expansion of a recursive alias on either
+    /// side (`type ctx = [ctx, Symbol] | nil` unified against itself).
+    /// Mirrors `SubtypeChecker`'s coinductive-assumption abort limit
     /// (`subtyping.rs`) with a plain depth counter: unify only needs to
     /// stop, not stay sound under the cycle, so bailing to "no binding"
     /// past the cap is always safe.
-    interface_unify_depth: std::cell::Cell<u32>,
+    unify_depth: std::cell::Cell<u32>,
+    /// Set when `unify_into_bindings` bails at its depth cap; read by the
+    /// interface-arm memo (`DefinitionBuilder::interface_unify_cache`) so a
+    /// truncated result is never cached.
+    unify_depth_cap_hit: std::cell::Cell<bool>,
     /// `Some` only under `check_source_extract`: the site sink for
     /// `crema extract`. `None` (every `crema check` run) makes the
     /// record hooks a single branch, mirroring `options.verbose`'s cost
@@ -341,12 +383,16 @@ impl<'env> TypeChecker<'env> {
             diagnostics: RefCell::new(Vec::new()),
             comments,
             suppress_method_body_last_assertion: false,
+            concern_block_target_walk: false,
+
             suppress_parens_routed_last_assertion: false,
             options,
             overlay_stack: RefCell::new(Vec::new()),
             pure_overlay_stack: RefCell::new(Vec::new()),
+            lambda_self_stack: RefCell::new(Vec::new()),
             checker_names: NameTable::new(),
-            interface_unify_depth: std::cell::Cell::new(0),
+            unify_depth: std::cell::Cell::new(0),
+            unify_depth_cap_hit: std::cell::Cell::new(false),
             extract: None,
             extract_call_states: RefCell::new(FxHashMap::default()),
             extract_carried_types: RefCell::new(FxHashMap::default()),

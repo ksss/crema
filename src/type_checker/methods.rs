@@ -110,18 +110,14 @@ impl<'env> TypeChecker<'env> {
 
         // Top-level `def name` outside any class stack is Ruby-semantically
         // a private instance method on `Object` — fall back to `::Object`
-        // so a matching `class Object; def name: ...` sig binds the body.
-        // Sig mode only: in `--inline=true` mode the inline collector
-        // has already emitted `Ruby::TopLevelMethodDefinition` (parity
-        // with rbs `RBS::InlineParser`), and adding a body check on top
-        // of that would surface a second, redundant diagnostic. Keep the
-        // pre-existing early-return so inline mode's behavior is
-        // preserved verbatim.
+        // so a matching `class Object; def name: ...` sig (sig mode) or
+        // the inline collector's synthetic `::Object` reopen (inline
+        // mode) binds the body.
         // Singleton receivers (`def self.foo`) at the top level are
         // out of scope for this fallback in either mode.
         let class_name = match self.ctx.current_class_typename() {
             Some(name) => *name,
-            None if !self.options.inline && !is_singleton => self.env.names().builtins().object,
+            None if !is_singleton => self.env.names().builtins().object,
             None => return None,
         };
         let method_def = if is_singleton {
@@ -199,14 +195,21 @@ impl<'env> TypeChecker<'env> {
     }
 
     pub(super) fn bind_parameters<'pr>(&mut self, node: &DefNode<'pr>) {
-        let method_type = match self.ctx.method_type() {
-            Some(method_type) => method_type.clone(),
-            None => return,
-        };
-
         let params = match node.parameters() {
             Some(params) => params,
             None => return,
+        };
+
+        // No sig, or `(?) -> T`: every named param binds as `untyped`
+        // (Steep parity for plain params). Leaving them unbound instead
+        // would make narrowing (`case`/`is_a?`/truthiness) give up, since
+        // it only refines bound locals.
+        let method_type = match self.ctx.method_type() {
+            Some(method_type) if !method_type.is_untyped_function() => method_type.clone(),
+            _ => {
+                self.bind_parameters_untyped(&params);
+                return;
+            }
         };
 
         for (index, param) in params.requireds().iter().enumerate() {
@@ -327,6 +330,54 @@ impl<'env> TypeChecker<'env> {
             let name = self.checker_names().intern(&name_str);
             let ty = self.freeze_self_type_for_lvar_binding(ty);
             self.ctx.set_local_variable(name, ty);
+        }
+    }
+
+    /// Binds every named param of a sig-less (or `(?) -> T`) method as
+    /// `untyped`. Rest / kwrest / block params are `untyped` too rather than
+    /// Steep's `Array[untyped]` / `Hash[Symbol, untyped]` / `nil`, so a
+    /// sig-less body gains no new receiver diagnostics.
+    fn bind_parameters_untyped(&mut self, params: &ruby_prism::ParametersNode<'_>) {
+        let mut names = Vec::new();
+        for param in params.requireds().iter().chain(params.posts().iter()) {
+            if let Some(required) = param.as_required_parameter_node() {
+                names.push(required.name());
+            }
+        }
+        for param in params.optionals().iter() {
+            if let Some(optional) = param.as_optional_parameter_node() {
+                names.push(optional.name());
+            }
+        }
+        if let Some(rest) = params.rest().and_then(|r| r.as_rest_parameter_node())
+            && let Some(name) = rest.name()
+        {
+            names.push(name);
+        }
+        for keyword in params.keywords().iter() {
+            if let Some(required) = keyword.as_required_keyword_parameter_node() {
+                names.push(required.name());
+            } else if let Some(optional) = keyword.as_optional_keyword_parameter_node() {
+                names.push(optional.name());
+            }
+        }
+        if let Some(kwrest) = params
+            .keyword_rest()
+            .and_then(|r| r.as_keyword_rest_parameter_node())
+            && let Some(name) = kwrest.name()
+        {
+            names.push(name);
+        }
+        if let Some(block) = params.block()
+            && let Some(name) = block.name()
+        {
+            names.push(name);
+        }
+
+        for name_id in names {
+            let name_str = String::from_utf8_lossy(name_id.as_slice());
+            let name = self.checker_names().intern(&name_str);
+            self.ctx.set_local_variable(name, Ty::UNTYPED);
         }
     }
 

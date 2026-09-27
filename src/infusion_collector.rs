@@ -8,6 +8,7 @@
 //! rules so that normal class bodies and synthetic Concern bodies pass
 //! through the same InfusionBody rule application path.
 
+pub mod action_mailer;
 pub mod active_decorator;
 pub mod active_record_synthesis;
 pub mod activemodel;
@@ -17,6 +18,7 @@ pub mod config;
 pub(crate) mod inflector;
 pub(crate) mod paranoia;
 pub(crate) mod pipeline;
+pub(crate) mod sidekiq;
 mod zeitwerk_synthesis;
 
 pub use inflector::{Inflector, OwnedOrDefault, build_for_config};

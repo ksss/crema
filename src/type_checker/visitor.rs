@@ -402,7 +402,14 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
 
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         self.record_extract_implements(node);
-        let synthetic_targets = self.synthetic_method_context_targets(node);
+        // Inside a retargeted concern block walk the class stack already
+        // names the one target this pass is for — see the field doc.
+        let synthetic_targets = if self.concern_block_target_walk {
+            Vec::new()
+        } else {
+            self.synthetic_method_context_targets(node)
+        };
+
         if !synthetic_targets.is_empty() {
             for target in synthetic_targets {
                 let saved_class_stack = self.ctx.replace_class_stack(vec![target]);
@@ -673,20 +680,14 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
         // skip the default walker to avoid double-emitting the head
         // ConstantReadNode at the same source location.
         //
-        // Dynamic-parent paths (`Foo.bar::Const`, `obj::C`) cannot be
-        // statically resolved, so the path itself stays silent on the
-        // diagnostic axis (the finisher still records the extract-mode
-        // `untyped` site) — but the parent expression may still have
-        // diagnostics worth firing (`Foo` in `Foo.bar::Baz` is an
-        // unknown receiver). Detect that shape via the resolver outcome
-        // and hand back to the default walker so the subtree is visited
-        // normally.
-        let outcome = self.resolve_constant_path_outcome(node);
-        let malformed = matches!(outcome, ConstantPathOutcome::Malformed);
+        // Dynamic-parent paths (`Foo.bar::Const`, `obj::C`) are handled
+        // inside `check_constant_path_outcome`: it type-checks the parent
+        // expression once (firing its own diagnostics, e.g. `Foo.bar`'s
+        // NoMethod) and resolves the leaf against the parent's type.
+        // Only a truly malformed prism tree stays `Malformed`, and that
+        // has nothing left to walk.
+        let outcome = self.check_constant_path_outcome(node);
         self.finish_constant_path_read(node, &outcome, Some(ConstantKind::Constant));
-        if malformed {
-            visit_constant_path_node(self, node);
-        }
     }
 
     fn visit_global_variable_read_node(&mut self, node: &GlobalVariableReadNode<'pr>) {
@@ -921,10 +922,13 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
     fn visit_yield_node(&mut self, node: &YieldNode<'pr>) {
         let info = self.ctx.method_type().map(|mt| {
             let block_is_none = mt.block.is_none();
+            // Required + optional slots (Steep `flat_unnamed_params`): a
+            // `yield 1, "s"` into `(Integer, ?Integer)` must check the
+            // second argument against the optional slot.
             let req_positionals: Vec<Ty> = mt
                 .block
                 .as_ref()
-                .map(|b| b.params().to_vec())
+                .map(|b| b.flat_positionals())
                 .unwrap_or_default();
             (block_is_none, req_positionals)
         });
@@ -1598,6 +1602,94 @@ impl<'env> TypeChecker<'env> {
         self.ctx
             .replace_singleton_class_depth(saved_singleton_class_depth);
         self.ctx.pop_class();
+    }
+
+    /// `included do` / `prepended do` on an ActiveSupport::Concern
+    /// module. Rails `class_eval`s the block on every class that
+    /// (transitively) includes the concern, so the body is walked once
+    /// per final target with the class stack replaced by `[target]` —
+    /// `self` is `singleton(target)`, the same retargeting
+    /// `visit_def_node` applies to a synthetic concern `def`, and the
+    /// same body entry (`check_node`) `walk_class_construction_block_body`
+    /// uses. A `|base|` block param is bound to that singleton too. The
+    /// block scope itself was already pushed by `check_call`'s
+    /// `setup_block_scope`, so the rebinding lands in it.
+    ///
+    /// Returns `false` when the call is not a block the infusion pipeline
+    /// expanded (receiver present, not `included` / `prepended`, a
+    /// non-Concern module, a second `included do` in the same module),
+    /// and the caller keeps the default walk under the module's own
+    /// singleton. A collected block with zero targets returns `true`
+    /// without walking anything: Rails never runs it, and a
+    /// module-singleton walk would only report `NoMethod` on DSL calls
+    /// (`has_many`) the concern module itself never answers.
+    pub(super) fn walk_concern_block_body<'pr>(
+        &mut self,
+        call: &CallNode<'pr>,
+        block: &Node<'pr>,
+    ) -> bool {
+        if call.receiver().is_some() || self.ctx.method_name().is_some() {
+            return false;
+        }
+        let name = call.name().as_slice();
+        if name != b"included" && name != b"prepended" {
+            return false;
+        }
+        let Some(block_node) = block.as_block_node() else {
+            return false;
+        };
+        let Some(concern) = self.ctx.current_class_typename().copied() else {
+            return false;
+        };
+        let location = crate::inline_parser::prism_location_range(block_node.location());
+        let source_file = self.env.names().intern(&self.file.to_string_lossy());
+        let Some(targets) = self
+            .env
+            .concern_block_targets(concern, location, Some(source_file))
+        else {
+            return false;
+        };
+        let Some(body) = block_node.body() else {
+            return true;
+        };
+        let base_param = block_node
+            .parameters()
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|bp| bp.parameters())
+            .and_then(|params| {
+                let requireds = params.requireds();
+                if requireds.len() != 1 {
+                    return None;
+                }
+                requireds.iter().next()
+            })
+            .and_then(|p| p.as_required_parameter_node())
+            .map(|p| String::from_utf8_lossy(p.name().as_slice()).to_string());
+
+        let saved_walk = std::mem::replace(&mut self.concern_block_target_walk, true);
+        // Each target is a separate `class_eval` at runtime, so each walk
+        // starts from the same lvar state: without the reset, a binding
+        // (or narrowing) from the first target's walk would leak into the
+        // next one through the single block scope `check_call` pushed
+        // (crema-review adversarial finding).
+        let scopes_before = self.ctx.snapshot_scopes();
+        for target in targets {
+            self.ctx.restore_scopes(scopes_before.clone());
+            let saved_class_stack = self.ctx.replace_class_stack(vec![target]);
+
+            let saved_singleton_class_depth = self.ctx.replace_singleton_class_depth(0);
+            if let Some(base) = &base_param {
+                let base = self.checker_names().intern(base);
+                let ty = self.env.types().class_singleton(target);
+                self.ctx.set_local_variable(base, ty);
+            }
+            self.check_node(&body, None);
+            self.ctx
+                .replace_singleton_class_depth(saved_singleton_class_depth);
+            self.ctx.restore_class_stack(saved_class_stack);
+        }
+        self.concern_block_target_walk = saved_walk;
+        true
     }
 
     /// Push a `class` / `module` declaration onto the context stack keyed by
@@ -2541,7 +2633,7 @@ impl<'env> TypeChecker<'env> {
                         // get force-widened below and false-positive
                         // against the very hint it should satisfy.
                         let tuple_elem_hints: Option<Vec<Ty>> = if assertion_ty.is_none() {
-                            hint.and_then(|h| self.array_tuple_hint(h, elements.len()))
+                            hint.and_then(|h| self.array_tuple_hint(h, &elements))
                         } else {
                             None
                         };

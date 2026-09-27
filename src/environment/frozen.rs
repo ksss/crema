@@ -23,6 +23,7 @@ use crate::ast::declarations::{
     ModuleAliasDeclaration as ModuleAlias, ModuleDeclaration as Module, ModuleSelf as SelfType,
     TypeAliasDeclaration as TypeAlias,
 };
+use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::declarations::{
     ClassDecl as RubyClassDecl, ClassModuleAliasDecl as RubyClassModuleAliasDecl,
     ModuleDecl as RubyModuleDecl,
@@ -33,6 +34,7 @@ use crate::ast::types::{
     ProcType, RecordField, RecordType, TupleType, Type, UnionType, VariableType,
 };
 use crate::environment::DeclOrigin;
+
 use crate::environment::draft::{
     Context, EnvironmentDraft, FrozenOverlay, GlobalEntry, PathIndexKey, SingleEntry,
     class_decl_has_super,
@@ -582,6 +584,38 @@ pub struct Environment {
     /// [`Self::all_names`] for the persistence rationale. Two-layer —
     /// see [`Self::path_index`].
     pub(crate) aliases: FxHashMap<TypeName, (String, Context)>,
+    /// `included do` / `prepended do` block → final include / prepend
+    /// targets, per ActiveSupport::Concern module, computed by the
+    /// infusion pipeline's concern expansion
+    /// (`infusion_collector::load_collected`). Read by
+    /// `DefinitionBuilder::concern_block_targets` so the type checker can
+    /// walk a concern block body under each target's singleton context.
+    /// Kept as its own table rather than derived from the synthetic
+    /// decls: a block whose only calls synthesize no member (`validates`)
+    /// leaves no decl behind, yet still needs its targets. An entry with
+    /// zero targets is recorded too — the checker skips that body, as
+    /// Rails never runs it. A-layer only (concerns are a Ruby-only
+    /// mechanism), so never persisted in a G snapshot. Fingerprinted as
+    /// its own key (`FingerprintKey::ConcernTargets`, kept apart from
+    /// the module's `Type` so a target change is not expanded to every
+    /// includer) so adding or removing a target invalidates the concern
+    /// file and nothing else.
+    pub(crate) concern_block_targets: FxHashMap<TypeName, Vec<ConcernBlockTargets>>,
+}
+
+/// One concern block's expansion result — see
+/// [`Environment::concern_block_targets`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcernBlockTargets {
+    /// File the concern module (and its block) is declared in. `None`
+    /// for a file-less source (tests' inline units) — matches any file.
+    pub source_file: Option<Name>,
+    /// Byte range of the block node (`do ... end`), the same range the
+    /// synthetic decls carry as `name_location`.
+    pub location: PrismByteRange,
+    /// Final include / prepend targets, in concern-site iteration order,
+    /// deduplicated. Intermediate concern modules never appear.
+    pub targets: Vec<TypeName>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -861,6 +895,12 @@ impl Environment {
         }
     }
 
+    /// Concern block → final targets table, keyed by the concern module.
+    /// See the field doc for provenance and consumers.
+    pub fn concern_block_targets(&self) -> &FxHashMap<TypeName, Vec<ConcernBlockTargets>> {
+        &self.concern_block_targets
+    }
+
     pub fn class_decls(&self) -> Decls<'_, TypeName, ClassOrModule> {
         match &self.g {
             None => Decls::built(&self.class_decls),
@@ -1081,6 +1121,7 @@ impl Environment {
             path_index,
             mut all_names,
             mut aliases,
+            concern_block_targets,
         } = self;
 
         // Resolver-table delta (ADR-0028 slice S2): a name drops out of
@@ -1158,6 +1199,23 @@ impl Environment {
         let mut draft = EnvironmentDraft::new_with_names(names);
         draft.path_index = path_index;
         draft.g = g;
+        // Entries are keyed by the concern's own file: dropping the
+        // unloaded files' entries mirrors dropping their decls. A
+        // surviving entry's targets may still name a class declared in an
+        // unloaded file — `load_collected` recomputes the whole table
+        // when the infusion pipeline re-runs over the draft.
+        draft.concern_block_targets = concern_block_targets
+            .into_iter()
+            .map(|(concern, entries)| {
+                let kept: Vec<_> = entries
+                    .into_iter()
+                    .filter(|e| !e.source_file.is_some_and(|f| paths.contains(&f)))
+                    .collect();
+                (concern, kept)
+            })
+            .filter(|(_, entries)| !entries.is_empty())
+            .collect();
+
         draft.overlay = Some(Box::new(FrozenOverlay {
             class_decls,
             interface_decls,

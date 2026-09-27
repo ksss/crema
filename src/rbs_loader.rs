@@ -175,27 +175,19 @@ fn parse_magic_comment(source: &[u8]) -> Option<ResolveTypeNamesDirective> {
 }
 
 impl EnvironmentDraft {
-    /// Load all .rbs files from a directory recursively into this draft.
+    /// Load all .rbs files from a directory recursively into this draft,
+    /// walking with [`crate::file_finder::each_file`] (rbs `FileFinder`):
+    /// `skip_hidden` prunes `_` dirs and is `true` for core / library /
+    /// collection sources, `false` for user sig dirs (rbs `-I`).
     /// ADR-0017 Phase 5b: legacy buffer is still
     /// updated in lockstep so existing internal helpers
     /// (`process_class_decl_ast` etc.) keep compiling; the buffer is no
     /// longer consumed downstream and Phase E will remove the dead push
     /// path.
-    pub fn load_dir(&mut self, dir: &Path) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| format!("Cannot read directory {}: {}", dir.display(), e))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                self.load_dir(&path)?;
-            } else if path.extension().is_some_and(|ext| ext == "rbs") {
-                self.load_file(&path)?;
-            }
+    pub fn load_dir(&mut self, dir: &Path, skip_hidden: bool) -> Result<(), String> {
+        for path in crate::file_finder::each_file(dir, skip_hidden)? {
+            self.load_file(&path)?;
         }
-
         Ok(())
     }
 

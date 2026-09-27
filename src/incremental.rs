@@ -37,6 +37,7 @@ use crate::environment::frozen::Environment;
 use crate::name::{NameTable, Symbol};
 use crate::snapshot::invalidation::InvalidationKey;
 use crate::snapshot::write::write_atomic_bytes;
+use crate::type_name::TypeName;
 
 
 /// Cache location, sibling of the G snapshot under the same
@@ -56,7 +57,20 @@ pub const CACHE_MAGIC: u64 = 0xC5EA_1CAC_0000_0001;
 /// existed carries consulted columns missing those entries, and reading
 /// it would replay exactly the stale diagnostics the new keys were
 /// added to prevent (v1→v2: ancestor-walk queries became recorded).
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+/// v2→v3: `FingerprintKey::ConcernTargets` and
+/// `ConsultedKey::ConcernBlockTargets` (concern block bodies checked per
+/// include target); a v2 cache has neither column.
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
+
+/// Probe id for a [`FingerprintKey::ConcernTargets`] change, shared by
+/// [`probe_hashes`] and the `ConsultedKey::ConcernBlockTargets`
+/// projection. Distinct from the bare name id so a concern's target-set
+/// change reaches only the file that walked its block, not every file
+/// that merely resolved the module (a `DeclaredKind` / include probe
+/// carries the bare id).
+pub fn concern_targets_probe_id(concern: TypeName) -> u64 {
+    concern.get().rotate_left(32) ^ 0x434f_4e43_4552_4e21 // "CONCERN!"
+}
 
 /// Layout: magic u64 LE | schema_version u32 LE | reserved u32 = 0 |
 /// invalidation key 32 bytes. Mirrors the G-snapshot header shape.
@@ -261,6 +275,11 @@ fn project_consulted_key(key: &ConsultedKey, out: &mut Vec<u64>) {
                 out.push(n.get());
             }
         }
+        // Matched by `FingerprintKey::ConcernTargets(concern)`'s probe
+        // (`environment::fingerprint::hash_class_or_module` emits it), so
+        // a target joining or leaving reaches this file and no other.
+        ConcernBlockTargets { concern, .. } => out.push(concern_targets_probe_id(*concern)),
+
         ConstantResolution { name, context } => {
             out.push(name.raw_id());
             for scope in context.scopes() {
@@ -294,7 +313,9 @@ pub fn fingerprint_records(table: &FingerprintTable, names: &NameTable) -> Vec<F
                 | FingerprintKey::ClassAlias(n)
                 | FingerprintKey::TypeAlias(n)
                 | FingerprintKey::Constant(n) => names.last_segment_if_interned(*n),
-                FingerprintKey::Member(..) | FingerprintKey::Global(_) => None,
+                FingerprintKey::Member(..)
+                | FingerprintKey::Global(_)
+                | FingerprintKey::ConcernTargets(_) => None,
             },
         })
         .collect();
@@ -310,6 +331,7 @@ fn record_sort_key(key: &FingerprintKey) -> (u8, u64, u64) {
         FingerprintKey::TypeAlias(n) => (3, n.get(), 0),
         FingerprintKey::Constant(n) => (4, n.get(), 0),
         FingerprintKey::Global(s) => (5, s.raw_id(), 0),
+        FingerprintKey::ConcernTargets(n) => (6, n.get(), 0),
     }
 }
 
@@ -368,6 +390,7 @@ pub fn probe_hashes(
                 out.push(m.raw_id());
             }
             FingerprintKey::Global(s) => out.push(s.raw_id()),
+            FingerprintKey::ConcernTargets(n) => out.push(concern_targets_probe_id(*n)),
         }
     }
     out.sort_unstable();

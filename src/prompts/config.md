@@ -94,7 +94,7 @@ Synthesizes declarations for methods and constants that metaprogramming or stati
 
 ### [infusion.rails]
 
-- `enabled` — `Boolean`, default `false`. Turns on the ActiveSupport, ActiveModel, and ActiveRecord rule families together, plus the zeitwerk-style constant synthesis that runs after them. The unit of choice is the framework, not the individual DSL rule.
+- `enabled` — `Boolean`, default `false`. Turns on the ActiveSupport, ActiveModel, and ActiveRecord rule families together, plus the zeitwerk-style constant synthesis that runs after them. Also synthesizes each ActionMailer action (an instance `def` on an `ActionMailer::Base` descendant) as a class method returning `ActionMailer::MessageDelivery`, the way `FooMailer.hello(user).deliver_later` calls it. The unit of choice is the framework, not the individual DSL rule.
 - `inflections` — `Table`, default `absent`. Holds locale sub-tables; only `en` exists (see below).
 
 Propose this table when the project uses Rails.

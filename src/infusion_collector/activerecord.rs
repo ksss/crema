@@ -947,6 +947,7 @@ fn push_overloaded_ctor_def(
         })
         .collect();
     members.push(Member::Def(DefMember {
+        visibility: None,
         ivar_param_pairs: Vec::new(),
         name: method_name.to_string(),
         kind: MethodKind::Instance,
@@ -1105,6 +1106,7 @@ fn push_typed_def(
         location: None,
     };
     members.push(Member::Def(DefMember {
+        visibility: None,
         ivar_param_pairs: Vec::new(),
         name,
         kind: MethodKind::Instance,
@@ -1432,6 +1434,7 @@ fn collect_scope_call(
         )
     });
     members.push(Member::Def(DefMember {
+        visibility: None,
         ivar_param_pairs: Vec::new(),
         name: arg.name.clone(),
         kind: MethodKind::Singleton,
@@ -1724,6 +1727,7 @@ fn push_singleton_typed_def(
         )
     });
     members.push(Member::Def(DefMember {
+        visibility: None,
         ivar_param_pairs: Vec::new(),
         name,
         kind: MethodKind::Singleton,
@@ -1765,6 +1769,7 @@ fn push_instance_overloaded_def(
         })
         .collect();
     members.push(Member::Def(DefMember {
+        visibility: None,
         ivar_param_pairs: Vec::new(),
         name,
         kind: MethodKind::Instance,

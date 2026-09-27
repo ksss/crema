@@ -20,6 +20,8 @@ use crate::ast::ruby::{LineIndex, PrismByteRange};
 use crate::config::InfusionOptions;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::environment::draft::EnvironmentDraft;
+use crate::environment::frozen::ConcernBlockTargets;
+
 use crate::environment::ruby_decl::build_annotation_syntax_error;
 use crate::infusion_collector::activerecord::{
     ActiveRecordAssociation, ActiveRecordEnumMapping, ActiveRecordScope,
@@ -231,8 +233,39 @@ pub fn load_collected<'a>(
         }
     }
 
+    // Every concern block gets an entry up front, targets or not: the
+    // type checker skips a block with zero targets (Rails never runs it)
+    // and must tell that apart from a block the pipeline never collected
+    // (which keeps the default module-singleton walk).
+    let mut concern_block_targets: FxHashMap<TypeName, Vec<ConcernBlockTargets>> =
+        FxHashMap::default();
+    for source in collected.iter().flatten() {
+        let source_file = source
+            .file
+            .map(|f| draft.names().intern(&f.to_string_lossy()));
+        for concern in &source.concerns {
+            for body in [
+                concern.included_body.as_ref(),
+                concern.prepended_body.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                concern_block_targets
+                    .entry(concern.name)
+                    .or_default()
+                    .push(ConcernBlockTargets {
+                        source_file,
+                        location: body.name_location,
+                        targets: Vec::new(),
+                    });
+            }
+        }
+    }
+
     let mut emitted_bodies = FxHashSet::default();
     let mut emitted_class_methods = FxHashSet::default();
+
     // Expansion contributions per target, keyed by the emitting concern
     // file: `model_owner` must not count them as a second declaring file
     // (they are re-creatable from the concern side — ADR-0028 S2d), while
@@ -295,6 +328,21 @@ pub fn load_collected<'a>(
                 // yields no members (and thus no decl) but still marks
                 // its include target as a paranoia model.
                 paranoia_models.extend(synthetic.body.paranoia_model(options));
+                // Also before the bail, for the same reason: the target
+                // list must not depend on whether any member came out.
+                if let Some(entry) =
+                    concern_block_targets
+                        .get_mut(&synthetic.concern)
+                        .and_then(|entries| {
+                            entries
+                                .iter_mut()
+                                .find(|e| e.location == synthetic.body.name_location)
+                        })
+                    && !entry.targets.contains(&site.target)
+                {
+                    entry.targets.push(site.target);
+                }
+
                 let Some(decl) = Collector::apply_body(
                     synthetic.body,
                     Vec::new(),
@@ -351,6 +399,8 @@ pub fn load_collected<'a>(
         }
     }
 
+    draft.set_concern_block_targets(concern_block_targets);
+
     if options.activerecord {
         if let Some(schema) = schema.as_ref() {
             let mut enums_by_attr: FxHashMap<TypeName, FxHashSet<String>> = FxHashMap::default();
@@ -390,6 +440,26 @@ pub fn load_collected<'a>(
         }
     }
 
+    // sidekiq: class-body `include Sidekiq::Job` sites, matched after
+    // alias normalization inside the pass. Module targets are dropped
+    // here — see `sidekiq::synthesize` for why.
+    if options.sidekiq {
+        let sites: Vec<super::sidekiq::SidekiqSite> = collected
+            .iter()
+            .flatten()
+            .flat_map(|source| source.concern_sites.iter())
+            .filter(|site| {
+                matches!(site.kind, ConcernSiteKind::Include)
+                    && matches!(site.target_kind, InfusionOwnerKind::Class)
+            })
+            .map(|site| super::sidekiq::SidekiqSite {
+                target: site.target,
+                module_names: site.module_names.clone(),
+            })
+            .collect();
+        super::sidekiq::synthesize(draft, &sites);
+    }
+
     // Zeitwerk-style implicit namespace synthesis (see
     // `crate::infusion_collector::zeitwerk_synthesis`). Runs after every
     // Ruby-source declaration (top-level + concern expansion +
@@ -400,6 +470,9 @@ pub fn load_collected<'a>(
     // plain-Ruby NameError we intentionally preserve.
     if options.rails_enabled() {
         super::zeitwerk_synthesis::synthesize(draft);
+        // Reads the Ruby `def`s of every `ActionMailer::Base` descendant,
+        // so it too runs after every Ruby-source declaration is in.
+        super::action_mailer::synthesize(draft);
     }
 
     diagnostics
@@ -411,6 +484,7 @@ fn activesupport_options() -> InfusionOptions {
         activemodel: false,
         activerecord: false,
         paranoia: false,
+        sidekiq: false,
     }
 }
 
@@ -678,6 +752,9 @@ enum SyntheticClassMethodsMixinKind {
 
 struct SyntheticBody {
     source_index: usize,
+    /// The concern module whose block `body` was cloned from — the key
+    /// `load_collected` records the block's targets under.
+    concern: TypeName,
     body: InfusionBody,
 }
 
@@ -774,6 +851,7 @@ fn expand_concern_bodies(
     if let Some(body) = concern.body(body_kind) {
         out.push(SyntheticBody {
             source_index: concern.source_index,
+            concern: concern.name,
             body: body.synthetic_for(
                 expansion_target.target,
                 expansion_target.target_kind,
@@ -1014,6 +1092,7 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
             TrailingResolution::None => {}
         }
         self.members.push(Member::Def(DefMember {
+            visibility: None,
             ivar_param_pairs: Vec::new(),
             name: String::from_utf8_lossy(node.name().as_slice()).to_string(),
             kind,
@@ -1072,6 +1151,7 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
                 _ => (None, None),
             };
         let attribute = AttributeMember {
+            visibility: None,
             location: prism_location_range(node.location()),
             name_nodes,
             type_text,
@@ -1433,6 +1513,7 @@ impl<'a> Collector<'a> {
             return true;
         }
         let attribute = AttributeMember {
+            visibility: None,
             location: prism_location_range(node.location()),
             name_nodes,
             type_text: None,
@@ -1955,6 +2036,7 @@ fn push_def_with_origin(
     Collector::push_member(
         members,
         Member::Def(DefMember {
+            visibility: None,
             ivar_param_pairs: Vec::new(),
             name,
             kind,
@@ -2405,6 +2487,7 @@ mod tests {
             module_name: names.append_type_name(owner, names.intern_symbol("ClassMethods")),
             name_location: (0, 0),
             members: vec![Member::Def(DefMember {
+                visibility: None,
                 ivar_param_pairs: Vec::new(),
                 name: method.to_string(),
                 kind: MethodKind::Instance,
@@ -2854,6 +2937,7 @@ end
             activemodel: true,
             activerecord: true,
             paranoia: false,
+            sidekiq: false,
         }
     }
 

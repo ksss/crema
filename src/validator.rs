@@ -18,6 +18,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::ast::ruby::PrismByteRange;
 use crate::ast::types::Type as AstType;
 use crate::definition::ancestor_builder::{Ancestor, AncestorBuilder};
 use crate::definition::{MixinRef, VariableDuplicationKind};
@@ -25,6 +26,7 @@ use crate::definition_builder::{
     BakedAncestorCycle, BakedArityViolation, DefinitionBuilder, PerNameCache, TypeParamsCache,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::environment::DeclOrigin;
 use crate::environment::frozen::{
     ClassDeclaration, ClassOrModule, Environment, ModuleDeclaration, NormalizeModuleNameResult,
 };
@@ -923,10 +925,22 @@ fn has_self_edge(graph: &FxHashMap<TypeName, Vec<TypeName>>, node: TypeName) -> 
         .is_some_and(|successors| successors.contains(&node))
 }
 
-/// `RubyClassDecl` / `RubyModuleDecl` track byte ranges per member but
-/// have no decl-level `LocationRange`, so inline anchors degrade to `None` —
-/// the diagnostic still surfaces with the empty path / line 1 fallback
-/// that `resolve_or_default` produces for locationless inputs.
+/// Location of the anchor's primary decl. rbs anchors at
+/// `entry.primary_decl.location` (`RecursiveAncestorError.check!` in
+/// `definition_builder/ancestor_builder.rb`), i.e. the whole decl span
+/// for both `.rbs` and `.rb` decls.
+///
+/// Signature decls carry their own `source_file` + decl-level range, so
+/// that branch matches rbs exactly. `RubyClassDecl` / `RubyModuleDecl`
+/// have no decl-level range and no file slot, so the inline branch is an
+/// approximation: the file comes from the entry's `context_decls` origin
+/// (found by `Arc::ptr_eq` against `primary_decl`, which is a clone of
+/// that same `Arc`) and the range is the name token (`name_location`,
+/// same line as rbs's span start) as a byte-only `SourceLocation` — the
+/// JSONL emitter derives `line` from the byte offset, so no `SourceCache`
+/// is threaded through `AncestryEnv`. Fileless inline decls
+/// (`DeclOrigin::Unspecified`, in-memory tests) stay `None` and take the
+/// `resolve_or_default` fallback.
 fn primary_decl_location(ctx: &AncestryEnv, name: &TypeName) -> Option<SourceLocation> {
     let environment = ctx.env;
     let names = ctx.names();
@@ -939,7 +953,12 @@ fn primary_decl_location(ctx: &AncestryEnv, name: &TypeName) -> Option<SourceLoc
                         range: l.range,
                     })
                 }
-                ClassDeclaration::Ruby(_) => None,
+                ClassDeclaration::Ruby(primary) => {
+                    let (origin, _, _) = entry.context_decls().iter().find(|(_, _, d)| {
+                        matches!(d, ClassDeclaration::Ruby(r) if Arc::ptr_eq(r, primary))
+                    })?;
+                    ruby_name_location(names, *origin, primary.name_location)
+                }
             },
             ClassOrModule::Module(entry) => match entry.primary_decl() {
                 ModuleDeclaration::Signature(m) => {
@@ -948,7 +967,12 @@ fn primary_decl_location(ctx: &AncestryEnv, name: &TypeName) -> Option<SourceLoc
                         range: l.range,
                     })
                 }
-                ModuleDeclaration::Ruby(_) => None,
+                ModuleDeclaration::Ruby(primary) => {
+                    let (origin, _, _) = entry.context_decls().iter().find(|(_, _, d)| {
+                        matches!(d, ModuleDeclaration::Ruby(r) if Arc::ptr_eq(r, primary))
+                    })?;
+                    ruby_name_location(names, *origin, primary.name_location)
+                }
             },
         };
     }
@@ -1502,6 +1526,20 @@ fn check_one(
         expected,
         got,
         location: mixin.location.clone(),
+    })
+}
+
+/// Byte-only `SourceLocation` for an inline decl's name token; same shape
+/// as the disk-miss branch of `resolve_ruby_location`.
+fn ruby_name_location(
+    names: &NameTable,
+    origin: DeclOrigin,
+    (start_byte, end_byte): PrismByteRange,
+) -> Option<SourceLocation> {
+    let file = origin.file()?;
+    Some(SourceLocation {
+        file: PathBuf::from(names.resolve(file)),
+        range: crate::location::LocationRange::new(start_byte, start_byte, end_byte, end_byte),
     })
 }
 

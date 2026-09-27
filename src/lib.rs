@@ -12,6 +12,7 @@ pub mod definition_builder;
 pub mod diagnostic;
 pub mod environment;
 pub mod extract;
+pub mod file_finder;
 pub mod gem_dir_cache;
 pub mod gem_enumerator;
 pub mod ids;

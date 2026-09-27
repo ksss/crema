@@ -32,7 +32,7 @@ use crate::ast::ruby::members::{DefMemberOrigin, Member as RubyMember};
 use crate::ast::types::Type as AstType;
 use crate::definition::ancestor_builder::{self, Ancestor, AncestorBuilder, AncestorSource};
 use crate::definition::lowering_maps::LoweringMaps;
-use crate::definition::method::deprecated_annotation;
+use crate::definition::method::{deprecated_annotation, has_method_missing_annotation};
 use crate::definition::method_builder;
 use crate::definition::{
     ConstantContext, ConstantResolver, Definition, LoweringEnv, MemberRef, Method,
@@ -69,6 +69,10 @@ pub(crate) struct SubtypeCacheKey {
 }
 
 type SubtypeCache = FxHashMap<SubtypeCacheKey, bool>;
+
+/// Key of [`DefinitionBuilder::interface_unify_cache`]: `(interface name,
+/// interface args, arg type, widen-leaves mode)`.
+pub(crate) type InterfaceUnifyKey = (TypeName, Vec<Ty>, Ty, bool);
 
 /// On-demand memoized per-class definition cache built on top of a frozen
 /// [`Environment`]. Mirrors `RBS::DefinitionBuilder`.
@@ -114,6 +118,16 @@ pub struct DefinitionBuilder {
     /// positive and negative results are stored. No invalidation since
     /// the underlying environment is immutable post-build (ADR-0020).
     subtype_cache: RefCell<SubtypeCache>,
+    /// Memoized `TypeChecker::unify_interface_into_bindings` results: the
+    /// type-var bindings an interface-typed param extracts from a concrete
+    /// arg, keyed by `(interface, its args, the arg, widen-leaves mode)`.
+    /// Computing one walks the arg class's full applied ancestor chain per
+    /// required method; rbs core's `array[U]` (`Array[U] | _ToAry[U]`)
+    /// puts that walk on every Array call once param-side unions unify all
+    /// members, and the same `(_ToAry, [U], Array[X])` key recurs across
+    /// files, so this lives here rather than on the per-file checker.
+    /// Same no-persistence rule as `subtype_cache` (keyed by `Ty`).
+    interface_unify_cache: RefCell<FxHashMap<InterfaceUnifyKey, Vec<(TypeVarKey, Ty)>>>,
     /// Memoized `expand_alias` results: input `Ty` → fully-expanded `Ty`
     /// (after fixpoint alias-to-alias chasing). The function is called
     /// from both the dispatch path (`resolve_call_target_at` /
@@ -212,6 +226,7 @@ impl DefinitionBuilder {
             singleton_definition_cache: RefCell::new(FxHashMap::default()),
             interface_definition_cache: RefCell::new(FxHashMap::default()),
             subtype_cache: RefCell::new(FxHashMap::default()),
+            interface_unify_cache: RefCell::new(FxHashMap::default()),
             expand_alias_cache: RefCell::new(FxHashMap::default()),
             normalize_receiver_cache: RefCell::new(FxHashMap::default()),
             type_params: TypeParamsCache::default(),
@@ -236,8 +251,8 @@ impl DefinitionBuilder {
     /// `AncestorBuilder` update at all).
     ///
     /// Three fields are *not* carried over, each for a different reason:
-    /// - `subtype_cache` / `expand_alias_cache` / `normalize_receiver_cache`:
-    ///   forbidden outright (ADR-0028 Decision 3 — no persistence for a
+    /// - `subtype_cache` / `interface_unify_cache` / `expand_alias_cache` /
+    ///   `normalize_receiver_cache`: forbidden outright (ADR-0028 Decision 3 — no persistence for a
     ///   cache keyed by `Ty`, since crema has no "changed `TypeName` ->
     ///   affected `Ty` keys" reverse index to invalidate by).
     /// - `type_params`: rbs has no correspondent (crema-only convenience
@@ -331,6 +346,7 @@ impl DefinitionBuilder {
             singleton_definition_cache,
             interface_definition_cache,
             subtype_cache: RefCell::new(FxHashMap::default()),
+            interface_unify_cache: RefCell::new(FxHashMap::default()),
             expand_alias_cache: RefCell::new(FxHashMap::default()),
             normalize_receiver_cache: RefCell::new(FxHashMap::default()),
             type_params: TypeParamsCache::default(),
@@ -376,6 +392,25 @@ impl DefinitionBuilder {
     /// (`subtyping/cache.rb:20`).
     pub(crate) fn store_subtype_result(&self, key: SubtypeCacheKey, result: bool) {
         self.subtype_cache.borrow_mut().insert(key, result);
+    }
+
+    /// Memo read for `TypeChecker::unify_interface_into_bindings`; see
+    /// [`Self::interface_unify_cache`].
+    pub(crate) fn cached_interface_unify(
+        &self,
+        key: &InterfaceUnifyKey,
+    ) -> Option<Vec<(TypeVarKey, Ty)>> {
+        self.interface_unify_cache.borrow().get(key).cloned()
+    }
+
+    pub(crate) fn store_interface_unify(
+        &self,
+        key: InterfaceUnifyKey,
+        bindings: Vec<(TypeVarKey, Ty)>,
+    ) {
+        self.interface_unify_cache
+            .borrow_mut()
+            .insert(key, bindings);
     }
 
     /// Cache-state inspector for [`expand_alias`] tests. Returns the
@@ -662,6 +697,7 @@ impl DefinitionBuilder {
 
         if matches!(entry, ClassOrModule::Class(_)) {
             self.bake_typed_new(name, &mut singleton_def);
+            self.drop_method_missing_members_shadowed_by_ancestors(name, &mut singleton_def);
         }
 
         let singleton_arc = Arc::new(singleton_def);
@@ -669,6 +705,46 @@ impl DefinitionBuilder {
             .borrow_mut()
             .insert(*name, Arc::clone(&singleton_arc));
         Some((instance_arc, singleton_arc))
+    }
+
+    /// crema-specific, no rbs counterpart. Infusion synthesis stamps a
+    /// singleton member `%a{crema:method_missing}` when the method only
+    /// exists at runtime through `method_missing` (ActionMailer actions,
+    /// `infusion_collector::action_mailer`). Ruby reaches
+    /// `method_missing` only after the whole singleton ancestry has been
+    /// searched, so such a member must lose to any ancestor that
+    /// defines the same name for real. Same chain walk as
+    /// [`Self::bake_typed_new`]: index 0 is `Singleton { name: self }`
+    /// and is skipped to avoid re-entering the in-flight build.
+    ///
+    /// An ancestor whose hit is itself a stamped synth (a parent mailer's
+    /// own action) does not shadow — both resolve via `method_missing`
+    /// at runtime, and the child's action is the one that runs.
+    fn drop_method_missing_members_shadowed_by_ancestors(
+        &self,
+        name: &TypeName,
+        singleton_def: &mut Definition,
+    ) {
+        let names = self.env.names();
+        let stamped: Vec<Symbol> = singleton_def
+            .methods
+            .iter()
+            .filter(|(_, m)| has_method_missing_annotation(&m.annotations, names))
+            .map(|(sym, _)| *sym)
+            .collect();
+        for sym in stamped {
+            let Some(inherited) = self.lookup_singleton_method_skip_self(name, sym) else {
+                continue;
+            };
+            let real = !has_method_missing_annotation(&inherited.annotations, names)
+                && inherited
+                    .defs
+                    .iter()
+                    .any(|td| !matches!(td.member, MemberRef::Synthesized));
+            if real {
+                singleton_def.methods.remove(&sym);
+            }
+        }
     }
 
     /// Port of `RBS::DefinitionBuilder#build_singleton`'s typed `.new`
@@ -1047,6 +1123,31 @@ impl DefinitionBuilder {
             }
         }
         targets
+    }
+
+    /// Final include / prepend targets of an ActiveSupport::Concern
+    /// `included do` / `prepended do` block (the infusion pipeline's
+    /// expansion result, [`Environment::concern_block_targets`]). `None`
+    /// when the block at `location` is not one the pipeline collected — a
+    /// non-Concern module's `included`, or a second `included do` in the
+    /// same module — so the caller keeps the default walk. `Some(empty)`
+    /// is a concern block no class includes. `source_file` follows
+    /// [`Self::synthetic_concern_targets`]'s rule: an entry recorded
+    /// without a file matches any file.
+    pub(crate) fn concern_block_targets(
+        &self,
+        concern: TypeName,
+        location: PrismByteRange,
+        source_file: Option<Name>,
+    ) -> Option<Vec<TypeName>> {
+        self.env
+            .concern_block_targets()
+            .get(&concern)?
+            .iter()
+            .find(|e| {
+                e.location == location && e.source_file.is_none_or(|f| Some(f) == source_file)
+            })
+            .map(|e| e.targets.clone())
     }
 
     /// Shortcut for `self.env().names()`. Free functions reach the
@@ -1983,7 +2084,7 @@ impl DefinitionBuilder {
     /// draft before building.
     pub fn from_rbs_dir(dir: &std::path::Path) -> Result<Self, String> {
         let mut draft = EnvironmentDraft::new();
-        draft.load_dir(dir)?;
+        draft.load_dir(dir, false)?;
         let env = Arc::new(
             draft
                 .build()
@@ -2558,11 +2659,20 @@ fn lower_bucket_defn_to_method(
     //    bucket. Re-apply `special_instance_visibility` so the
     //    overload-only path doesn't silently fall back to the default.
     //
-    // 3. `accessibility_override` — bucket-level default the interface
+    // 3. Ruby-side marker on an overload-only bucket. An un-annotated
+    //    inline `def` is pushed as `overloading` (so it merges into a
+    //    sig-declared method instead of duplicating it) and therefore
+    //    never records an accessibility. When no sig original exists
+    //    the bucket is overloads-only and the `private` the inline
+    //    parser folded into the def would be lost here — pick it up.
+    //    Only reached when step 1 is empty, so a sig original still
+    //    decides (sig-first, same as `accessibilities.first()`).
+    //
+    // 4. `accessibility_override` — bucket-level default the interface
     //    flush path passes in (`:public`). Used when the bucket has
     //    neither a recorded accessibility nor a special-name hit.
     //
-    // 4. `Visibility::Public` — last-resort default for empty buckets
+    // 5. `Visibility::Public` — last-resort default for empty buckets
     //    on the class/module path (no override).
     let bucket_accessibility = defn
         .accessibilities
@@ -2571,6 +2681,13 @@ fn lower_bucket_defn_to_method(
         .or_else(|| {
             if matches!(method_kind, crate::type_param::MethodKind::Instance) {
                 special_instance_visibility(&names.resolve(defn.name))
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            if matches!(method_kind, crate::type_param::MethodKind::Instance) {
+                ruby_overload_visibility(&defn.overloads)
             } else {
                 None
             }
@@ -2685,7 +2802,7 @@ fn legacy_context_from_type_name(name: &TypeName, names: &NameTable) -> Vec<Opti
 /// build-phase `validate_type_params` rejects open-class arity drift —
 /// but the fallback keeps lowering total instead of panicking on a
 /// mismatch that slipped through.
-fn build_alpha_renamed_param_scope(
+pub(crate) fn build_alpha_renamed_param_scope(
     decl_params: &[AstTypeParam],
     primary_params: &[AstTypeParam],
     owner: &TypeName,
@@ -4181,6 +4298,16 @@ pub(crate) fn special_instance_visibility(name: &str) -> Option<Visibility> {
     .then_some(Visibility::Private)
 }
 
+/// Ruby-side visibility carried by an overload-only bucket's inline
+/// defs (see step 3 of the precedence list in
+/// [`lower_bucket_defn_to_method`]). First explicit marker wins.
+fn ruby_overload_visibility(overloads: &[MemberRef]) -> Option<Visibility> {
+    overloads.iter().find_map(|member| match member {
+        MemberRef::RubyDef(def) => def.visibility.map(Visibility::from_ast),
+        _ => None,
+    })
+}
+
 /// Effective attribute visibility, folding the surrounding
 /// `private` / `public` marker for instance attrs. Mirrors the
 /// `DefinitionBuilder#build_instance` visibility rule:
@@ -5046,6 +5173,15 @@ pub enum ConsultedKey {
         source_file: Option<String>,
         current: Option<TypeName>,
     },
+    /// `DefinitionBuilder::concern_block_targets`. Projects `concern`'s
+    /// dedicated probe id (`incremental::concern_targets_probe_id`),
+    /// matched by a `FingerprintKey::ConcernTargets(concern)` change.
+    ConcernBlockTargets {
+        concern: TypeName,
+        location: PrismByteRange,
+        /// Resolved from the raw `Name` — see `SyntheticConcernTargets`.
+        source_file: Option<String>,
+    },
     ConstantResolution {
         name: Symbol,
         context: ConstantContext,
@@ -5408,6 +5544,26 @@ impl<'a> ConsultationView<'a> {
         result
     }
 
+    pub(crate) fn concern_block_targets(
+        &self,
+        concern: TypeName,
+        location: PrismByteRange,
+        source_file: Option<Name>,
+    ) -> Option<Vec<TypeName>> {
+        let result = self
+            .builder
+            .concern_block_targets(concern, location, source_file);
+        self.record(
+            || ConsultedKey::ConcernBlockTargets {
+                concern,
+                location,
+                source_file: source_file.map(|n| self.builder.names().resolve(n)),
+            },
+            result.is_some(),
+        );
+        result
+    }
+
     /// Replaces raw `constant_resolver().resolve(...)` access — checker
     /// code held the raw `&ConstantResolver` across several calls, which
     /// would bypass the view entirely.
@@ -5542,6 +5698,21 @@ impl<'a> ConsultationView<'a> {
 
     pub(crate) fn store_subtype_result(&self, key: SubtypeCacheKey, result: bool) {
         self.builder.store_subtype_result(key, result);
+    }
+
+    pub(crate) fn cached_interface_unify(
+        &self,
+        key: &InterfaceUnifyKey,
+    ) -> Option<Vec<(TypeVarKey, Ty)>> {
+        self.builder.cached_interface_unify(key)
+    }
+
+    pub(crate) fn store_interface_unify(
+        &self,
+        key: InterfaceUnifyKey,
+        bindings: Vec<(TypeVarKey, Ty)>,
+    ) {
+        self.builder.store_interface_unify(key, bindings);
     }
 }
 

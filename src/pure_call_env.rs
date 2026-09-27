@@ -64,6 +64,10 @@ pub enum PureKey {
     SelfRef,
     ConstPath(TypeName),
     Send(Box<PureKey>, Symbol),
+    /// Safe-navigation call (`recv&.m`). Kept distinct from `Send` because
+    /// the csend value is nil-widened; Steep separates them for free by
+    /// keying on the AST node (`(send ...)` vs `(csend ...)`).
+    CSend(Box<PureKey>, Symbol),
 }
 
 impl PureKey {
@@ -77,7 +81,7 @@ impl PureKey {
         match self {
             PureKey::Lvar(n) => *n == name,
             PureKey::SelfRef | PureKey::ConstPath(_) => false,
-            PureKey::Send(recv, _) => recv.contains_lvar(name),
+            PureKey::Send(recv, _) | PureKey::CSend(recv, _) => recv.contains_lvar(name),
         }
     }
 
@@ -85,7 +89,7 @@ impl PureKey {
         match self {
             PureKey::ConstPath(_) => true,
             PureKey::Lvar(_) | PureKey::SelfRef => false,
-            PureKey::Send(recv, _) => recv.contains_const_path(),
+            PureKey::Send(recv, _) | PureKey::CSend(recv, _) => recv.contains_const_path(),
         }
     }
 }

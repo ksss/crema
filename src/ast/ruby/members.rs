@@ -15,7 +15,6 @@ use rustc_hash::FxHashMap;
 
 use ruby_prism::DefNode;
 
-use crate::ast::MethodKind;
 use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::annotations::{
     BlockParamTypeAnnotation, ColonMethodTypeAnnotation, DoubleSplatParamTypeAnnotation,
@@ -25,6 +24,7 @@ use crate::ast::ruby::annotations::{
 };
 use crate::ast::ruby::comment_block::CommentBlock;
 use crate::ast::ruby::declarations::Declaration;
+use crate::ast::{MethodKind, Visibility};
 use crate::ast_builder;
 use crate::inline_parser::TrailingAnnotation;
 use crate::name::{Name, NameTable};
@@ -729,6 +729,16 @@ pub struct DefMember {
     /// instance-variable declarations from the initialize signature
     /// (Sorbet-style instance variable inference).
     pub ivar_param_pairs: Vec<InitializeIvarParamPair>,
+    /// crema extension, not part of the rbs `DefMember` contract (rbs
+    /// `docs/inline.md` lists method visibility as unsupported). Same
+    /// shape as `RBS::AST::Members::MethodDefinition#visibility` so a
+    /// future upstream port lands without drift: `None` = no Ruby-side
+    /// marker applies (public by default), `Some(_)` = an enclosing bare
+    /// `private` / `public`, a `private def` modifier, or a retroactive
+    /// `private :name` decided it. Only instance-side defs carry a value;
+    /// singleton defs stay `None` (Ruby's `private` never reaches
+    /// `def self.x`).
+    pub visibility: Option<Visibility>,
 }
 
 /// One `@ivar = param` fact inside `def initialize`. `param` locates the
@@ -795,6 +805,11 @@ pub struct AttributeMember {
     /// attr / Struct-synthesised accessor members (e.g. the multi-source
     /// dup between a sig `attr_reader` and a rb `Struct.new` accessor).
     pub source_file: Option<Name>,
+    /// crema extension (rbs `docs/inline.md`: attribute visibility is
+    /// unsupported upstream). Same shape as the sig-side
+    /// `AttrReader#visibility`; see [`DefMember::visibility`] for the
+    /// `None` / `Some` contract. Applies to every name in `name_nodes`.
+    pub visibility: Option<Visibility>,
 }
 
 impl AttributeMember {

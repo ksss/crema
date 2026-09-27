@@ -59,40 +59,24 @@ pub fn scan(dirs: &[PathBuf]) -> GFreshnessManifest {
 }
 
 fn collect(dir: &Path, out: &mut Vec<GFileStat>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // `entry.file_type()` reads the type `read_dir` already
-        // returned — usually free of an extra stat, unlike
-        // `path.is_dir()` (always one). Symlinks fall back to a stat
-        // so a symlinked directory still gets recursed into, matching
-        // `load_dir`'s (stat-following) walk exactly.
-        let is_dir = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => path.is_dir(),
-            Ok(ft) => ft.is_dir(),
-            Err(_) => path.is_dir(),
-        };
-        if is_dir {
-            collect(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rbs") {
-            // A file that vanishes or turns unreadable between the
-            // `read_dir` listing and this `stat` is dropped from the
-            // manifest rather than erroring the scan — it will show up
-            // as a set difference against the stored manifest, which
-            // `is_fresh` already treats as a miss.
-            if let Ok(meta) = fs::metadata(&path) {
-                let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-                let since_epoch = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
-                out.push(GFileStat {
-                    path: path.to_string_lossy().into_owned(),
-                    mtime_secs: since_epoch.as_secs(),
-                    mtime_nanos: since_epoch.subsec_nanos(),
-                    size: meta.len(),
-                });
-            }
+    // Same walk as the cold build's `load_dir` on a G-layer dir
+    // (`skip_hidden: true`: `_` dirs pruned, symlinked dirs never
+    // descended), so the manifest is exactly the loaded file set.
+    for path in crate::file_finder::each_file(dir, true).unwrap_or_default() {
+        // A file that vanishes or turns unreadable between the
+        // listing and this `stat` is dropped from the manifest rather
+        // than erroring the scan — it will show up as a set difference
+        // against the stored manifest, which `is_fresh` already treats
+        // as a miss.
+        if let Ok(meta) = fs::metadata(&path) {
+            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+            let since_epoch = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
+            out.push(GFileStat {
+                path: path.to_string_lossy().into_owned(),
+                mtime_secs: since_epoch.as_secs(),
+                mtime_nanos: since_epoch.subsec_nanos(),
+                size: meta.len(),
+            });
         }
     }
 }

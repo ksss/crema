@@ -24,6 +24,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::ast::declarations::{AsMember, Member as SigMember};
 use crate::ast::members::IvarName;
 use crate::ast::method_type::MethodType;
+use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::members::{
     BlockEntry, DefMemberOrigin, DocStyle, ExplicitAnnotation, Member as RubyMember,
     PositionalEntry, SplatRestEntry, TypeAnnotations,
@@ -34,8 +35,9 @@ use crate::definition::ancestor_graph::{AncestorGraph, Node};
 use crate::environment::DeclOrigin;
 use crate::environment::frozen::{
     self, ClassAliasDeclaration, ClassDeclaration, ClassOrModule, ClassOrModuleAliasEntry,
-    Environment, ModuleAliasDeclaration, ModuleDeclaration,
+    ConcernBlockTargets, Environment, ModuleAliasDeclaration, ModuleDeclaration,
 };
+
 use crate::name::{NameTable, Symbol};
 use crate::type_name::TypeName;
 
@@ -57,6 +59,17 @@ pub enum FingerprintKey {
     TypeAlias(TypeName),
     Constant(TypeName),
     Global(Symbol),
+    /// An ActiveSupport::Concern module's `included do` / `prepended do`
+    /// block → final include target sets (`Environment::concern_block_targets`).
+    /// Present only for a module the infusion pipeline collected a block
+    /// for. Kept apart from `Type`: the target set is consulted by exactly
+    /// one query (`ConsultedKey::ConcernBlockTargets`, from the concern
+    /// file's own check), and a change must not be expanded to the
+    /// module's descendants — every includer is one — or adding a new
+    /// includer would recheck every existing includer's file for a shape
+    /// that did not change for them. Matched through its own probe id
+    /// (`incremental::concern_targets_probe_id`), not the bare name id.
+    ConcernTargets(TypeName),
 }
 
 impl FingerprintKey {
@@ -69,7 +82,8 @@ impl FingerprintKey {
             | FingerprintKey::Member(n, _)
             | FingerprintKey::ClassAlias(n)
             | FingerprintKey::TypeAlias(n)
-            | FingerprintKey::Constant(n) => Some(*n),
+            | FingerprintKey::Constant(n)
+            | FingerprintKey::ConcernTargets(n) => Some(*n),
             FingerprintKey::Global(_) => None,
         }
     }
@@ -86,7 +100,13 @@ pub fn compute_fingerprint_table(env: &Environment) -> FingerprintTable {
     let names = env.names();
 
     for (name, entry) in env.class_decls().a_iter() {
-        hash_class_or_module(*name, entry, names, &mut table);
+        hash_class_or_module(
+            *name,
+            entry,
+            env.concern_block_targets().get(name).map(Vec::as_slice),
+            names,
+            &mut table,
+        );
     }
     for (name, entry) in env.interface_decls().a_iter() {
         hash_interface(*name, entry.decl(), names, &mut table);
@@ -198,8 +218,10 @@ impl RawDiff {
 pub fn expand_changed_set(graph: &AncestorGraph, raw: &RawDiff) -> FxHashSet<FingerprintKey> {
     let mut expanded: FxHashSet<FingerprintKey> = raw.all().copied().collect();
 
+    // `ConcernTargets` never seeds: see its variant doc.
     let seeds: FxHashSet<TypeName> = expanded
         .iter()
+        .filter(|k| !matches!(k, FingerprintKey::ConcernTargets(_)))
         .filter_map(FingerprintKey::type_name)
         .collect();
 
@@ -271,11 +293,42 @@ fn is_a_layer_origin(origin: DeclOrigin) -> bool {
 fn hash_class_or_module(
     name: TypeName,
     entry: &ClassOrModule,
+    concern_blocks: Option<&[ConcernBlockTargets]>,
     names: &NameTable,
     table: &mut FingerprintTable,
 ) {
     let mut type_hasher = Xxh3::new();
     let mut member_digests: MemberDigests = FxHashMap::default();
+
+    // An ActiveSupport::Concern module's `included do` / `prepended do`
+    // block is type-checked once per final include target
+    // (`TypeChecker::walk_concern_block_body`), so a class gaining or
+    // losing `include M` must invalidate M's file. Member-name probes
+    // cannot carry this — a block that synthesizes no member (`validates`
+    // only) has no `Member` key to change. Its own key, not folded into
+    // `Type` (see `FingerprintKey::ConcernTargets`). Sorted so
+    // concern-site order never perturbs the digest.
+    if let Some(blocks) = concern_blocks {
+        let mut h = Xxh3::new();
+        blocks.len().hash(&mut h);
+        let mut entries: Vec<(PrismByteRange, Vec<TypeName>)> = blocks
+            .iter()
+            .map(|b| {
+                let mut targets = b.targets.clone();
+                targets.sort();
+                (b.location, targets)
+            })
+            .collect();
+        entries.sort();
+        for (location, targets) in entries {
+            location.hash(&mut h);
+            targets.len().hash(&mut h);
+            for t in targets {
+                t.hash(&mut h);
+            }
+        }
+        table.insert(FingerprintKey::ConcernTargets(name), h.digest());
+    }
 
     match entry {
         ClassOrModule::Class(class_entry) => {
@@ -702,11 +755,11 @@ fn hash_sig_attr(
 /// `DefMemberOrigin` is not part of the hash — a synthetic
 /// (concern-included/prepended) def's shape already changes whenever the
 /// concern module it was synthesized from changes, so hashing origin
-/// would only add noise, not signal. Ruby-origin syntax has no
-/// `public`/`private` markers or `alias` keyword inside inline `# @rbs`
-/// bodies (those are plain Ruby statements, not members this AST layer
-/// models), so unlike the Signature-origin sibling there is no ambient
-/// visibility or alias case to handle here.
+/// would only add noise, not signal. Ruby-side `private` / `public`
+/// statements are folded into each def's / attr's `visibility` by the
+/// inline parser (crema extension), so hashing that field covers the
+/// ambient-marker case the Signature-origin sibling handles inline;
+/// `alias` stays unmodelled on the Ruby side.
 fn hash_ruby_member<H: Hasher>(
     m: &RubyMember,
     type_hasher: &mut H,
@@ -734,6 +787,9 @@ fn hash_ruby_member<H: Hasher>(
                 // sequence, preserving the "body edits don't move the
                 // fingerprint" pin for ordinary methods.
                 def.ivar_param_pairs.hash(h);
+                // Toggling `private` on a def changes which call sites
+                // are legal, so dependents must re-check.
+                def.visibility.hash(h);
             });
         }
         RubyMember::AttrReader(a) => hash_ruby_attr(&a.attribute, member_digests, names),
@@ -817,6 +873,7 @@ fn hash_ruby_attr(
             // `AttributeMember` doc comment); hashing the text directly
             // is location-free by construction, no strip needed.
             attr.type_text.hash(h);
+            attr.visibility.hash(h);
         });
     }
 }

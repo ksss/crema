@@ -89,6 +89,8 @@ pub enum InfusionUnit {
     Zeitwerk,
     Config,
     Paranoia,
+    ActionMailer,
+    Sidekiq,
 }
 
 impl InfusionUnit {
@@ -98,6 +100,8 @@ impl InfusionUnit {
             InfusionUnit::Zeitwerk => "zeitwerk",
             InfusionUnit::Config => "config",
             InfusionUnit::Paranoia => "paranoia",
+            InfusionUnit::ActionMailer => "actionmailer",
+            InfusionUnit::Sidekiq => "sidekiq",
         }
     }
 }

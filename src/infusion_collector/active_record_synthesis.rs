@@ -159,8 +159,18 @@ fn model_owner(
 }
 
 pub(crate) fn active_record_model_names(draft: &EnvironmentDraft) -> Vec<TypeName> {
+    descendant_class_names(draft, ACTIVE_RECORD_BASE)
+}
+
+/// Every class declared in the draft (A layer) or baked into the G
+/// snapshot whose super chain reaches `base` (an absolute name such as
+/// `::ActiveRecord::Base`), sorted by display name. Shared by the
+/// `ActiveRecord::Base` model fixpoint and the `ActionMailer::Base`
+/// mailer fixpoint, which need the same A ∪ G super-edge walk with a
+/// different root.
+pub(crate) fn descendant_class_names(draft: &EnvironmentDraft, base: &str) -> Vec<TypeName> {
     let names = draft.names();
-    let active_record_base = names.parse_type_name(ACTIVE_RECORD_BASE);
+    let base = names.parse_type_name(base);
     let all_names = collect_declared_class_module_names(draft);
     let aliases = FxHashMap::default();
     let resolver = TypeNameResolver::new(&all_names, &aliases, names);
@@ -208,7 +218,7 @@ pub(crate) fn active_record_model_names(draft: &EnvironmentDraft) -> Vec<TypeNam
     loop {
         let before = models.len();
         for (name, super_name) in &supers {
-            if *super_name == active_record_base || models.contains(super_name) {
+            if *super_name == base || models.contains(super_name) {
                 models.insert(*name);
             }
         }
@@ -222,7 +232,7 @@ pub(crate) fn active_record_model_names(draft: &EnvironmentDraft) -> Vec<TypeNam
     candidates
 }
 
-fn collect_declared_class_module_names(draft: &EnvironmentDraft) -> FxHashSet<TypeName> {
+pub(crate) fn collect_declared_class_module_names(draft: &EnvironmentDraft) -> FxHashSet<TypeName> {
     let mut names = FxHashSet::default();
     for (name, entry) in &draft.class_decls {
         names.insert(*name);
@@ -1215,7 +1225,7 @@ fn method_with_type(name: Symbol, kind: MethodKind, method_type: MethodType) -> 
     })
 }
 
-fn method_returning(name: Symbol, kind: MethodKind, return_type: TypeName) -> Member {
+pub(crate) fn method_returning(name: Symbol, kind: MethodKind, return_type: TypeName) -> Member {
     Member::MethodDefinition(MethodDefinition {
         name,
         kind,

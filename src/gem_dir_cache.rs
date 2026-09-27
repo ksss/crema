@@ -18,9 +18,15 @@ use std::path::PathBuf;
 /// fallback (installed) version resolved instead — see
 /// `resolve_gem_dirs`'s self-heal path. Callers use this to warn about
 /// the stale pin.
+///
+/// `rbs_runtime_deps` lists `(name, gem_dir)` for each gemspec runtime
+/// dependency of rbs that ships a `sig/` and is not shadowed by a
+/// same-named `stdlib/` entry. Only populated when the resolver was
+/// asked for it (script mode); empty on the normal path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedGemDirs {
     pub rbs_gem_dir: PathBuf,
     pub libraries: HashMap<String, Option<PathBuf>>,
     pub stale: HashMap<String, String>,
+    pub rbs_runtime_deps: Vec<(String, PathBuf)>,
 }

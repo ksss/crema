@@ -92,6 +92,23 @@ enum Commands {
         #[arg(short = 'e')]
         eval: Option<String>,
 
+        /// Script mode: type check one stdlib-only Ruby script with no
+        /// project setup. `crema.toml` is never looked for (neither
+        /// read nor ignored — the walk-up does not run), the
+        /// environment is rbs core plus every stdlib signature shipped
+        /// with the installed rbs gem plus the rbs gem's own `sig/` (and
+        /// the `sig/` of its gemspec runtime dependencies, e.g. prism),
+        /// inline annotations are on, the
+        /// gem resolver is plain `ruby` (never `bundle exec`), and
+        /// nothing is written to disk (no `.crema/`, no snapshot read
+        /// or write). Scripts that need gems or project code belong in
+        /// a project with a `crema.toml` instead. Cannot be combined
+        /// with files, `-e`, `--config`, `--sig`, `--add-sig`,
+        /// `--collection`, `--inline`, `--no-g-snapshot` or
+        /// `--refresh-g-snapshot`.
+        #[arg(long = "script", value_name = "FILE")]
+        script: Option<PathBuf>,
+
         /// RBS signature directory or `.rbs` file to load (repeatable).
         /// Directories are walked recursively for `.rbs` files; a path
         /// pointing at a single `.rbs` file loads just that file.
@@ -311,9 +328,24 @@ fn warn_and_record(warnings: &mut Vec<String>, message: String) {
 /// version the host project pins. If `bundle` is not on PATH, we warn
 /// and retry with plain `ruby`. `no_bundler` (`--no-bundler`) skips
 /// bundler entirely: plain `ruby` from the start, no fallback warning.
+///
+/// `rbs_runtime_deps` (script mode only) additionally walks the rbs
+/// gemspec's `runtime_dependencies` transitively and reports every
+/// dependency that ships a `sig/` dir and has no same-named
+/// `${rbs_gem_dir}/stdlib/` entry as `dep:name=path` (today: prism,
+/// which rbs's own sig references but `sig/manifest.yaml` does not
+/// list — manifests only name stdlib deps, gem deps live in the
+/// gemspec). This is a deliberate divergence from rbs's own
+/// `Collection::Sources::Base#dependencies_of`, which only chases
+/// `sig/manifest.yaml`: following that alone leaves `Prism::*`
+/// unresolved. The gem names come from the installed gemspec, never
+/// from a table in crema, so an rbs release that changes its
+/// dependencies is followed without a code change. The normal path
+/// never passes the flag, so its stdin / stdout stay byte-identical.
 fn resolve_gem_dirs(
     entries: &[(String, Option<String>)],
     no_bundler: bool,
+    rbs_runtime_deps: bool,
     warnings: &mut Vec<String>,
 ) -> Result<ResolvedGemDirs, String> {
     let debug_resolver = std::env::var_os("CREMA_DEBUG_RESOLVER").is_some_and(|v| v == "1");
@@ -325,6 +357,27 @@ $stdin.each_line do |line|
   begin
     spec = pinned ? Gem::Specification.find_by_name(name, version) : Gem::Specification.find_by_name(name)
     puts "#{name}=#{spec.gem_dir}"
+    if name == "rbs" && ARGV.include?("--rbs-runtime-deps")
+      seen = {}
+      queue = spec.runtime_dependencies.map(&:name)
+      deps = []
+      until queue.empty?
+        dep = queue.shift
+        next if seen[dep]
+        seen[dep] = true
+        begin
+          dep_spec = Gem::Specification.find_by_name(dep)
+        rescue Gem::MissingSpecError
+          deps << "dep:#{dep}="
+          next
+        end
+        queue.concat(dep_spec.runtime_dependencies.map(&:name))
+        next if File.directory?(File.join(spec.gem_dir, "stdlib", dep))
+        next unless File.directory?(File.join(dep_spec.gem_dir, "sig"))
+        deps << "dep:#{dep}=#{dep_spec.gem_dir}"
+      end
+      puts deps.sort
+    end
   rescue Gem::MissingSpecError
     if pinned
       begin
@@ -347,6 +400,10 @@ end
     let bundle_gemfile = std::env::var_os("BUNDLE_GEMFILE");
     let use_bundler = resolver_uses_bundler(no_bundler, bundle_gemfile.as_deref(), &cwd);
     let mut cmd = build_resolver_command(use_bundler, script);
+    if rbs_runtime_deps {
+        // `--` ends ruby's own option parsing so the flag lands in ARGV.
+        cmd.args(["--", "--rbs-runtime-deps"]);
+    }
     if debug_resolver {
         eprint_resolver_spawn(&cmd);
     }
@@ -364,6 +421,9 @@ end
                 ),
             );
             let mut fallback = build_resolver_command(false, script);
+            if rbs_runtime_deps {
+                fallback.args(["--", "--rbs-runtime-deps"]);
+            }
             if debug_resolver {
                 eprint_resolver_spawn(&fallback);
             }
@@ -449,8 +509,31 @@ end
     let mut rbs_gem_dir: Option<PathBuf> = None;
     let mut libraries: HashMap<String, Option<PathBuf>> = HashMap::new();
     let mut stale: HashMap<String, String> = HashMap::new();
+    let mut rbs_runtime_dep_dirs: Vec<(String, PathBuf)> = Vec::new();
     for line in stdout.lines() {
         if line.is_empty() {
+            continue;
+        }
+        if let Some(dep) = line.strip_prefix("dep:") {
+            let Some((name, path)) = dep.split_once('=') else {
+                return Err(format!(
+                    "error: malformed ruby resolver output line: {}",
+                    line
+                ));
+            };
+            if path.is_empty() {
+                // rubygems normally guarantees runtime deps are
+                // installed; a miss is worth a line, not a silent skip.
+                warn_and_record(
+                    warnings,
+                    format!(
+                        "warning: rbs runtime dependency {} is not installed; its signatures are not loaded",
+                        name
+                    ),
+                );
+            } else {
+                rbs_runtime_dep_dirs.push((name.to_string(), PathBuf::from(path)));
+            }
             continue;
         }
         let Some((name, rest)) = line.split_once('=') else {
@@ -494,6 +577,7 @@ end
         rbs_gem_dir,
         libraries,
         stale,
+        rbs_runtime_deps: rbs_runtime_dep_dirs,
     })
 }
 
@@ -526,6 +610,7 @@ fn get_gem_dirs(
     entries: &[(String, Option<String>)],
     rbs_collection_lock: Option<&Path>,
     no_bundler: bool,
+    rbs_runtime_deps: bool,
     warnings: &mut Vec<String>,
 ) -> Result<ResolvedGemDirs, String> {
     // `entries` already carries a pinned `rbs` tuple when the lock file
@@ -541,7 +626,7 @@ fn get_gem_dirs(
                 .chain(entries.iter().cloned())
                 .collect()
         };
-    let resolved = resolve_gem_dirs(&resolver_input, no_bundler, warnings)?;
+    let resolved = resolve_gem_dirs(&resolver_input, no_bundler, rbs_runtime_deps, warnings)?;
     emit_stale_pin_warnings(
         &resolved,
         entries,
@@ -550,6 +635,24 @@ fn get_gem_dirs(
         warnings,
     );
     Ok(resolved)
+}
+
+/// Every `${rbs_gem_dir}/stdlib/<name>/0/` directory, sorted by name so
+/// load order (and thus any duplicate-declaration error text) is
+/// stable across runs. The `0/` level is rbs's stdlib version slot
+/// (`Collection::Sources::Stdlib` / `EnvironmentLoader`); only that
+/// slot exists today. A missing or unreadable `stdlib/` yields nothing.
+fn stdlib_sig_dirs(rbs_gem_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(rbs_gem_dir.join("stdlib")) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path().join("0"))
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 /// Record one warning per lock-pinned gem whose exact pinned version
@@ -733,11 +836,19 @@ fn collect_rb_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         // `entry.file_type()` reads the type `read_dir` already
         // returned — usually free of an extra stat, unlike
-        // `path.is_dir()` (always one). Symlinks fall back to a stat
-        // so a symlinked directory is still recursed into (same shape
-        // as `snapshot::freshness::collect`).
+        // `path.is_dir()` (always one). A symlink costs one stat to
+        // tell dir from file: a symlinked directory is pruned (Steep's
+        // `**/*.rb` glob never descends one — Ruby's `**` skips symlink
+        // dirs, which also keeps a self-loop link from walking until
+        // PATH_MAX), a symlinked `.rb` file is still collected (same
+        // rule as `file_finder::each_file` on the `.rbs` side).
         let is_dir = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => path.is_dir(),
+            Ok(ft) if ft.is_symlink() => {
+                if path.is_dir() {
+                    continue;
+                }
+                false
+            }
             Ok(ft) => ft.is_dir(),
             Err(_) => path.is_dir(),
         };
@@ -1002,29 +1113,13 @@ fn compute_g_snapshot_key(
     })
 }
 
-/// Recursively collect every `.rbs` file under `dir` into `out`, same walk
-/// order as [`crema::environment::draft::EnvironmentDraft::load_dir`] but
-/// enumeration-only (no read/parse) — ADR-0028 S8 change detection needs
-/// the current path set, not file content.
+/// Every `.rbs` file under a user sig dir, same walk as
+/// [`crema::environment::draft::EnvironmentDraft::load_dir`] with
+/// `skip_hidden: false` but enumeration-only (no read/parse) — ADR-0028 S8
+/// change detection needs the current path set, not file content. An
+/// unreadable root contributes nothing, as before.
 fn collect_rbs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // Same `file_type()` + symlink fallback as `collect_rb_files`.
-        let is_dir = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => path.is_dir(),
-            Ok(ft) => ft.is_dir(),
-            Err(_) => path.is_dir(),
-        };
-        if is_dir {
-            collect_rbs_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rbs") {
-            out.push(path);
-        }
-    }
+    out.extend(crema::file_finder::each_file(dir, false).unwrap_or_default());
 }
 
 /// Every `.rbs` file `--sig` would load: each `sig_dirs` entry expanded the
@@ -1165,13 +1260,14 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
         &all_entries,
         rbs_collection_lock_path.as_deref(),
         no_bundler,
+        false,
         &mut g_warnings,
     ) {
         Ok(gem_dirs) => {
             let core_dir = gem_dirs.rbs_gem_dir.join("core");
             if core_dir.is_dir() {
                 g_dirs.push(core_dir.clone());
-                if let Err(e) = draft.load_dir(&core_dir) {
+                if let Err(e) = draft.load_dir(&core_dir, true) {
                     warn_and_record(
                         &mut g_warnings,
                         format!("warning: failed to load core RBS: {}", e),
@@ -1185,7 +1281,7 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
             }
             for dir in &libs.dirs {
                 g_dirs.push(dir.clone());
-                if let Err(e) = draft.load_dir(dir) {
+                if let Err(e) = draft.load_dir(dir, true) {
                     warn_and_record(
                         &mut g_warnings,
                         format!("warning: failed to load library {}: {}", dir.display(), e),
@@ -1234,7 +1330,7 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
             print_collection_lock_warnings(&mut g_warnings, &collection_lock.warnings);
             for (source, dir) in &collection_lock.dirs {
                 g_dirs.push(dir.clone());
-                if let Err(e) = draft.load_dir(dir) {
+                if let Err(e) = draft.load_dir(dir, true) {
                     warn_and_record(
                         &mut g_warnings,
                         format!(
@@ -1347,6 +1443,7 @@ fn report_verify_divergence(
 struct CheckInvocation {
     files: Vec<PathBuf>,
     eval: Option<String>,
+    script: Option<PathBuf>,
     sig_dirs: Vec<PathBuf>,
     add_sig_dirs: Vec<PathBuf>,
     verbose: bool,
@@ -1379,6 +1476,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     let CheckInvocation {
         files: cli_targets,
         eval,
+        script,
         sig_dirs,
         add_sig_dirs,
         verbose,
@@ -1397,8 +1495,55 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         eprintln!("error: -e and files are mutually exclusive");
         process::exit(2);
     }
+    // Script mode (`--script FILE`): every flag below would be
+    // silently overridden by the mode's fixed choices (no config, no
+    // sig, inline on, no snapshot), so their co-use is an error rather
+    // than a no-op (specs/config.md Design Goal 5).
+    let script_active = script.is_some();
+    if script_active {
+        let conflicts: [(&str, bool); 9] = [
+            ("files", !cli_targets.is_empty()),
+            ("-e", eval_active),
+            ("--config", cli_config.is_some()),
+            ("--sig", !sig_dirs.is_empty()),
+            ("--add-sig", !add_sig_dirs.is_empty()),
+            ("--collection", collection.is_some()),
+            ("--inline", inline.is_some()),
+            ("--no-g-snapshot", no_g_snapshot),
+            ("--refresh-g-snapshot", refresh_g_snapshot),
+        ];
+        for (name, set) in conflicts {
+            if set {
+                eprintln!("error: --script cannot be combined with {}", name);
+                process::exit(2);
+            }
+        }
+        // One script means one file: `expand_targets` below would
+        // otherwise walk a directory and quietly turn script mode into
+        // a scope-less multi-file check (crema-review finding).
+        if let Some(path) = &script
+            && !path.is_file()
+        {
+            eprintln!("error: --script expects a Ruby file: {}", path.display());
+            process::exit(2);
+        }
+    }
 
-    let (file_config, project_root) = load_file_config_with_dir(cli_config);
+    // Script mode never runs the crema.toml walk-up: the project's
+    // config is not "found and ignored", it is not looked for at all
+    // (a malformed crema.toml in cwd must not break a script check).
+    // `project_root` only feeds paths that are disabled below
+    // (snapshot / incremental cache) and `ignore` matching over an
+    // empty list, so cwd is a fine stand-in.
+    let (file_config, project_root) = if script_active {
+        let cwd = std::env::current_dir().unwrap_or_else(|e| {
+            eprintln!("error: cannot read current dir: {}", e);
+            process::exit(2);
+        });
+        (None, cwd)
+    } else {
+        load_file_config_with_dir(cli_config)
+    };
 
     // ADR-0029 §4: the environment scope now lives in crema.toml's
     // `check` field, so a missing crema.toml or a missing `check`
@@ -1417,7 +1562,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // config file and deserves the config-completeness error.
     let has_config = file_config.is_some();
     match &file_config {
-        None if !eval_active => print_no_check_target_configured_and_exit(true),
+        None if !eval_active && !script_active => print_no_check_target_configured_and_exit(true),
         None => { /* zero-config -e: fall through with empty scope */ }
         Some(cfg) if cfg.check.is_none() => print_no_check_target_configured_and_exit(false),
         _ => {}
@@ -1430,7 +1575,12 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // shadowing the opt-in flag; `get_gem_dirs` itself never
     // writes to disk (no persistent gem-dir cache), so this is
     // the only gate needed.
+    // Script mode has no project to persist into either.
     let no_g_snapshot = no_g_snapshot || !has_config;
+    // Script mode's resolver is always plain `ruby`: a script has no
+    // bundle, and a Gemfile discoverable from cwd belongs to whatever
+    // project the user happens to be standing in.
+    let no_bundler = no_bundler || script_active;
 
     if let Some(cfg) = &file_config {
         validate_sig_dirs(&cfg.sig, "crema.toml sig");
@@ -1536,7 +1686,12 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // only thing type-checked. `unwrap_or_default` gives that path
     // an empty Vec; the ADR-0029 gate above still guarantees
     // `Some(_)` in every other invocation.
-    let check_field = resolved.check.clone().unwrap_or_default();
+    // Script mode: the scope is exactly the one script (the mode's
+    // whole point is that no `check` field exists to expand).
+    let check_field = match &script {
+        Some(path) => vec![path.clone()],
+        None => resolved.check.clone().unwrap_or_default(),
+    };
     let expanded = expand_targets(&check_field);
     // Canonicalize the full pre-`ignore` expansion first (and
     // dedup — `check`'s entries are a union, ADR-0029 §1: a
@@ -1595,6 +1750,9 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     let mut draft = crema::environment::draft::EnvironmentDraft::new();
 
     let lockfile = match &resolved.collection {
+        // Script mode: an rbs_collection.lock.yaml in cwd belongs to
+        // the surrounding project, not to the script.
+        CollectionMode::Auto if script_active => None,
         CollectionMode::Auto => match discover_lockfile_from_cwd() {
             Ok(opt) => opt,
             Err(msg) => {
@@ -1713,6 +1871,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     let infusion_active = resolved.infusion.activesupport
         || resolved.infusion.activemodel
         || resolved.infusion.activerecord
+        || resolved.infusion.sidekiq
         || resolved.config_infusion.is_some()
         || resolved.active_decorator_infusion.is_some();
     // Shared by every infusion ingest site below — one build so
@@ -1750,6 +1909,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
             &all_entries,
             rbs_collection_lock_path.as_deref(),
             no_bundler,
+            script_active,
             &mut g_warnings,
         ) {
             Ok(gem_dirs) => {
@@ -1757,11 +1917,55 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
 
                 if core_dir.is_dir() {
                     g_dirs.push(core_dir.clone());
-                    if let Err(e) = draft.load_dir(&core_dir) {
+                    if let Err(e) = draft.load_dir(&core_dir, true) {
                         warn_and_record(
                             &mut g_warnings,
                             format!("warning: failed to load core RBS: {}", e),
                         );
+                    }
+                }
+
+                // Script mode: every `${rbs_gem_dir}/stdlib/<name>/0/`
+                // dir, loaded by path. Deliberately not through the
+                // name-based `library_loader::resolve` below — that
+                // is gem-sig first, and an installed gem shipping its
+                // own `sig/` for a stdlib name (nkf, bigdecimal, ...)
+                // would then collide with the stdlib copy. The stdlib
+                // set itself loads together cleanly (pinned by
+                // `test_script_mode_installed_rbs_stdlib_set_loads_together`).
+                // No manifest expansion is needed: everything is
+                // loaded, so every dependency is already present.
+                if script_active {
+                    for dir in stdlib_sig_dirs(&gem_dirs.rbs_gem_dir) {
+                        g_dirs.push(dir.clone());
+                        if let Err(e) = draft.load_dir(&dir, true) {
+                            warn_and_record(
+                                &mut g_warnings,
+                                format!("warning: failed to load stdlib {}: {}", dir.display(), e),
+                            );
+                        }
+                    }
+                    // Plus the rbs gem's own `sig/` (rbs is a Ruby 4.0
+                    // bundled gem, so scripts driving `RBS::*` are in
+                    // scope) and the `sig/` of every gemspec runtime
+                    // dependency it references (`gem_dirs.rbs_runtime_deps`,
+                    // resolved by the Ruby resolver — no gem name is
+                    // hard-coded here). Deps first so rbs's references
+                    // to them resolve within one environment build.
+                    let rbs_sig = gem_dirs.rbs_gem_dir.join("sig");
+                    let script_gem_dirs = gem_dirs
+                        .rbs_runtime_deps
+                        .iter()
+                        .map(|(_, dir)| dir.join("sig"))
+                        .chain(std::iter::once(rbs_sig));
+                    for dir in script_gem_dirs {
+                        g_dirs.push(dir.clone());
+                        if let Err(e) = draft.load_dir(&dir, true) {
+                            warn_and_record(
+                                &mut g_warnings,
+                                format!("warning: failed to load gem sig {}: {}", dir.display(), e),
+                            );
+                        }
                     }
                 }
 
@@ -1774,7 +1978,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
                 }
                 for dir in &libs.dirs {
                     g_dirs.push(dir.clone());
-                    if let Err(e) = draft.load_dir(dir) {
+                    if let Err(e) = draft.load_dir(dir, true) {
                         warn_and_record(
                             &mut g_warnings,
                             format!("warning: failed to load library {}: {}", dir.display(), e),
@@ -1823,7 +2027,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
                 print_collection_lock_warnings(&mut g_warnings, &collection_lock.warnings);
                 for (source, dir) in &collection_lock.dirs {
                     g_dirs.push(dir.clone());
-                    if let Err(e) = draft.load_dir(dir) {
+                    if let Err(e) = draft.load_dir(dir, true) {
                         warn_and_record(
                             &mut g_warnings,
                             format!(
@@ -1944,7 +2148,8 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // single `.rbs` file.
     for path in &resolved.sig_dirs {
         let result = if path.is_dir() {
-            draft.load_dir(path)
+            // User sig dirs are rbs `-I` dirs: `_` subdirs are read.
+            draft.load_dir(path, false)
         } else {
             draft.load_file(path)
         };
@@ -2920,12 +3125,13 @@ fn run_extract(
                 );
             record.method_call = method_call;
             record.implements = implements;
-            record.constant = constant;
             record.consulted = crema::extract::consulted_symbols(
                 &log.into_entries(),
                 &signature_types,
+                &constant,
                 env.env().names(),
             );
+            record.constant = constant;
         }
         files.insert(display(file), record);
     }
@@ -3065,6 +3271,7 @@ fn main() {
         Commands::Check {
             files,
             eval,
+            script,
             sig_dirs,
             add_sig_dirs,
             verbose,
@@ -3080,6 +3287,7 @@ fn main() {
             CheckInvocation {
                 files,
                 eval,
+                script,
                 sig_dirs,
                 add_sig_dirs,
                 verbose,
@@ -3098,6 +3306,7 @@ fn main() {
             CheckInvocation {
                 files: Vec::new(),
                 eval,
+                script: None,
                 sig_dirs: Vec::new(),
                 add_sig_dirs: Vec::new(),
                 verbose: false,

@@ -16,6 +16,10 @@ use crate::types::{
 use super::method_resolver;
 use super::{ArgSpan, CallArguments, CallTarget, SplatTail, TypeChecker, arg_span};
 
+/// `(keyword name, value type)` per Symbol key of a Record-typed `**h`
+/// (`TypeChecker::kwsplat_record_keys`).
+pub(super) type KwsplatKeys = Vec<(String, Ty)>;
+
 /// Abstraction over the two prism nodes that drive argument checking:
 /// `CallNode` (regular method call) and `SuperNode` (explicit `super(args)`).
 ///
@@ -369,7 +373,7 @@ impl<'env> TypeChecker<'env> {
             self.apply_receiver_assertion_gate(&receiver);
         }
         if let Some(arguments) = node.arguments() {
-            self.visit_call_arguments(&arguments, target);
+            self.visit_call_arguments(&arguments, target, resolved.receiver_ty);
         }
 
         let site = CallSite::Call(node);
@@ -391,7 +395,9 @@ impl<'env> TypeChecker<'env> {
             );
         }
 
-        if let Some(block) = node.block() {
+        if let Some(block) = node.block()
+            && !self.walk_concern_block_body(node, &block)
+        {
             self.visit(&block);
         }
         if block_scope_pushed {
@@ -415,13 +421,33 @@ impl<'env> TypeChecker<'env> {
         &mut self,
         arguments: &ruby_prism::ArgumentsNode<'pr>,
         target: Option<&CallTarget>,
+        receiver_ty: Ty,
     ) {
         let args: Vec<_> = arguments.arguments().iter().collect();
-        if !args.iter().any(|arg| arg.as_lambda_node().is_some()) {
+        // A trailing `key: value` hash (every element a symbol-keyed assoc,
+        // no `**splat`) is walked element-wise so a lambda value gets the
+        // keyword's declared type as hint; anything else stays opaque.
+        let trailing_keywords = args
+            .last()
+            .and_then(|arg| arg.as_keyword_hash_node())
+            .filter(|hash| {
+                hash.elements().iter().all(|elem| {
+                    elem.as_assoc_node()
+                        .is_some_and(|assoc| assoc.key().as_symbol_node().is_some())
+                })
+            });
+        let keyword_has_lambda = trailing_keywords.as_ref().is_some_and(|hash| {
+            hash.elements().iter().any(|elem| {
+                elem.as_assoc_node()
+                    .is_some_and(|assoc| assoc.value().as_lambda_node().is_some())
+            })
+        });
+        if !keyword_has_lambda && !args.iter().any(|arg| arg.as_lambda_node().is_some()) {
             self.visit_arguments_node(arguments);
             return;
         }
-        let simple_shape = args.iter().all(|arg| {
+        let positional_count = args.len() - usize::from(trailing_keywords.is_some());
+        let simple_shape = args[..positional_count].iter().all(|arg| {
             arg.as_splat_node().is_none()
                 && arg.as_keyword_hash_node().is_none()
                 && arg.as_forwarding_arguments_node().is_none()
@@ -431,10 +457,43 @@ impl<'env> TypeChecker<'env> {
             .filter(|def| def.method_types().count() == 1)
             .and_then(|def| def.first_method_type())
             .filter(|mt| mt.type_params.is_empty());
+        // Declared slot types still carry `instance` / `self` / the
+        // receiver's class type params; bind them to the call's receiver
+        // (as argument matching does) so a `[self: instance]` lambda hint
+        // rebinds to the concrete class, not the bare `instance` keyword.
+        let receiver_subst =
+            target.map(|t| self.substitution_for_call_receiver(receiver_ty, t.bindings()));
+        let types = self.env.types();
+        let bind = move |hint: Option<Ty>| -> Option<Ty> {
+            let hint = hint?;
+            Some(match &receiver_subst {
+                Some(subst) => subst.apply(hint, types),
+                None => hint,
+            })
+        };
         for (index, arg) in args.iter().enumerate() {
-            if arg.as_lambda_node().is_some() {
+            if index == positional_count
+                && let Some(hash) = &trailing_keywords
+            {
+                for elem in hash.elements().iter() {
+                    let lambda_value = elem.as_assoc_node().and_then(|assoc| {
+                        let name = assoc.key().as_symbol_node()?;
+                        let value = assoc.value();
+                        value.as_lambda_node()?;
+                        Some((String::from_utf8_lossy(name.unescaped()).to_string(), value))
+                    });
+                    if let Some((name, value)) = lambda_value {
+                        let hint = bind(overload.and_then(|o| o.keyword_param_for_call(&name)));
+                        self.check_node(&value, hint);
+                    } else {
+                        self.visit(&elem);
+                    }
+                }
+            } else if arg.as_lambda_node().is_some() {
                 let hint = if simple_shape {
-                    overload.and_then(|o| o.positional_param_for_call(index, args.len()))
+                    bind(
+                        overload.and_then(|o| o.positional_param_for_call(index, positional_count)),
+                    )
                 } else {
                     None
                 };
@@ -693,6 +752,7 @@ impl<'env> TypeChecker<'env> {
         let mut positional_spans = vec![];
         let mut keywords = vec![];
         let mut kwsplats = vec![];
+        let mut non_symbol_pairs = vec![];
         let mut splat_tail: Option<SplatTail> = None;
 
         let Some(arguments) = arguments else {
@@ -701,6 +761,8 @@ impl<'env> TypeChecker<'env> {
                 positional_spans,
                 keywords,
                 kwsplats,
+                non_symbol_pairs,
+                folded: None,
                 has_block,
                 explicit_type_args: None,
                 splat_tail,
@@ -734,6 +796,19 @@ impl<'env> TypeChecker<'env> {
                                     assoc.location().end_offset(),
                                 ),
                                 arg_span(key_location.start_offset(), key_location.end_offset()),
+                            ));
+                        } else {
+                            let value = assoc.value();
+                            let key_type = self.infer_type(&key, None);
+                            let value_type = self.infer_type(&value, None);
+                            self.extract_carry_argument(&value, value_type);
+                            non_symbol_pairs.push((
+                                key_type,
+                                value_type,
+                                arg_span(
+                                    assoc.location().start_offset(),
+                                    assoc.location().end_offset(),
+                                ),
                             ));
                         }
                     } else if let Some(splat) = elem.as_assoc_splat_node()
@@ -800,6 +875,8 @@ impl<'env> TypeChecker<'env> {
             positional_spans,
             keywords,
             kwsplats,
+            non_symbol_pairs,
+            folded: None,
             has_block,
             explicit_type_args: None,
             splat_tail,
@@ -912,6 +989,8 @@ impl<'env> TypeChecker<'env> {
         let mut positional_spans = vec![];
         let mut keywords = vec![];
         let mut kwsplats = vec![];
+        let mut non_symbol_pairs = vec![];
+        let mut folded = None;
         let mut splat_tail: Option<SplatTail> = None;
         let has_block = node.block().is_some();
         // `#[T]` / `#$ T` trailing annotations only attach to CallNode
@@ -927,6 +1006,8 @@ impl<'env> TypeChecker<'env> {
                 positional_spans,
                 keywords,
                 kwsplats,
+                non_symbol_pairs,
+                folded,
                 has_block,
                 explicit_type_args,
                 splat_tail,
@@ -970,6 +1051,19 @@ impl<'env> TypeChecker<'env> {
                                 ),
                                 arg_span(key_location.start_offset(), key_location.end_offset()),
                             ));
+                        } else {
+                            let value = assoc.value();
+                            let key_type = self.infer_type(&key, None);
+                            let value_type = self.infer_type(&value, None);
+                            self.extract_carry_argument(&value, value_type);
+                            non_symbol_pairs.push((
+                                key_type,
+                                value_type,
+                                arg_span(
+                                    assoc.location().start_offset(),
+                                    assoc.location().end_offset(),
+                                ),
+                            ));
                         }
                     } else if let Some(splat) = elem.as_assoc_splat_node()
                         && let Some(value) = splat.value()
@@ -984,6 +1078,20 @@ impl<'env> TypeChecker<'env> {
                             ),
                         ));
                     }
+                }
+                // Keyword-less overload: the whole braceless hash is the
+                // positional at `positional_count` (the fold's slot, see
+                // `fold_braceless_keywords_for`), typed under that slot's
+                // Record / `Hash[K, V]` hint like the braced literal.
+                // Skipped behind a splat tail, where the fold does not
+                // apply either.
+                if splat_tail.is_none()
+                    && let Some(o) = overload.filter(|o| super::takes_no_keywords(o))
+                    && let Some(hint) =
+                        o.positional_param_for_call(positional_count, positional_count + 1)
+                {
+                    let elements: Vec<Node<'pr>> = keyword_hash.elements().iter().collect();
+                    folded = self.synthesize_hash_literal_with_hint(&elements, hint);
                 }
             } else if let Some(splat) = arg.as_splat_node() {
                 let start_index = positional_index;
@@ -1048,6 +1156,8 @@ impl<'env> TypeChecker<'env> {
             positional_spans,
             keywords,
             kwsplats,
+            non_symbol_pairs,
+            folded,
             has_block,
             explicit_type_args,
             splat_tail,
@@ -1088,6 +1198,8 @@ impl<'env> TypeChecker<'env> {
             ],
             keywords: vec![],
             kwsplats: vec![],
+            non_symbol_pairs: vec![],
+            folded: None,
             has_block: caller_mt.block.is_some(),
             explicit_type_args: self.lookup_callsite_type_args(node),
             splat_tail: None,
@@ -1136,10 +1248,18 @@ impl<'env> TypeChecker<'env> {
     /// is `&self` and cannot push diagnostics; this is the `&mut self`
     /// counterpart that owns the diagnostic side of ADR-0012 at the call
     /// site.
+    ///
+    /// `folds_braceless` is `CallArguments::folded.is_some()` from the
+    /// same overload's hinted collect: the braceless keyword hash then
+    /// occupies the positional slot after the plain positionals and is
+    /// walked as one literal against that slot's hint, exactly like its
+    /// braced form (and only there — the per-keyword walk below would
+    /// emit the same extras a second time).
     pub(super) fn emit_hash_literal_record_extras<'pr>(
         &mut self,
         node: CallSite<'_, 'pr>,
         overload: &crate::types::MethodType,
+        folds_braceless: bool,
     ) {
         let Some(arguments) = node.arguments() else {
             return;
@@ -1152,6 +1272,14 @@ impl<'env> TypeChecker<'env> {
         let mut positional_index = 0usize;
         for arg in arguments.arguments().iter() {
             if let Some(keyword_hash) = arg.as_keyword_hash_node() {
+                if folds_braceless {
+                    // Same slot the hinted collect used: splat literals
+                    // expand there, so count them expanded here too.
+                    let slot = self.estimate_post_expansion_positional_count(&arguments);
+                    let hint = overload.positional_param_for_call(slot, slot + 1);
+                    self.maybe_emit_record_extras(&arg, hint);
+                    continue;
+                }
                 for elem in keyword_hash.elements().iter() {
                     if let Some(assoc) = elem.as_assoc_node() {
                         let key = assoc.key();
@@ -1172,10 +1300,9 @@ impl<'env> TypeChecker<'env> {
 
     fn maybe_emit_record_extras<'pr>(&mut self, arg: &Node<'pr>, hint: Option<Ty>) {
         let Some(hint_ty) = hint else { return };
-        let Some(hash) = arg.as_hash_node() else {
+        let Some(elements) = super::inference::hash_or_keyword_hash_elements(arg) else {
             return;
         };
-        let elements: Vec<_> = hash.elements().iter().collect();
         // `pick_record_hint` unwraps Optional/Union and picks the
         // committed Record candidate (or returns None for no-match in the
         // multi-candidate strict-pick case). Sharing this with the
@@ -1213,7 +1340,7 @@ impl<'env> TypeChecker<'env> {
     /// `method_resolver` is self-context-free and returns `None` for it, so
     /// lookup must run against the concrete `current_self_type()`. Non-self
     /// receivers pass through unchanged.
-    fn concrete_self_for_lookup(&self, receiver_type: Ty) -> Ty {
+    pub(super) fn concrete_self_for_lookup(&self, receiver_type: Ty) -> Ty {
         if receiver_type == Ty::SELF_TYPE {
             self.current_self_type()
         } else {
@@ -1510,11 +1637,15 @@ impl<'env> TypeChecker<'env> {
         let bindings = target.bindings();
         let hint_overload =
             self.pick_hint_overload(&method_def, CallSite::Call(node), &bindings, receiver_type);
-        if let Some(ov) = hint_overload.as_ref() {
-            self.emit_hash_literal_record_extras(CallSite::Call(node), ov);
-        }
         let arguments =
             self.collect_call_arguments_hinted(CallSite::Call(node), hint_overload.as_ref());
+        if let Some(ov) = hint_overload.as_ref() {
+            self.emit_hash_literal_record_extras(
+                CallSite::Call(node),
+                ov,
+                arguments.folded.is_some(),
+            );
+        }
         let method_name = target.method_name().to_string();
         self.check_deprecated_send(
             &method_name,
@@ -1723,10 +1854,10 @@ impl<'env> TypeChecker<'env> {
             0
         };
         let hint_overload = self.pick_hint_overload(&method, site, &bindings, self_ty);
-        if let Some(ov) = hint_overload.as_ref() {
-            self.emit_hash_literal_record_extras(site, ov);
-        }
         let arguments = self.collect_call_arguments_hinted(site, hint_overload.as_ref());
+        if let Some(ov) = hint_overload.as_ref() {
+            self.emit_hash_literal_record_extras(site, ov, arguments.folded.is_some());
+        }
         // Match the prior `offset_to_location(start)` shape: a single-point
         // span anchored at the call's start. Preserves the diagnostic
         // location bytes (start_byte == end_byte) the super-arg path has
@@ -1959,15 +2090,41 @@ impl<'env> TypeChecker<'env> {
         arguments: &CallArguments,
         overload: &crate::types::MethodType,
     ) -> Option<CallArguments> {
-        if (arguments.keywords.is_empty() && arguments.kwsplats.is_empty())
+        if (arguments.keywords.is_empty()
+            && arguments.kwsplats.is_empty()
+            && arguments.non_symbol_pairs.is_empty())
             || arguments.splat_tail.is_some()
-            || overload.is_untyped_function()
-            || !overload.required_keywords().is_empty()
-            || !overload.optional_keywords().is_empty()
-            || overload.rest_keyword().is_some()
+            || !super::takes_no_keywords(overload)
         {
             return None;
         }
+        let folded_ty = match arguments.folded {
+            Some(ty) => ty,
+            None => self.fold_braceless_keywords_without_hint(arguments),
+        };
+        let spans = arguments
+            .keywords
+            .iter()
+            .map(|(_, _, span, _)| *span)
+            .chain(arguments.kwsplats.iter().map(|(_, span)| *span))
+            .chain(arguments.non_symbol_pairs.iter().map(|(_, _, span)| *span));
+        let first = spans.clone().map(|s| s.0).min()?;
+        let last = spans.map(|s| s.1).max()?;
+        let mut folded = arguments.clone();
+        folded.positional.push(folded_ty);
+        folded.positional_spans.push((first, last));
+        folded.keywords.clear();
+        folded.kwsplats.clear();
+        folded.non_symbol_pairs.clear();
+        Some(folded)
+    }
+
+    /// No-hint shape of the folded braceless hash: literal keywords
+    /// widened into a Record, or `Hash[K, V]` when `**h` / non-Symbol
+    /// pairs join in. Used when the hint overload's positional slot did
+    /// not resolve to a Record / Hash hint (`CallArguments::folded` is
+    /// `None`), so `rec: ({ a: Integer })` + `rec(a: 1)` keeps matching.
+    fn fold_braceless_keywords_without_hint(&self, arguments: &CallArguments) -> Ty {
         let mut fields: Vec<(crate::types::RecordKey, Ty, bool)> = Vec::new();
         for (name, ty, _, _) in &arguments.keywords {
             let key = crate::types::RecordKey::Symbol(name.clone());
@@ -1982,7 +2139,7 @@ impl<'env> TypeChecker<'env> {
             }
         }
         fields.sort_by(|a, b| a.0.cmp(&b.0));
-        let folded_ty = if arguments.kwsplats.is_empty() {
+        if arguments.kwsplats.is_empty() && arguments.non_symbol_pairs.is_empty() {
             self.env.types().intern(Type::Record { fields })
         } else {
             let mut key_members = Vec::new();
@@ -1994,6 +2151,12 @@ impl<'env> TypeChecker<'env> {
             for (ty, _) in &arguments.kwsplats {
                 self.absorb_kwsplat_ty(*ty, &mut key_members, &mut value_members);
             }
+            // `"a" => 1` contributes String / Integer, widened like the
+            // literal keywords above (no-hint hash-literal synthesis).
+            for (key_ty, value_ty, _) in &arguments.non_symbol_pairs {
+                self.push_flat_union_members(self.widen_literal(*key_ty), &mut key_members);
+                self.push_flat_union_members(self.widen_literal(*value_ty), &mut value_members);
+            }
             // Every contributor was untyped (or non-Hash): `Hash[untyped,
             // untyped]`, which still occupies the positional slot.
             let key_ty = self.union_of_members(&key_members);
@@ -2002,20 +2165,43 @@ impl<'env> TypeChecker<'env> {
                 name: self.env.names().builtins().hash,
                 args: vec![key_ty, value_ty],
             })
+        }
+    }
+
+    /// Symbol keys of a Record-typed `**h` value, the shape a
+    /// keyword-bearing overload consumes key by key (Steep
+    /// `KeywordArgs#consume_keys` on `AST::Types::Record`). `None` for
+    /// anything that is not keyword-shaped at runtime — Hash / untyped /
+    /// Union / Optional, and a Record with a non-Symbol key — which the
+    /// keyword paths treat as an opaque Hash: no key is consumed, and
+    /// the value only type-checks against `**rest` (see
+    /// `kwsplat_rest_hash_type`).
+    pub(super) fn kwsplat_record_keys(&self, ty: Ty) -> Option<KwsplatKeys> {
+        let resolved = self
+            .env
+            .types()
+            .resolve(definition_builder::expand_alias(self.env, ty));
+        let Type::Record { fields } = resolved else {
+            return None;
         };
-        let spans = arguments
-            .keywords
+        fields
             .iter()
-            .map(|(_, _, span, _)| *span)
-            .chain(arguments.kwsplats.iter().map(|(_, span)| *span));
-        let first = spans.clone().map(|s| s.0).min()?;
-        let last = spans.map(|s| s.1).max()?;
-        let mut folded = arguments.clone();
-        folded.positional.push(folded_ty);
-        folded.positional_spans.push((first, last));
-        folded.keywords.clear();
-        folded.kwsplats.clear();
-        Some(folded)
+            .map(|(key, ty, _)| match key {
+                RecordKey::Symbol(name) => Some((name.clone(), *ty)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `Hash[Symbol, rest]`: the type a non-Record `**h` is checked
+    /// against when the overload takes `**rest`. Only the rest type
+    /// contributes (not Steep's intersection with the named keyword
+    /// values — see the todo's park condition).
+    pub(super) fn kwsplat_rest_hash_type(&self, rest: Ty) -> Ty {
+        let symbol = self
+            .env
+            .class_instance_type(self.env.names().builtins().symbol);
+        self.hash_instance(symbol, rest)
     }
 
     /// Union of an `absorb_kwsplat_ty` member pool; untyped when the pool
@@ -2202,36 +2388,50 @@ impl<'env> TypeChecker<'env> {
                     }
                     ty
                 };
+                // Record `**h` keys count as supplied keywords; Hash /
+                // untyped splats supply nothing (`kwsplat_record_keys`).
+                let splats: Vec<(Option<KwsplatKeys>, Ty)> = arguments
+                    .kwsplats
+                    .iter()
+                    .map(|(ty, _)| (self.kwsplat_record_keys(*ty), *ty))
+                    .collect();
                 for (required_name, _) in o.required_keywords() {
-                    if !arguments
+                    let supplied = arguments
                         .keywords
                         .iter()
                         .any(|(name, _, _, _)| name == required_name)
-                    {
+                        || splats.iter().any(|(keys, _)| {
+                            keys.as_ref().is_some_and(|keys| {
+                                keys.iter().any(|(name, _)| name == required_name)
+                            })
+                        });
+                    if !supplied {
                         return false;
                     }
                 }
+                let keyword_fits = |name: &str, actual: Ty| match o.keyword_param_type(name) {
+                    Some(expected_type) => subtyper.check(actual, subst(expected_type)),
+                    None => false,
+                };
                 for (keyword_name, actual, _, _) in &arguments.keywords {
-                    let expected = o
-                        .required_keywords()
-                        .iter()
-                        .find(|(name, _)| name == keyword_name)
-                        .map(|(_, ty)| *ty)
-                        .or_else(|| {
-                            o.optional_keywords()
-                                .iter()
-                                .find(|(name, _)| name == keyword_name)
-                                .map(|(_, ty)| *ty)
-                        })
-                        .or(o.rest_keyword());
-                    match expected {
-                        Some(expected_type) => {
-                            if !subtyper.check(*actual, subst(expected_type)) {
-                                return false;
+                    if !keyword_fits(keyword_name, *actual) {
+                        return false;
+                    }
+                }
+                for (keys, splat_ty) in &splats {
+                    match keys {
+                        Some(keys) => {
+                            for (name, actual) in keys {
+                                if !keyword_fits(name, *actual) {
+                                    return false;
+                                }
                             }
                         }
                         None => {
-                            if o.rest_keyword().is_none() {
+                            if let Some(rest) = o.rest_keyword()
+                                && !subtyper
+                                    .check(*splat_ty, subst(self.kwsplat_rest_hash_type(rest)))
+                            {
                                 return false;
                             }
                         }
@@ -2799,6 +2999,8 @@ impl<'env> TypeChecker<'env> {
             positional_spans,
             keywords: vec![],
             kwsplats: vec![],
+            non_symbol_pairs: vec![],
+            folded: None,
             has_block: false,
             explicit_type_args: None,
             splat_tail: None,
@@ -2974,6 +3176,8 @@ impl<'env> TypeChecker<'env> {
             positional_spans,
             keywords: vec![],
             kwsplats: vec![],
+            non_symbol_pairs: vec![],
+            folded: None,
             has_block: false,
             explicit_type_args: None,
             splat_tail: None,
@@ -3179,6 +3383,8 @@ impl<'env> TypeChecker<'env> {
                 )],
                 keywords: vec![],
                 kwsplats: vec![],
+                non_symbol_pairs: vec![],
+                folded: None,
                 has_block: false,
                 explicit_type_args: None,
                 splat_tail: None,
@@ -3199,6 +3405,8 @@ impl<'env> TypeChecker<'env> {
             )],
             keywords: vec![],
             kwsplats: vec![],
+            non_symbol_pairs: vec![],
+            folded: None,
             has_block: false,
             explicit_type_args: None,
             splat_tail: None,
@@ -3842,13 +4050,25 @@ impl<'env> TypeChecker<'env> {
             }
         }
 
-        // Keyword checks are independent of positional checks
+        // Keyword checks are independent of positional checks. A Record
+        // `**h` supplies its Symbol keys (Steep `consume_keys`); Hash /
+        // untyped splats supply nothing, so a required keyword stays
+        // missing behind `f(**h)`.
+        let splats: Vec<(Option<KwsplatKeys>, Ty, ArgSpan)> = arguments
+            .kwsplats
+            .iter()
+            .map(|(ty, span)| (self.kwsplat_record_keys(*ty), *ty, *span))
+            .collect();
         for (required_name, _) in first_overload.required_keywords() {
-            if !arguments
+            let supplied = arguments
                 .keywords
                 .iter()
                 .any(|(name, _, _, _)| name == required_name)
-            {
+                || splats.iter().any(|(keys, _, _)| {
+                    keys.as_ref()
+                        .is_some_and(|keys| keys.iter().any(|(name, _)| name == required_name))
+                });
+            if !supplied {
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location: self.span_to_location(loc_span),
@@ -3861,46 +4081,72 @@ impl<'env> TypeChecker<'env> {
             }
         }
 
-        for (keyword_name, actual, keyword_span, keyword_name_span) in &arguments.keywords {
-            let expected = first_overload
-                .required_keywords()
-                .iter()
-                .find(|(name, _)| name == keyword_name)
-                .map(|(_, ty)| *ty)
-                .or_else(|| {
-                    first_overload
-                        .optional_keywords()
-                        .iter()
-                        .find(|(name, _)| name == keyword_name)
-                        .map(|(_, ty)| *ty)
-                })
-                .or(first_overload.rest_keyword());
-
-            if let Some(expected_type) = expected {
-                if !subtyper.check(*actual, expected_type) {
+        // One keyword against the overload: mismatch on `value_span`,
+        // unexpected on `name_span`. A Record splat key has only the
+        // `**h` span for both.
+        let check_keyword =
+            |keyword_name: &str, actual: Ty, value_span: ArgSpan, name_span: ArgSpan| {
+                if let Some(expected_type) = first_overload.keyword_param_type(keyword_name) {
+                    if !subtyper.check(actual, expected_type) {
+                        self.push_diagnostic(Diagnostic {
+                            scope: None,
+                            location: self.span_to_location(value_span),
+                            kind: DiagnosticKind::ArgumentTypeMismatch {
+                                method_name: method_name.to_string(),
+                                param_index: None,
+                                keyword: Some(keyword_name.to_string()),
+                                expected: self.display_type(expected_type),
+                                actual: self.display_type(actual),
+                                defined_in: Some(defined_in.clone()),
+                            },
+                        });
+                    }
+                } else {
                     self.push_diagnostic(Diagnostic {
                         scope: None,
-                        location: self.span_to_location(*keyword_span),
-                        kind: DiagnosticKind::ArgumentTypeMismatch {
+                        location: self.span_to_location(name_span),
+                        kind: DiagnosticKind::UnexpectedKeywordArgument {
                             method_name: method_name.to_string(),
-                            param_index: None,
-                            keyword: Some(keyword_name.clone()),
-                            expected: self.display_type(expected_type),
-                            actual: self.display_type(*actual),
+                            keyword: keyword_name.to_string(),
                             defined_in: Some(defined_in.clone()),
                         },
                     });
                 }
-            } else {
-                self.push_diagnostic(Diagnostic {
-                    scope: None,
-                    location: self.span_to_location(*keyword_name_span),
-                    kind: DiagnosticKind::UnexpectedKeywordArgument {
-                        method_name: method_name.to_string(),
-                        keyword: keyword_name.clone(),
-                        defined_in: Some(defined_in.clone()),
-                    },
-                });
+            };
+        for (keyword_name, actual, keyword_span, keyword_name_span) in &arguments.keywords {
+            check_keyword(keyword_name, *actual, *keyword_span, *keyword_name_span);
+        }
+        for (keys, splat_ty, splat_span) in &splats {
+            match keys {
+                // Per-key reports (not Steep's one Record-vs-Record
+                // mismatch) so the offending key is readable.
+                Some(keys) => {
+                    for (name, actual) in keys {
+                        check_keyword(name, *actual, *splat_span, *splat_span);
+                    }
+                }
+                // Opaque Hash: only `**rest` can judge it. Without a
+                // rest the splat is silent (Steep yields an anonymous
+                // UnexpectedKeyword it never records).
+                None => {
+                    if let Some(rest) = first_overload.rest_keyword() {
+                        let expected_type = self.kwsplat_rest_hash_type(rest);
+                        if !subtyper.check(*splat_ty, expected_type) {
+                            self.push_diagnostic(Diagnostic {
+                                scope: None,
+                                location: self.span_to_location(*splat_span),
+                                kind: DiagnosticKind::ArgumentTypeMismatch {
+                                    method_name: method_name.to_string(),
+                                    param_index: None,
+                                    keyword: None,
+                                    expected: self.display_type(expected_type),
+                                    actual: self.display_type(*splat_ty),
+                                    defined_in: Some(defined_in.clone()),
+                                },
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -4408,65 +4654,88 @@ impl<'env> TypeChecker<'env> {
         }
     }
 
-    /// Compute the type bound to each block parameter, by position.
-    ///
-    /// Returns `(requireds_types, rest_type)`:
-    /// - `requireds_types[i]` — type for the i-th required param (`None` = unbound).
-    /// - `rest_type` — type to bind to the `*rest` param, or `None` when there is
-    ///   no rest param.
-    ///
-    /// Auto-splat fires when `expected_params` is a single aggregate and the block
-    /// has 2+ required params **or** at least 1 required param plus a rest param.
-    /// Pure rest-only `|*b|` does NOT splat: Ruby `yield([1,2]) { |*b| p b }` gives
-    /// `[[1,2]]` (whole tuple collected into rest). Mirrors Steep's `BlockParams#zip`
-    /// and `expandable?` (`block_params.rb:264-367`):
-    ///
-    /// - Tuple `[A, B]`: required `i` gets `members[i]` (excess → `nil`); rest
-    ///   gets `Array[union of leftover members]`, or `Array[bot]` when there are
-    ///   no leftover members (Ruby `*c = []`; Steep uses `nil` but Ruby is `[]`).
-    /// - `Array[T]`: every required gets `T | nil`; rest gets `Array[T]`.
-    /// - Non-aggregate single yield: required `0` gets the type, others get `nil`;
-    ///   rest gets `Array[bot]` (no leftover elements; Steep uses `Array[untyped]`).
-    ///
-    /// Non-splat path (index mapping): required `i` gets `expected_params[i]` if
-    /// present, otherwise `None` (unbound). Rest gets `Array[union of remaining
-    /// expected_params]`, or `Array[bot]` when no params remain after requireds.
-    /// This handles `|*b|` (rest-only) correctly: rest gets `Array[expected_params[0]]`.
     /// `block_param_types` when the call's block type resolved; every param
     /// UNTYPED otherwise, so an unresolvable block never invents a binding
     /// (e.g. `Array[bot]` for `*rest`) that could surface a new diagnostic.
     fn unresolved_or_block_param_types(
         &self,
         expected_block: Option<&Block>,
-        requireds_count: usize,
-        rest_present: bool,
+        shape: BlockParamShape,
     ) -> (Vec<Option<Ty>>, Option<Ty>) {
         match expected_block {
-            Some(block) => self.block_param_types(block.params(), requireds_count, rest_present),
+            Some(block) => {
+                self.block_param_types(&block.flat_positionals(), block.rest_positional(), shape)
+            }
             None => (
-                vec![Some(Ty::UNTYPED); requireds_count],
-                rest_present.then_some(Ty::UNTYPED),
+                vec![Some(Ty::UNTYPED); shape.positionals()],
+                shape.rest_present.then_some(Ty::UNTYPED),
             ),
         }
     }
 
+    /// Compute the type bound to each block parameter, by position.
+    ///
+    /// `expected_params` are the expected block's required + optional
+    /// positionals flattened (`Block::flat_positionals`, Steep
+    /// `flat_unnamed_params`); `expected_rest` its `*rest` type.
+    ///
+    /// Returns `(positional_types, rest_type)`:
+    /// - `positional_types[i]` — type for the i-th block positional, required
+    ///   params first then optional params (`None` = no slot; the caller
+    ///   decides nil / UNTYPED).
+    /// - `rest_type` — type to bind to the `*rest` param, or `None` when there is
+    ///   no rest param.
+    ///
+    /// Auto-splat fires when `expected_params` is a single aggregate and the
+    /// block has 2+ positionals **or** at least 1 positional plus a rest param.
+    /// Ruby counts optional params in that arity (`yield [1, "s"]` into
+    /// `|a, b = 0|` gives `b == "s"`); Steep's `expandable?` counts only the
+    /// required ones and is deliberately not followed here. Pure rest-only
+    /// `|*b|` does NOT splat: Ruby `yield([1,2]) { |*b| p b }` gives `[[1,2]]`
+    /// (whole tuple collected into rest). The per-shape rules mirror Steep's
+    /// `BlockParams#zip` (`block_params.rb:264-336`):
+    ///
+    /// - Tuple `[A, B]`: positional `i` gets `members[i]` (excess required →
+    ///   `nil`, excess optional → `None`); rest gets `Array[union of leftover
+    ///   members]`, or `Array[bot]` when there are no leftover members (Ruby
+    ///   `*c = []`; Steep uses `nil` but Ruby is `[]`).
+    /// - `Array[T]`: every positional gets `T | nil`; rest gets `Array[T]`.
+    /// - Non-aggregate single yield: not expandable, so it takes the index
+    ///   mapping below (positional `0` gets the type, the others fall back to
+    ///   `expected_rest` / `None`; rest gets `Array[expected_rest]` or
+    ///   `Array[bot]` — Steep uses `Array[untyped]` for the latter).
+    ///
+    /// Non-splat path (index mapping): positional `i` gets `expected_params[i]`
+    /// if present, else `expected_rest` if declared, else `None`. Rest gets
+    /// `Array[union of remaining expected_params (+ expected_rest)]`, or
+    /// `Array[expected_rest]` / `Array[bot]` when nothing remains. This handles
+    /// `|*b|` (rest-only) correctly: rest gets `Array[expected_params[0]]`.
     pub(super) fn block_param_types(
         &self,
         expected_params: &[Ty],
-        requireds_count: usize,
-        rest_present: bool,
+        expected_rest: Option<Ty>,
+        shape: BlockParamShape,
     ) -> (Vec<Option<Ty>>, Option<Ty>) {
+        let BlockParamShape {
+            requireds_count,
+            rest_present,
+            ..
+        } = shape;
+        let positionals_count = shape.positionals();
+        // Type for a block positional with no expected slot: required is nil
+        // at runtime, optional takes its default (unknown here).
+        let unfilled = |i: usize| (i < requireds_count).then_some(Ty::NIL);
         let splat = expected_params.len() == 1
-            && (requireds_count >= 2 || (requireds_count >= 1 && rest_present));
+            && (positionals_count >= 2 || (positionals_count >= 1 && rest_present));
         if splat {
             let expanded = definition_builder::expand_alias(self.env, expected_params[0]);
             match self.env.types().resolve(expanded) {
                 Type::Tuple(members) => {
-                    let requireds = (0..requireds_count)
-                        .map(|i| Some(members.get(i).copied().unwrap_or(Ty::NIL)))
+                    let positionals = (0..positionals_count)
+                        .map(|i| members.get(i).copied().or_else(|| unfilled(i)))
                         .collect();
                     let rest = rest_present.then(|| {
-                        let start = requireds_count.min(members.len());
+                        let start = positionals_count.min(members.len());
                         let leftover = &members[start..];
                         let elem = match leftover {
                             [] => Ty::BOTTOM,
@@ -4475,47 +4744,52 @@ impl<'env> TypeChecker<'env> {
                         };
                         self.make_array_type(elem)
                     });
-                    return (requireds, rest);
+                    return (positionals, rest);
                 }
                 Type::ClassInstance { name, args }
                     if args.len() == 1 && self.is_array_name(name) =>
                 {
                     let elem = args[0];
                     let elem_or_nil = union_of(elem, Ty::NIL, self.env.types());
-                    let requireds = (0..requireds_count).map(|_| Some(elem_or_nil)).collect();
+                    let positionals = (0..positionals_count).map(|_| Some(elem_or_nil)).collect();
                     let rest = rest_present.then(|| self.make_array_type(elem));
-                    return (requireds, rest);
+                    return (positionals, rest);
                 }
-                _ => {
-                    // Non-aggregate: first required gets the yielded type, others get nil.
-                    // Rest gets Array[bot] — all expected params are consumed by requireds.
-                    let requireds = (0..requireds_count)
-                        .map(|i| Some(if i == 0 { expected_params[0] } else { Ty::NIL }))
-                        .collect();
-                    let rest = rest_present.then(|| self.make_array_type(Ty::BOTTOM));
-                    return (requireds, rest);
-                }
+                // Non-aggregate: not expandable (Steep `expandable_params?`
+                // returns nil), so it zips by index like any other yield —
+                // the first positional gets the type and the rest fall back
+                // to `expected_rest` (`(String, *Integer)` with `|a, *r|`
+                // gives `r: Array[Integer]`).
+                _ => {}
             }
         }
-        // Index mapping (no splat). Rest gets Array of the expected_params residual
-        // after requireds have claimed their slots (mirrors Steep block_params.rb:310-321).
-        let requireds = (0..requireds_count)
-            .map(|i| expected_params.get(i).copied())
+        // Index mapping (no splat). Slots past the flat list fall back to the
+        // expected `*rest` type. Rest gets Array of the expected_params
+        // residual after positionals have claimed their slots (mirrors Steep
+        // block_params.rb:310-321).
+        let positionals = (0..positionals_count)
+            .map(|i| expected_params.get(i).copied().or(expected_rest))
             .collect();
         let rest = rest_present.then(|| {
-            let remaining = if requireds_count < expected_params.len() {
-                &expected_params[requireds_count..]
+            let remaining = if positionals_count < expected_params.len() {
+                &expected_params[positionals_count..]
             } else {
                 &[][..]
             };
-            let elem = match remaining {
-                [] => Ty::BOTTOM,
-                [single] => *single,
-                many => self.env.types().intern(Type::Union(many.to_vec())),
+            let elem = match (remaining, expected_rest) {
+                ([], None) => Ty::BOTTOM,
+                ([], Some(rest_ty)) => rest_ty,
+                ([single], None) => *single,
+                (many, None) => self.env.types().intern(Type::Union(many.to_vec())),
+                (many, Some(rest_ty)) => {
+                    let mut members = many.to_vec();
+                    members.push(rest_ty);
+                    self.env.types().intern(Type::Union(members))
+                }
             };
             self.make_array_type(elem)
         });
-        (requireds, rest)
+        (positionals, rest)
     }
 
     fn make_array_type(&self, elem: Ty) -> Ty {
@@ -4573,21 +4847,110 @@ impl<'env> TypeChecker<'env> {
                 && let Some(params) = block_params.parameters()
             {
                 let requireds = params.requireds();
-                let rest_present = params.rest().is_some();
-                let (param_types, rest_ty) = self.unresolved_or_block_param_types(
-                    expected_block.as_ref(),
-                    requireds.len(),
-                    rest_present,
-                );
+                let optionals = params.optionals();
+                let shape = BlockParamShape {
+                    requireds_count: requireds.len(),
+                    optionals_count: optionals.len(),
+                    rest_present: params.rest().is_some(),
+                };
+                let (param_types, rest_ty) =
+                    self.unresolved_or_block_param_types(expected_block.as_ref(), shape);
+                // Every declared param name must bind, or a read inside the
+                // block walks `lookup_local_variable` out to the enclosing
+                // method's same-named lvar (Ruby always shadows). A positional
+                // with no expected slot (`block_param_types` gave `None`) is
+                // nil at runtime when required; an optional takes its default,
+                // whose type is not tracked, so UNTYPED. With no block type
+                // (`(?)` or unresolved) everything is UNTYPED.
+                let typed_function = expected_block.as_ref().and_then(|b| match &b.type_ {
+                    FunctionType::Typed(f) => Some(f),
+                    FunctionType::Untyped(_) => None,
+                });
+                let unfilled_ty = if typed_function.is_some() {
+                    Ty::NIL
+                } else {
+                    Ty::UNTYPED
+                };
                 for (index, param) in requireds.iter().enumerate() {
-                    if let Some(required) = param.as_required_parameter_node()
-                        && let Some(Some(expected_type)) = param_types.get(index).copied()
-                    {
+                    if let Some(required) = param.as_required_parameter_node() {
+                        let expected_type = param_types
+                            .get(index)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(unfilled_ty);
                         let name_str = String::from_utf8_lossy(required.name().as_slice());
                         let name = self.checker_names().intern(&name_str);
                         let expected_type = self.freeze_self_type_for_lvar_binding(expected_type);
                         self.ctx.set_local_variable(name, expected_type);
                     }
+                }
+                for (index, param) in optionals.iter().enumerate() {
+                    if let Some(optional) = param.as_optional_parameter_node() {
+                        let expected_type = param_types
+                            .get(requireds.len() + index)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(Ty::UNTYPED);
+                        let name_str = String::from_utf8_lossy(optional.name().as_slice());
+                        let name = self.checker_names().intern(&name_str);
+                        let expected_type = self.freeze_self_type_for_lvar_binding(expected_type);
+                        self.ctx.set_local_variable(name, expected_type);
+                    }
+                }
+                // A required after `*rest` (prism `posts()`) has no slot rule
+                // yet; Steep `block_params.rb` also leaves it untyped ("not
+                // supported yet"). Bind UNTYPED to stop the leak.
+                for param in params.posts().iter() {
+                    if let Some(post) = param.as_required_parameter_node() {
+                        let name_str = String::from_utf8_lossy(post.name().as_slice());
+                        let name = self.checker_names().intern(&name_str);
+                        self.ctx.set_local_variable(name, Ty::UNTYPED);
+                    }
+                }
+                // Keywords resolve by name against either keyword list of the
+                // expected block (same lookup as `methods.rs` for a def).
+                for keyword_node in params.keywords().iter() {
+                    let name_id = if let Some(required) =
+                        keyword_node.as_required_keyword_parameter_node()
+                    {
+                        required.name()
+                    } else if let Some(optional) = keyword_node.as_optional_keyword_parameter_node()
+                    {
+                        optional.name()
+                    } else {
+                        continue;
+                    };
+                    let keyword_str = String::from_utf8_lossy(name_id.as_slice());
+                    let ty = typed_function
+                        .and_then(|f| {
+                            f.required_keywords
+                                .iter()
+                                .chain(f.optional_keywords.iter())
+                                .find(|(keyword_name, _)| keyword_name == &keyword_str)
+                        })
+                        .map_or(Ty::UNTYPED, |&(_, ty)| ty);
+                    let name = self.checker_names().intern(&keyword_str);
+                    let ty = self.freeze_self_type_for_lvar_binding(ty);
+                    self.ctx.set_local_variable(name, ty);
+                }
+                if let Some(keyword_rest) = params.keyword_rest()
+                    && let Some(keyword_rest) = keyword_rest.as_keyword_rest_parameter_node()
+                    && let Some(name_id) = keyword_rest.name()
+                {
+                    let name_str = String::from_utf8_lossy(name_id.as_slice());
+                    let name = self.checker_names().intern(&name_str);
+                    self.ctx.set_local_variable(name, Ty::UNTYPED);
+                }
+                // `RBS::Types::Block` cannot declare a nested block, so a
+                // typed block never passes one: `|&blk|` is nil (Ruby runtime
+                // and Steep agree). Unlike the def-side `&block` in
+                // `methods.rs` there is no Proc to synthesize.
+                if let Some(block_param) = params.block()
+                    && let Some(name_id) = block_param.name()
+                {
+                    let name_str = String::from_utf8_lossy(name_id.as_slice());
+                    let name = self.checker_names().intern(&name_str);
+                    self.ctx.set_local_variable(name, unfilled_ty);
                 }
                 if let Some(ty) = rest_ty
                     && let Some(rest_node) = params.rest()
@@ -4606,8 +4969,10 @@ impl<'env> TypeChecker<'env> {
                 // bind (UNTYPED when the block yields nothing) so a nested
                 // implicit `it` can't fall through `lookup_local_variable` to an
                 // enclosing block's `it`.
-                let (param_types, _) =
-                    self.unresolved_or_block_param_types(expected_block.as_ref(), 1, false);
+                let (param_types, _) = self.unresolved_or_block_param_types(
+                    expected_block.as_ref(),
+                    BlockParamShape::requireds(1),
+                );
                 let it_ty = param_types
                     .first()
                     .copied()
@@ -4629,8 +4994,10 @@ impl<'env> TypeChecker<'env> {
                 // bind (UNTYPED when the block yields nothing) so a lookup
                 // can't fall through to an enclosing binding.
                 let count = numbered.maximum() as usize;
-                let (param_types, _) =
-                    self.unresolved_or_block_param_types(expected_block.as_ref(), count, false);
+                let (param_types, _) = self.unresolved_or_block_param_types(
+                    expected_block.as_ref(),
+                    BlockParamShape::requireds(count),
+                );
                 for index in 0..count {
                     let ty = param_types
                         .get(index)
@@ -5683,6 +6050,30 @@ pub(super) fn block_pass_symbol(block_arg: &Node<'_>) -> Option<(String, usize)>
 /// Steep `one_arg?`: the expected block takes exactly one required
 /// positional and nothing else. Multi-arg blocks (e.g. `{ (K, V) -> void }`)
 /// are outside the Symbol#to_proc special case (Steep logs and skips).
+/// How many positionals a block declares, split the way `block_param_types`
+/// needs: required first, then optional, plus whether a `*rest` exists.
+#[derive(Clone, Copy)]
+pub(super) struct BlockParamShape {
+    pub(super) requireds_count: usize,
+    pub(super) optionals_count: usize,
+    pub(super) rest_present: bool,
+}
+
+impl BlockParamShape {
+    /// `|x|` / `it` / `_1.._n`: `count` required positionals, no rest.
+    pub(super) fn requireds(count: usize) -> Self {
+        BlockParamShape {
+            requireds_count: count,
+            optionals_count: 0,
+            rest_present: false,
+        }
+    }
+
+    pub(super) fn positionals(self) -> usize {
+        self.requireds_count + self.optionals_count
+    }
+}
+
 pub(super) fn symbol_to_proc_one_arg_param(expected_block: &Block) -> Option<Ty> {
     match &expected_block.type_ {
         FunctionType::Typed(f)

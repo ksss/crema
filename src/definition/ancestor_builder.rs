@@ -636,6 +636,7 @@ impl AncestorBuilder {
                 }
                 walk_class_mixins(
                     class_entry,
+                    name,
                     lowering,
                     &self.env,
                     Side::Instance,
@@ -649,6 +650,7 @@ impl AncestorBuilder {
                 one.params = module_type_params(module_entry, lowering, &class_scope);
                 one.self_types = module_self_types_or_default(
                     module_entry,
+                    name,
                     lowering,
                     &self.env,
                     names,
@@ -656,6 +658,7 @@ impl AncestorBuilder {
                 );
                 walk_module_mixins(
                     module_entry,
+                    name,
                     lowering,
                     &self.env,
                     Side::Instance,
@@ -709,6 +712,7 @@ impl AncestorBuilder {
                 }
                 walk_class_mixins(
                     class_entry,
+                    name,
                     lowering,
                     &self.env,
                     Side::Singleton,
@@ -727,6 +731,7 @@ impl AncestorBuilder {
                 });
                 walk_module_mixins(
                     module_entry,
+                    name,
                     lowering,
                     &self.env,
                     Side::Singleton,
@@ -1229,35 +1234,82 @@ fn class_super_or_default(
 
 fn module_self_types_or_default(
     entry: &ModuleEntry,
+    name: &TypeName,
     lowering: &LoweringEnv<'_>,
     env: &Environment,
     names: &NameTable,
     class_scope: &TypeParamScope,
 ) -> Vec<MixinRef> {
-    // rbs `ModuleEntry#self_types` aggregates `each_decl.flat_map(&:self_types).uniq`.
-    // Reading only `primary_decl()` mis-builds reopens like Kernel, where the
-    // self-type-bearing decl is not necessarily the first one loaded.
-    let aggregated = entry.self_types();
-    let resolved: Vec<MixinRef> = aggregated
-        .iter()
-        .filter(|ma| names.type_name_is_absolute(ma.name))
-        .map(|ma| {
-            mixin_ref(
-                ma.name,
-                &ma.args,
-                ma.source_file,
-                ma.location.map(|l| l.range),
+    // rbs `ModuleEntry#self_types` aggregates `each_decl.flat_map(&:self_types).uniq`,
+    // aligning each decl's type params onto the primary decl's spelling
+    // (`align_params`) before the `uniq`. Reading only `primary_decl()`
+    // mis-builds reopens like Kernel, where the self-type-bearing decl is
+    // not necessarily the first one loaded; lowering every decl under the
+    // primary scope leaves a reopen-spelled `_Each[Elem]` unbound.
+    let primary_params = primary_signature_module_type_params(entry);
+    let mut resolved: Vec<MixinRef> = Vec::new();
+    let mut push_unique = |mref: MixinRef| {
+        if !resolved
+            .iter()
+            .any(|existing| existing.name == mref.name && existing.args == mref.args)
+        {
+            resolved.push(mref);
+        }
+    };
+    for (_, _, decl) in entry.context_decls() {
+        let (self_types, decl_scope): (
+            Vec<crate::ast::declarations::ModuleSelf>,
+            std::borrow::Cow<'_, TypeParamScope>,
+        ) = match decl {
+            ModuleDeclaration::Signature(m) => (
+                m.self_types.clone(),
+                std::borrow::Cow::Owned(decl_param_scope(
+                    &m.type_params,
+                    primary_params,
+                    name,
+                    names,
+                )),
+            ),
+            ModuleDeclaration::Ruby(m) => (m.self_types(), std::borrow::Cow::Borrowed(class_scope)),
+        };
+        for st in self_types
+            .iter()
+            .filter(|st| names.type_name_is_absolute(st.name))
+        {
+            push_unique(mixin_ref(
+                st.name,
+                &st.args,
+                st.source_file,
+                st.location.map(|l| l.range),
                 lowering,
                 env,
-                class_scope,
-            )
-        })
-        .collect();
+                &decl_scope,
+            ));
+        }
+    }
     if resolved.is_empty() {
         vec![MixinRef::bare(names.builtins().object)]
     } else {
         resolved
     }
+}
+
+/// Per-decl scope for lowering a reopen's mixin / self_types args: the
+/// decl's own type-param spelling is alpha-renamed onto the primary
+/// decl's (rbs `ClassEntry#align_params`, applied by
+/// `AncestorBuilder#mixin_ancestors` and `ModuleEntry#self_types`).
+fn decl_param_scope(
+    decl_params: &[AstTypeParam],
+    primary_params: &[AstTypeParam],
+    owner: &TypeName,
+    names: &NameTable,
+) -> TypeParamScope {
+    crate::definition_builder::build_alpha_renamed_param_scope(
+        decl_params,
+        primary_params,
+        owner,
+        names,
+    )
 }
 
 fn mixin_ref(
@@ -1398,6 +1450,7 @@ pub(super) fn mixin_target_exists(env: &Environment, name: TypeName) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn walk_class_mixins(
     entry: &ClassEntry,
+    name: &TypeName,
     lowering: &LoweringEnv<'_>,
     env: &Environment,
     side: Side,
@@ -1406,11 +1459,22 @@ fn walk_class_mixins(
     names: &NameTable,
     misses: &mut FxHashSet<TypeName>,
 ) {
+    let primary_params = primary_signature_class_type_params(entry);
     for (_, _, decl) in entry.context_decls() {
         match decl {
             ClassDeclaration::Signature(c) => {
+                let decl_scope = decl_param_scope(&c.type_params, primary_params, name, names);
                 for member in &c.members {
-                    dispatch_mixin_member(member, lowering, env, side, class_scope, one, misses);
+                    dispatch_mixin_member(
+                        member,
+                        lowering,
+                        env,
+                        side,
+                        &decl_scope,
+                        class_scope,
+                        one,
+                        misses,
+                    );
                 }
             }
             ClassDeclaration::Ruby(c) => {
@@ -1434,6 +1498,7 @@ fn walk_class_mixins(
 #[allow(clippy::too_many_arguments)]
 fn walk_module_mixins(
     entry: &ModuleEntry,
+    name: &TypeName,
     lowering: &LoweringEnv<'_>,
     env: &Environment,
     side: Side,
@@ -1442,11 +1507,22 @@ fn walk_module_mixins(
     names: &NameTable,
     misses: &mut FxHashSet<TypeName>,
 ) {
+    let primary_params = primary_signature_module_type_params(entry);
     for (_, _, decl) in entry.context_decls() {
         match decl {
             ModuleDeclaration::Signature(m) => {
+                let decl_scope = decl_param_scope(&m.type_params, primary_params, name, names);
                 for member in &m.members {
-                    dispatch_mixin_member(member, lowering, env, side, class_scope, one, misses);
+                    dispatch_mixin_member(
+                        member,
+                        lowering,
+                        env,
+                        side,
+                        &decl_scope,
+                        class_scope,
+                        one,
+                        misses,
+                    );
                 }
             }
             ModuleDeclaration::Ruby(m) => {
@@ -1473,11 +1549,21 @@ fn walk_module_mixins(
 /// Prepend now distinct AST variants, the keyword discriminator lives
 /// at the type level and only `(Side, Kind)` filtering remains
 /// inside each bucket function.
+///
+/// `decl_scope` is the per-decl alpha-renamed scope used for `include` /
+/// `prepend` args; `extend` args are lowered under the primary
+/// `class_scope` unchanged because rbs `mixin_ancestors0` applies
+/// `align_params` only to Include / Prepend (`ancestor_builder.rb:363,
+/// 392` vs the bare `member.args` at `:400`) — class type params are
+/// not in scope on the singleton side, so there is nothing to align
+/// (rbs `validate` rejects `extend M[E]` with `NoTypeFoundError`).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_mixin_member<M: AsMember>(
     wrapper: &M,
     lowering: &LoweringEnv<'_>,
     env: &Environment,
     side: Side,
+    decl_scope: &TypeParamScope,
     class_scope: &TypeParamScope,
     one: &mut OneAncestors,
     misses: &mut FxHashSet<TypeName>,
@@ -1497,7 +1583,7 @@ fn dispatch_mixin_member<M: AsMember>(
                 lowering,
                 env,
                 side,
-                class_scope,
+                decl_scope,
                 one,
                 misses,
             );
@@ -1529,7 +1615,7 @@ fn dispatch_mixin_member<M: AsMember>(
                 lowering,
                 env,
                 side,
-                class_scope,
+                decl_scope,
                 one,
                 misses,
             );

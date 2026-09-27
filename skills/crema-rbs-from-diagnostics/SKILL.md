@@ -1,10 +1,10 @@
 ---
-name: rbs-from-diagnostics
+name: crema-rbs-from-diagnostics
 license: MIT
 description: Turn `crema check` diagnostics into RBS signatures for gems that ship none. Ranks unresolved constants by how many NoMethod diagnostics cascade from them, classifies each as stdlib / gem / app, and for one gem per cycle reads the gem source and writes `sig/gem-patch/<gem>/*.rbs` for a human to review. Use when a Ruby project's crema output is dominated by UnknownConstant / NoMethod on gem constants.
 ---
 
-# rbs-from-diagnostics
+# crema-rbs-from-diagnostics
 
 One cycle = one gem. crema reports, the agent reads and writes, a human
 approves. Nothing in this skill infers a type from a name; every concrete

@@ -621,10 +621,13 @@ fn push_ruby_members(
                     continue;
                 }
                 let bucket_name = names.intern_symbol(&def.name);
+                // Same precedence as the signature branch above:
+                // special names first, then the Ruby-side marker the
+                // inline parser folded into `def.visibility`
+                // (`None` = public default).
                 let bucket_visibility = match kind {
-                    BuildSide::Instance => {
-                        special_instance_visibility(&def.name).unwrap_or(Visibility::Public)
-                    }
+                    BuildSide::Instance => special_instance_visibility(&def.name)
+                        .unwrap_or_else(|| Visibility::from_ast_or_default(def.visibility)),
                     BuildSide::Singleton => Visibility::Public,
                 };
                 let is_overloading = def.method_type.overloading() || def.method_type.is_empty();
@@ -646,7 +649,7 @@ fn push_ruby_members(
                         reader_name,
                         None,
                         MemberRef::RubyAttrReader(Arc::clone(&arc)),
-                        Visibility::Public,
+                        Visibility::from_ast_or_default(r.attribute.visibility),
                         origin,
                     );
                 }
@@ -661,7 +664,7 @@ fn push_ruby_members(
                         names.intern_symbol(name),
                         Some(writer_name),
                         MemberRef::RubyAttrWriter(Arc::clone(&arc)),
-                        Visibility::Public,
+                        Visibility::from_ast_or_default(w.attribute.visibility),
                         origin,
                     );
                 }
@@ -677,7 +680,7 @@ fn push_ruby_members(
                         reader_name,
                         Some(writer_name),
                         MemberRef::RubyAttrAccessor(Arc::clone(&arc)),
-                        Visibility::Public,
+                        Visibility::from_ast_or_default(a.attribute.visibility),
                         origin,
                     );
                 }

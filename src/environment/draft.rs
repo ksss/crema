@@ -39,9 +39,9 @@ use crate::environment::extras_state::PathIndexState;
 use crate::environment::frozen::GOverlap;
 use crate::environment::frozen::{
     ClassAliasDeclaration, ClassAliasEntry as FrozenClassAliasEntry, ClassDeclaration, ClassEntry,
-    ClassOrModule, ClassOrModuleAliasEntry, Environment, InterfaceEntry, ModuleAliasDeclaration,
-    ModuleAliasEntry as FrozenModuleAliasEntry, ModuleDeclaration, ModuleEntry,
-    NormalizeModuleNameResult,
+    ClassOrModule, ClassOrModuleAliasEntry, ConcernBlockTargets, Environment, InterfaceEntry,
+    ModuleAliasDeclaration, ModuleAliasEntry as FrozenModuleAliasEntry, ModuleDeclaration,
+    ModuleEntry, NormalizeModuleNameResult,
 };
 use crate::environment::resolution::{self, FlattenedDecls, TypeNameResolver};
 use crate::environment::use_map::UseMap;
@@ -400,6 +400,10 @@ pub struct EnvironmentDraft {
     /// time rather than staying lazy (overlay has no persisted backend to
     /// defer to).
     pub(crate) overlay: Option<Box<FrozenOverlay>>,
+    /// Concern block → targets table handed through to
+    /// [`Environment::concern_block_targets`] verbatim. Written once by
+    /// `infusion_collector::load_collected` (`set_concern_block_targets`).
+    pub(crate) concern_block_targets: FxHashMap<TypeName, Vec<ConcernBlockTargets>>,
 }
 
 /// The six frozen decl maps surviving an [`Environment::unload`] call,
@@ -550,7 +554,19 @@ impl EnvironmentDraft {
             g: None,
             path_index: PathIndexState::default(),
             overlay: None,
+            concern_block_targets: FxHashMap::default(),
         }
+    }
+
+    /// Replace the concern block → targets table (see
+    /// [`Environment::concern_block_targets`]). The infusion pipeline
+    /// computes it in one pass over every concern site, so a whole-table
+    /// set is the natural grain.
+    pub(crate) fn set_concern_block_targets(
+        &mut self,
+        table: FxHashMap<TypeName, Vec<ConcernBlockTargets>>,
+    ) {
+        self.concern_block_targets = table;
     }
 
     /// Record the [`directives`](crate::ast::directives::Directive)
@@ -1087,6 +1103,8 @@ impl EnvironmentDraft {
             // forward — ADR-0028 slice S2's delta path is `unload`-only).
             all_names: _,
             aliases: _,
+            // Concerns are A-layer only; a G snapshot env carries none.
+            concern_block_targets: _,
         } = env;
 
         let mut draft = EnvironmentDraft {
@@ -1105,6 +1123,7 @@ impl EnvironmentDraft {
             g: None,
             path_index: PathIndexState::default(),
             overlay: None,
+            concern_block_targets: FxHashMap::default(),
         };
 
         for (name, com) in class_decls {
@@ -2040,6 +2059,7 @@ impl EnvironmentDraft {
                 path_index: self.path_index,
                 all_names,
                 aliases,
+                concern_block_targets: self.concern_block_targets,
             })
         })();
 

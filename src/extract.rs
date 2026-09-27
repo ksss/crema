@@ -40,11 +40,14 @@
 //!   the env phase, so the query log alone cannot see them). Includes
 //!   implicit dependencies (ancestor chains, alias expansion) that
 //!   never appear as source occurrences — dependency-graph consumers
-//!   must read this, not `method_call`. Strictly "what the *check*
-//!   consulted": extract-mode bookkeeping performs no queries of its
-//!   own, so checking a file with or without extract consults the same
-//!   set (`return_type` is `null` where the check computed no type,
-//!   rather than synthesized).
+//!   must read this, not `method_call`. Also merges the resolved
+//!   `symbol` of every `constant` site, since the query log records a
+//!   constant lookup by its unresolved name and cannot name what it
+//!   resolved to (a `class Sub < Base` would otherwise lose `::Base`).
+//!   Strictly "what the *check* consulted": extract-mode bookkeeping
+//!   performs no queries of its own, so checking a file with or without
+//!   extract consults the same set (`return_type` is `null` where the
+//!   check computed no type, rather than synthesized).
 //!
 //! Global variables (`$foo`) are intentionally absent from v1 output:
 //! every emitted symbol is absolute (`::`-prefixed) rbs syntax, and
@@ -342,12 +345,16 @@ impl ExtractSitesCollector {
 }
 
 /// Project one file's consulted inputs onto absolute rbs symbol
-/// strings: sorted, deduped, internal enum vocabulary erased. Two
+/// strings: sorted, deduped, internal enum vocabulary erased. Three
 /// sources merge here: the pre-projection [`ConsultedKey`] entries
-/// (the u64 cache projection would have dropped the names) and
+/// (the u64 cache projection would have dropped the names),
 /// `signature_types` — the types the file's def signatures reference,
 /// which the log cannot see because annotation lowering resolved them
-/// during the env phase.
+/// during the env phase — and the resolved `symbol` of each
+/// [`ConstantRecord`], because `ConstantResolution` keys carry the
+/// unresolved name only (the resolved TypeName reached the log solely
+/// as a side effect of the deprecation check, which the superclass
+/// path never runs).
 ///
 /// Misses are included alongside hits — a query that came back empty
 /// is still a dependency of this file's diagnostics (the same negative
@@ -363,12 +370,14 @@ impl ExtractSitesCollector {
 pub fn consulted_symbols(
     entries: &FxHashMap<ConsultedKey, bool>,
     signature_types: &[TypeName],
+    constant: &[ConstantRecord],
     names: &NameTable,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for tn in signature_types {
         out.push(names.display_type_name(*tn));
     }
+    out.extend(constant.iter().filter_map(|c| c.symbol.clone()));
     let type_name = |n: TypeName| names.display_type_name(n);
     let qualified = |n: TypeName, separator: &str, m: crate::name::Symbol| {
         format!(
@@ -434,6 +443,8 @@ pub fn consulted_symbols(
                     out.push(type_name(*n));
                 }
             }
+            ConcernBlockTargets { concern, .. } => out.push(type_name(*concern)),
+
             ConstantResolution { context, .. } => {
                 for scope in context.scopes() {
                     out.push(type_name(*scope));

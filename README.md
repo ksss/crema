@@ -291,29 +291,33 @@ agent a crema workflow. They are versioned with the binary because they
 read its JSONL output, so replace `vX.Y.Z` below with the tag of the binary
 you installed.
 
-- `rbs-from-diagnostics` — turn `crema check` output into
+- `crema-rbs-from-diagnostics` — turn `crema check` output into
   `sig/gem-patch/<gem>/*.rbs` for gems that ship no RBS, one gem per
   cycle, ranked by how many NoMethod diagnostics cascade from each
-  unresolved constant. See `skills/rbs-from-diagnostics/SKILL.md`.
+  unresolved constant. See `skills/crema-rbs-from-diagnostics/SKILL.md`.
+- `crema-reduce-diagnostics` — shrink a committed `crema check --tamp` baseline
+  one diagnostic code and a few files per cycle, diffing the baseline by
+  fingerprint after every edit so removed, surfaced and introduced records
+  are told apart. See `skills/crema-reduce-diagnostics/SKILL.md`.
 
 Install with the GitHub CLI (preferred; `gh skill` is in preview):
 
 ```sh
-gh skill install ksss/crema rbs-from-diagnostics@vX.Y.Z --agent claude-code
+gh skill install ksss/crema crema-rbs-from-diagnostics@vX.Y.Z --agent claude-code
 ```
 
 or with the `skills` CLI:
 
 ```sh
-npx skills add ksss/crema --skill rbs-from-diagnostics
+npx skills add ksss/crema --skill crema-rbs-from-diagnostics
 ```
 
 or copy the directory into your agent's skill location by hand, for
-example `.claude/skills/rbs-from-diagnostics/` for Claude Code:
+example `.claude/skills/crema-rbs-from-diagnostics/` for Claude Code:
 
 ```sh
 git clone --depth 1 --branch vX.Y.Z https://github.com/ksss/crema.git /tmp/crema
-cp -r /tmp/crema/skills/rbs-from-diagnostics .claude/skills/
+cp -r /tmp/crema/skills/crema-rbs-from-diagnostics .claude/skills/
 ```
 
 ## Development

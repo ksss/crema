@@ -523,6 +523,26 @@ impl Method {
     }
 }
 
+/// `%a{crema:method_missing}` — stamped by infusion synthesis on a
+/// singleton method that only exists at runtime through
+/// `method_missing` (ActionMailer actions). Ruby resolves such a call
+/// *after* the whole singleton ancestry, so the definition builder
+/// drops the stamped member whenever an ancestor defines the name for
+/// real (`DefinitionBuilder::drop_method_missing_members_shadowed_by_ancestors`).
+/// An rbs annotation is used rather than a new `TypeDef` field so the
+/// rbs mirror shapes stay untouched; the marker rides
+/// `Method::annotations` like `%a{deprecated}` does.
+pub const METHOD_MISSING_ANNOTATION: &str = "crema:method_missing";
+
+pub fn has_method_missing_annotation(
+    annotations: &[Annotation],
+    names: &crate::name::NameTable,
+) -> bool {
+    annotations
+        .iter()
+        .any(|a| names.resolve(a.string) == METHOD_MISSING_ANNOTATION)
+}
+
 /// Scan `annotations` for the first entry matching `%a{deprecated}`
 /// or `%a{deprecated: <message>}` and return its optional message
 /// trailer. `None` when nothing matches; `Some(None)` for the bare

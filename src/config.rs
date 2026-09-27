@@ -114,6 +114,8 @@ pub struct InfusionTable {
     pub active_decorator: Option<ActiveDecoratorInfusionTable>,
     #[serde(default)]
     pub paranoia: Option<ParanoiaInfusionTable>,
+    #[serde(default)]
+    pub sidekiq: Option<SidekiqInfusionTable>,
 }
 
 /// `[infusion.rails]` table shape. Held as a sub-table (not a scalar bool)
@@ -214,6 +216,18 @@ pub struct ParanoiaInfusionTable {
     pub enabled: bool,
 }
 
+/// `[infusion.sidekiq]` table shape. The
+/// [sidekiq](https://github.com/sidekiq/sidekiq) gem's `include
+/// Sidekiq::Job` wiring has no per-class options, so the table carries
+/// only the opt-in switch. Independent of the rails preset: the
+/// synthesized mixins reference only the gem's own collection types.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SidekiqInfusionTable {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Resolved view of `[infusion]`. Plain `Copy` bool fields so the
 /// infusion collector can take it by value without lifetime entanglements.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -225,6 +239,8 @@ pub struct InfusionOptions {
     /// rails preset — the standalone combination is rejected at config
     /// resolution (`ConfigError::InvalidParanoia`).
     pub paranoia: bool,
+    /// `[infusion.sidekiq] enabled = true`.
+    pub sidekiq: bool,
 }
 
 impl InfusionOptions {
@@ -694,12 +710,18 @@ impl Config {
                     .to_string(),
             ));
         }
+        let sidekiq_infusion = file
+            .infusion
+            .as_ref()
+            .and_then(|d| d.sidekiq.as_ref())
+            .is_some_and(|t| t.enabled);
         let config_infusion = file.infusion.and_then(|d| d.config);
         let infusion = InfusionOptions {
             activesupport: rails_infusion,
             activemodel: rails_infusion,
             activerecord: rails_infusion,
             paranoia: paranoia_infusion,
+            sidekiq: sidekiq_infusion,
         };
         Ok((
             ResolvedConfig {

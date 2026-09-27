@@ -920,6 +920,30 @@ impl Block {
             FunctionType::Untyped(_) => &[],
         }
     }
+
+    /// Required then optional positional types, flattened in declaration
+    /// order — the slots a block's leading params zip against (Steep
+    /// `Function#flat_unnamed_params`). Trailing positionals are not
+    /// included, matching Steep.
+    pub fn flat_positionals(&self) -> Vec<Ty> {
+        match &self.type_ {
+            FunctionType::Typed(f) => f
+                .required_positionals
+                .iter()
+                .chain(f.optional_positionals.iter())
+                .copied()
+                .collect(),
+            FunctionType::Untyped(_) => vec![],
+        }
+    }
+
+    /// The `*rest` positional type of the block, if declared.
+    pub fn rest_positional(&self) -> Option<Ty> {
+        match &self.type_ {
+            FunctionType::Typed(f) => f.rest_positional,
+            FunctionType::Untyped(_) => None,
+        }
+    }
 }
 
 /// A method overload type. Mirrors `RBS::MethodType` (which holds
@@ -1009,6 +1033,19 @@ impl MethodType {
 
     pub fn rest_keyword(&self) -> Option<Ty> {
         self.func().and_then(|f| f.rest_keyword)
+    }
+
+    /// Expected type for the keyword argument `name`: a required
+    /// keyword, then an optional one, then `**rest`. `None` means the
+    /// overload has no home for it (Steep `KeywordArgs#keyword_type`
+    /// followed by `rest_type`).
+    pub fn keyword_param_type(&self, name: &str) -> Option<Ty> {
+        self.required_keywords()
+            .iter()
+            .chain(self.optional_keywords())
+            .find(|(param, _)| param == name)
+            .map(|(_, ty)| *ty)
+            .or(self.rest_keyword())
     }
 
     /// Minimum positional arguments required. Always 0 for UntypedFunction.

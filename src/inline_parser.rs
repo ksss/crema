@@ -7,7 +7,6 @@ use ruby_prism::{
     SingletonClassNode, Visit,
 };
 
-use crate::ast::MethodKind;
 use crate::ast::method_type::MethodType as AstMethodType;
 use crate::ast::ruby::annotations::{
     ColonMethodTypeAnnotation, LeadingAnnotation, TypeApplicationAnnotation,
@@ -29,6 +28,7 @@ use crate::ast::types::{
     BaseType, BaseTypeKind, Function, FunctionParam, FunctionType, KeywordParam, Literal,
     LiteralType, RecordField, RecordKey, RecordType, TupleType, Type, UnionType,
 };
+use crate::ast::{MethodKind, Visibility};
 use crate::ast_builder;
 use crate::class_new_recognizer::class_dot_new_call;
 use crate::data_struct_recognizer::{DataStructConstructionKind, data_struct_construction_kind};
@@ -109,6 +109,14 @@ struct InlineCollector<'a> {
     /// or module). Populated by [`attach_declaration`] when
     /// `scope_stack` is empty.
     top_level: Vec<Declaration>,
+    /// Top-level `def name` (no receiver, no enclosing class / module)
+    /// collected in inline mode. Ruby defines these as private instance
+    /// methods of `Object`, so [`finish_object_reopen`] folds them into
+    /// one synthetic `class Object` reopen appended to `top_level`.
+    /// Intentional divergence from rbs `RBS::InlineParser`, which
+    /// rejects them with `TopLevelMethodDefinition` (see
+    /// specs/inline.md "既知の意図的乖離").
+    object_members: Vec<Member>,
     /// One entry per currently-open class / module, storing the
     /// in-progress `members: Vec<Member>` of that declaration. Empty
     /// between top-level siblings.
@@ -118,12 +126,60 @@ struct InlineCollector<'a> {
     diagnostics: Vec<Diagnostic>,
     associated_leading_lines: FxHashSet<usize>,
     singleton_class_depth: usize,
+    /// One entry per `scope_stack` frame (pushed / popped at the same
+    /// three sites). Tracks the Ruby-side `private` / `public` state of
+    /// that class body — a crema extension over the rbs inline contract,
+    /// see [`DefMember::visibility`].
+    visibility_frames: Vec<VisibilityFrame>,
+    /// Explicit modifier being applied to the argument currently under
+    /// visit (`private def x`, `private attr_reader :x`). Set by
+    /// [`collect_visibility_call`] around the argument visit only, and
+    /// consumed by `visit_def_node` / `collect_attr_call`.
+    pending_explicit_visibility: Option<Visibility>,
     /// `--inline=true` scan. Gates diagnostics that mirror rbs's
     /// `RBS::InlineParser` restrictions (e.g. `TopLevelMethodDefinition`,
     /// `rbs/lib/rbs/inline_parser.rb:236`) — those are inline-mode
     /// restrictions upstream and must not surface when the collector is
     /// only harvesting skeleton for the sig-mode pipeline.
     inline_mode: bool,
+}
+
+/// Ruby-side visibility state of one open class / module body.
+///
+/// `ambient` is the default set by a bare `private` / `public` /
+/// `protected` statement (`None` until one appears; a fresh frame per
+/// `class` keyword, so reopening resets it like Ruby does).
+/// `direct_statement_starts` holds the start offsets of the body's
+/// top-level statements: a visibility call only counts when it is one
+/// of them, so `if cond; private; end` (not statically decidable) is
+/// ignored and stays on the public side.
+struct VisibilityFrame {
+    ambient: Option<Visibility>,
+    direct_statement_starts: FxHashSet<u32>,
+}
+
+impl VisibilityFrame {
+    fn new(body: Option<Node<'_>>) -> Self {
+        // A body with `rescue` / `ensure` clauses parses as a BeginNode
+        // wrapping the statements; its main statements are still direct
+        // children of the class body in Ruby's eyes.
+        let statements = body.and_then(|body| {
+            body.as_statements_node()
+                .or_else(|| body.as_begin_node().and_then(|b| b.statements()))
+        });
+        let direct_statement_starts = statements
+            .map(|s| {
+                s.body()
+                    .iter()
+                    .map(|stmt| stmt.location().start_offset() as u32)
+                    .collect()
+            })
+            .unwrap_or_default();
+        VisibilityFrame {
+            ambient: None,
+            direct_statement_starts,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -203,10 +259,13 @@ impl<'a> InlineCollector<'a> {
             cref_stack: vec![],
             cref_scope_frames: vec![],
             top_level: vec![],
+            object_members: vec![],
             scope_stack: vec![],
             diagnostics: vec![],
             associated_leading_lines: FxHashSet::default(),
             singleton_class_depth: 0,
+            visibility_frames: vec![],
+            pending_explicit_visibility: None,
             inline_mode,
         }
     }
@@ -247,6 +306,32 @@ impl<'a> InlineCollector<'a> {
             Some(&frame) => self.scope_stack[frame].push(Member::Declaration(decl)),
             None => self.top_level.push(decl),
         }
+    }
+
+    /// Wrap the collected top-level defs ([`object_members`]) into a
+    /// synthetic `::Object` reopen and attach it to `top_level`. The
+    /// decl is `block_body: true` because a top-level def's cref is the
+    /// top level, not `Object` — its annotations must resolve in the
+    /// enclosing (root) context exactly like a `Class.new do` body.
+    /// `name_location` points at the first def's name: the reopen has
+    /// no `class` keyword of its own to anchor to.
+    fn finish_object_reopen(&mut self) {
+        if self.object_members.is_empty() {
+            return;
+        }
+        let mut members = std::mem::take(&mut self.object_members);
+        members.sort_by_key(Member::location_start);
+        let name_location = match &members[0] {
+            Member::Def(def) => def.name_location,
+            _ => unreachable!("object_members only holds Member::Def"),
+        };
+        self.top_level.push(Declaration::Class(Arc::new(ClassDecl {
+            class_name: self.names.parse_type_name("::Object"),
+            name_location,
+            super_class: None,
+            members,
+            block_body: true,
+        })));
     }
 
     /// Build an absolute class-kind [`TypeName`] for the currently-open
@@ -344,6 +429,7 @@ impl<'a> InlineCollector<'a> {
             };
 
         let attribute = AttributeMember {
+            visibility: self.effective_instance_visibility(),
             location: byte_range,
             name_nodes,
             type_text,
@@ -364,6 +450,101 @@ impl<'a> InlineCollector<'a> {
         };
         self.push_member(member);
         true
+    }
+
+    /// Visibility an instance-side def / attr pushed right now should
+    /// carry: an explicit modifier under visit wins over the frame's
+    /// ambient marker; `None` when neither applies.
+    fn effective_instance_visibility(&self) -> Option<Visibility> {
+        self.pending_explicit_visibility
+            .or_else(|| self.visibility_frames.last().and_then(|f| f.ambient))
+    }
+
+    /// Recognize a receiver-less `private` / `public` / `protected`
+    /// statement written directly in the open class body and fold it
+    /// into Ruby-side member visibility (crema extension; rbs inline
+    /// does not model visibility). Returns `false` to let the default
+    /// visitor handle anything else (including the same calls nested in
+    /// `if` / `begin`, inside `class << self`, or at the top level).
+    ///
+    /// `protected` is folded to `Public`: crema's `Visibility` has no
+    /// protected state, and reporting a protected method as private
+    /// would flag legitimate same-class explicit-receiver calls.
+    ///
+    /// Forms handled: bare (sets the ambient default for the rest of
+    /// the body), `X def name` / `X attr_* :name` (modifier on the
+    /// argument), and `X :a, :b` (retroactive on already-collected
+    /// instance defs / single-name attrs). Anything else — `module_function`,
+    /// `private_class_method`, array or string arguments, unknown names —
+    /// is left alone, i.e. stays public.
+    fn collect_visibility_call(&mut self, node: &CallNode<'_>) -> bool {
+        let marker = match node.name().as_slice() {
+            b"private" => Visibility::Private,
+            b"public" | b"protected" => Visibility::Public,
+            _ => return false,
+        };
+        if node.receiver().is_some() || self.class_stack.is_empty() || self.in_singleton_class() {
+            return false;
+        }
+        let Some(frame) = self.visibility_frames.last() else {
+            return false;
+        };
+        if !frame
+            .direct_statement_starts
+            .contains(&(node.location().start_offset() as u32))
+        {
+            return false;
+        }
+
+        let Some(arguments) = node.arguments() else {
+            self.visibility_frames.last_mut().unwrap().ambient = Some(marker);
+            self.mark_enclosed_leading_lines(node.location());
+            return true;
+        };
+        for arg in arguments.arguments().iter() {
+            if let Some(sym) = arg.as_symbol_node() {
+                let name = String::from_utf8_lossy(sym.unescaped()).to_string();
+                self.apply_retroactive_visibility(&name, marker);
+            } else if arg.as_def_node().is_some() || is_attr_call(&arg) {
+                let saved = self.pending_explicit_visibility.replace(marker);
+                self.visit(&arg);
+                self.pending_explicit_visibility = saved;
+            } else {
+                self.visit(&arg);
+            }
+        }
+        true
+    }
+
+    /// `private :name` after the fact: rewrite the visibility of the
+    /// matching instance def / attr already collected in the open body.
+    /// Attr writers match on `name=`; multi-name attrs (`attr_reader :a,
+    /// :b` then `private :a`) and accessors (`private :x` privatizes only
+    /// the reader in Ruby, but the member carries one visibility for
+    /// both) are left public rather than over-privatized. Unknown names
+    /// are ignored.
+    fn apply_retroactive_visibility(&mut self, name: &str, marker: Visibility) {
+        let Some(members) = self.scope_stack.last_mut() else {
+            return;
+        };
+        for member in members.iter_mut() {
+            match member {
+                Member::Def(def) if def.kind == MethodKind::Instance && def.name == name => {
+                    def.visibility = Some(marker);
+                }
+                Member::AttrReader(r) if single_attr_name(&r.attribute) == Some(name) => {
+                    r.attribute.visibility = Some(marker);
+                }
+                Member::AttrWriter(w)
+                    if name
+                        .strip_suffix('=')
+                        .is_some_and(|base| single_attr_name(&w.attribute) == Some(base)) =>
+                {
+                    w.attribute.visibility = Some(marker);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn collect_mixin_call(&mut self, node: &CallNode<'_>) -> bool {
@@ -615,6 +796,7 @@ impl<'a> InlineCollector<'a> {
                 .and_then(|text| ast_builder::parse_trailing_type_text(text, self.names))
                 .unwrap_or_else(untyped_ast_type);
             let attribute = AttributeMember {
+                visibility: None,
                 location: prism_location_range(arg.location()),
                 name_nodes: vec![AttributeNameNode {
                     name: name.clone(),
@@ -813,6 +995,8 @@ impl<'a> InlineCollector<'a> {
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
         self.scope_stack.push(Vec::new());
+        self.visibility_frames
+            .push(VisibilityFrame::new(block_node.body()));
 
         if let Some(body) = block_node.body() {
             self.visit(&body);
@@ -820,6 +1004,7 @@ impl<'a> InlineCollector<'a> {
         self.collect_enclosed_instance_variable_members(call.location());
 
         let members = self.scope_stack.pop().unwrap();
+        self.visibility_frames.pop();
         self.singleton_class_depth = saved_singleton_class_depth;
         self.class_stack.pop();
         members
@@ -988,19 +1173,19 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
                 Some(self.names.resolve(data_struct.super_class_name))
             } else if let Some(constant) = super_node.as_constant_read_node() {
                 Some(String::from_utf8_lossy(constant.name().as_slice()).to_string())
-            } else if let Some(path) = super_node.as_constant_path_node() {
-                match static_constant_path_string(&path) {
-                    Some(s) => Some(s),
-                    None => {
-                        self.diagnostics
-                            .push(self.non_constant_super_class_diagnostic(&super_node));
-                        None
-                    }
-                }
             } else {
-                self.diagnostics
-                    .push(self.non_constant_super_class_diagnostic(&super_node));
-                None
+                let static_path = super_node
+                    .as_constant_path_node()
+                    .and_then(|path| static_constant_path_string(&path));
+                // Inline-mode-only (rbs `RBS::InlineParser` parity): in
+                // sig mode the RBS declaration decides the superclass, so
+                // a dynamic Ruby-side expression (`ActiveType::Record[User]`)
+                // is not an error and drops silently.
+                if static_path.is_none() && self.inline_mode {
+                    self.diagnostics
+                        .push(self.non_constant_super_class_diagnostic(&super_node));
+                }
+                static_path
             };
             if name.is_some() && data_struct_super.is_none() {
                 let loc = super_node.location();
@@ -1035,10 +1220,13 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
         self.scope_stack.push(Vec::new());
+        self.visibility_frames
+            .push(VisibilityFrame::new(node.body()));
         self.cref_scope_frames.push(self.scope_stack.len() - 1);
         ruby_prism::visit_class_node(self, node);
         self.collect_enclosed_instance_variable_members(node.location());
         let mut members = self.scope_stack.pop().unwrap();
+        self.visibility_frames.pop();
         self.cref_scope_frames.pop();
         self.singleton_class_depth = saved_singleton_class_depth;
         members.sort_by_key(Member::location_start);
@@ -1092,11 +1280,14 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
         self.scope_stack.push(Vec::new());
+        self.visibility_frames
+            .push(VisibilityFrame::new(node.body()));
         self.cref_scope_frames.push(self.scope_stack.len() - 1);
         self.collect_leading_module_self_members(module_start_line);
         ruby_prism::visit_module_node(self, node);
         self.collect_enclosed_instance_variable_members(node.location());
         let mut members = self.scope_stack.pop().unwrap();
+        self.visibility_frames.pop();
         self.cref_scope_frames.pop();
         self.singleton_class_depth = saved_singleton_class_depth;
         members.sort_by_key(Member::location_start);
@@ -1136,14 +1327,16 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             (false, None) => MethodKind::Instance,
         };
 
-        // Top-level def is dropped — parity with the pre-Phase-5 flat
-        // collector, which also skipped when no enclosing class was open.
-        // The `TopLevelMethodDefinition` diagnostic is inline-mode only
-        // (rbs `RBS::InlineParser` emits it for annotation-attach failure);
-        // in sig mode the top-level def is Ruby-semantically `Object#name`
-        // and the type checker binds it against `::Object` in
-        // `lookup_method_target`.
-        if self.class_stack.is_empty() {
+        // Top-level `def name` in inline mode is collected as a private
+        // `::Object` instance method (Ruby semantics; see
+        // `object_members`). Everything else at the top level is
+        // dropped: `def self.name` is a singleton method of `main` that
+        // RBS cannot represent, so inline mode reports
+        // `TopLevelMethodDefinition` (rbs `RBS::InlineParser` parity);
+        // sig mode drops silently and the type checker binds the def
+        // against the `::Object` sig in `lookup_method_target`.
+        let top_level = self.class_stack.is_empty();
+        if top_level && !(self.inline_mode && kind == MethodKind::Instance) {
             let def_start_line = self.line_index.line(node.location().start_offset());
             let leading_comment = collect_consecutive_leading(self.comments, def_start_line);
             self.report_unused_comment_block(leading_comment.as_ref());
@@ -1208,14 +1401,31 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         // Instance-side `initialize` bodies get one extra shallow scan for
         // `@ivar = param` facts (Sorbet-style instance variable inference,
         // crema extension over the rbs skeleton contract). Every other def
-        // keeps the body un-walked.
-        let ivar_param_pairs = if kind == MethodKind::Instance && name == "initialize" {
+        // keeps the body un-walked. A top-level `def initialize` is never
+        // called as a constructor, and synthesizing ivars onto `::Object`
+        // would leak them into every class, so it stays empty.
+        let ivar_param_pairs = if kind == MethodKind::Instance && name == "initialize" && !top_level
+        {
             collect_initialize_ivar_param_pairs(node)
         } else {
             Vec::new()
         };
 
-        self.push_member(Member::Def(DefMember {
+        let visibility = if top_level {
+            // Top-level defs are always private on `Object`. A bare
+            // `public` at the top level is not interpreted.
+            Some(Visibility::Private)
+        } else if kind == MethodKind::Instance {
+            self.effective_instance_visibility()
+        } else {
+            // Ruby's `private` never reaches `def self.x` (the modifier
+            // form receives the *instance* method name `:x`), so the
+            // singleton side carries no Ruby-derived visibility.
+            None
+        };
+
+        let member = Member::Def(DefMember {
+            visibility,
             name,
             kind,
             location,
@@ -1225,7 +1435,12 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             origin: DefMemberOrigin::Real,
             source_file: self.file_name(),
             ivar_param_pairs,
-        }));
+        });
+        if top_level {
+            self.object_members.push(member);
+        } else {
+            self.push_member(member);
+        }
 
         // Don't recurse into def body — not needed for skeleton extraction
     }
@@ -1241,6 +1456,9 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         }
         if self.collect_attr_call(node) || self.collect_mixin_call(node) {
             self.mark_enclosed_leading_lines(node.location());
+            return;
+        }
+        if self.collect_visibility_call(node) {
             return;
         }
         ruby_prism::visit_call_node(self, node);
@@ -1821,6 +2039,7 @@ pub fn collect_inline_declarations(
     let mut collector =
         InlineCollector::new(source, line_index, file, &comments, names, inline_mode);
     collector.visit(&root);
+    collector.finish_object_reopen();
     (collector.top_level, collector.diagnostics)
 }
 
@@ -2034,6 +2253,7 @@ fn generated_def(
         })
         .collect();
     Member::Def(DefMember {
+        visibility: None,
         ivar_param_pairs: Vec::new(),
         name: name.to_string(),
         kind,
@@ -2257,6 +2477,23 @@ fn collect_initialize_ivar_param_pairs(node: &DefNode<'_>) -> Vec<InitializeIvar
         });
     }
     pairs
+}
+
+fn is_attr_call(node: &Node<'_>) -> bool {
+    node.as_call_node().is_some_and(|call| {
+        call.receiver().is_none()
+            && matches!(
+                call.name().as_slice(),
+                b"attr_reader" | b"attr_writer" | b"attr_accessor"
+            )
+    })
+}
+
+fn single_attr_name(attr: &AttributeMember) -> Option<&str> {
+    match attr.name_nodes.as_slice() {
+        [only] => Some(only.name.as_str()),
+        _ => None,
+    }
 }
 
 pub(crate) fn prism_location_range(location: ruby_prism::Location<'_>) -> PrismByteRange {

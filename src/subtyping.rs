@@ -935,7 +935,8 @@ impl<'a> SubtypeChecker<'a> {
     ///   arm without the substitution). `self→sub` is not correct for
     ///   block param position — see `check_block_params`
     /// - Return type: **covariant** (sub_return <: iface_return)
-    /// - Parameters: **contravariant** (iface_param <: sub_param), checked
+    /// - Parameters: **contravariant** (iface_param <: sub_param), skipped
+    ///   entirely when either side is `(?) -> T` (untyped function), checked
     ///   against `iface_ol_for_params` (self→sub) rather than `iface_ol`
     ///   (self→iface_ty) — see `check_interface_conformance`
     fn check_overload_compatibility(
@@ -950,6 +951,15 @@ impl<'a> SubtypeChecker<'a> {
 
         if !self.check(sub_ol.return_type(), iface_ol.return_type()) {
             return false;
+        }
+
+        // `(?) -> T` on either side: params are not checked, only the
+        // return type (and block) — Steep `check_function` compares
+        // params only when both sides have them; same rule as
+        // `check_proc`. Not `max_arity() == None`, which a typed rest
+        // positional also returns.
+        if sub_ol.is_untyped_function() || iface_ol.is_untyped_function() {
+            return true;
         }
 
         if !self.check_positional_params(sub_ol, iface_ol_for_params) {
