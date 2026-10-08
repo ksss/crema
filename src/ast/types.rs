@@ -39,7 +39,7 @@ pub mod substitution;
 /// roles, but with relative-or-absolute [`TypeName`] in place of resolved
 /// `Name`, owned recursion (`Box<Type>` / `Vec<Type>`) in place of interned
 /// `Ty`, and per-node `location` mirroring rbs's type-node location pattern.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Base(BaseType),
     Variable(VariableType),
@@ -57,14 +57,14 @@ pub enum Type {
 }
 
 /// `RBS::Types::Bases::*` — the nine base types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BaseType {
     pub kind: BaseTypeKind,
     pub location: Option<LocationRange>,
 }
 
 /// Variants of [`BaseType`], mirroring `RBS::Types::Bases::*`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BaseTypeKind {
     Bool,
     Void,
@@ -91,7 +91,7 @@ pub enum BaseTypeKind {
 /// boundary: the parser marks the node as a variable when it can (e.g.
 /// inside a generic parameter list), and the resolver reclassifies
 /// otherwise-ambiguous `ClassInstance` nodes against the enclosing scope.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VariableType {
     pub name: Symbol,
     pub location: Option<LocationRange>,
@@ -103,7 +103,7 @@ pub struct VariableType {
 /// populated by the AST builder from the FFI layer. The resolved
 /// `Type::ClassSingleton` drops args (singleton types are not parameterised
 /// at the type-checker level).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClassSingletonType {
     pub name: TypeName,
     pub args: Vec<Type>,
@@ -111,7 +111,7 @@ pub struct ClassSingletonType {
 }
 
 /// `RBS::Types::Interface` — `_ToStr`, `_Each[String, void]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceType {
     pub name: TypeName,
     pub args: Vec<Type>,
@@ -119,7 +119,7 @@ pub struct InterfaceType {
 }
 
 /// `RBS::Types::ClassInstance` — `Array`, `Array[Integer]`, `::Foo::Bar[T]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClassInstanceType {
     pub name: TypeName,
     pub args: Vec<Type>,
@@ -127,7 +127,7 @@ pub struct ClassInstanceType {
 }
 
 /// `RBS::Types::Alias` — `int`, `array[String]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AliasType {
     pub name: TypeName,
     pub args: Vec<Type>,
@@ -135,35 +135,35 @@ pub struct AliasType {
 }
 
 /// `RBS::Types::Tuple` — fixed-length heterogeneous array `[A, B, C]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TupleType {
     pub types: Vec<Type>,
     pub location: Option<LocationRange>,
 }
 
 /// `RBS::Types::Record` — `{ foo: A, ?bar: B, "baz" => C }`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RecordType {
     pub fields: Vec<RecordField>,
     pub location: Option<LocationRange>,
 }
 
 /// `RBS::Types::Optional` — `A?` (syntactic sugar for `A | nil`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct OptionalType {
     pub ty: Box<Type>,
     pub location: Option<LocationRange>,
 }
 
 /// `RBS::Types::Union` — `A | B | ...`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UnionType {
     pub types: Vec<Type>,
     pub location: Option<LocationRange>,
 }
 
 /// `RBS::Types::Intersection` — `A & B & ...`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct IntersectionType {
     pub types: Vec<Type>,
     pub location: Option<LocationRange>,
@@ -171,7 +171,7 @@ pub struct IntersectionType {
 
 /// `RBS::Types::Proc` — `^(A) -> B`, optionally with `[self: T]` binding
 /// and a trailing block.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ProcType {
     pub function: Function,
     pub block: Option<BlockType>,
@@ -180,7 +180,7 @@ pub struct ProcType {
 }
 
 /// `RBS::Types::Literal` — `1`, `"hello"`, `:sym`, `true`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LiteralType {
     pub literal: Literal,
     pub location: Option<LocationRange>,
@@ -191,7 +191,7 @@ pub struct LiteralType {
 /// converts variant-for-variant.
 ///
 /// Mirrors `rbs Rust` `ast::types::Literal`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Literal {
     Integer(String),
     String(String),
@@ -200,7 +200,9 @@ pub enum Literal {
 }
 
 /// Mirrors `rbs Rust` `ast::types::RecordKey`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum RecordKey {
     Symbol(Symbol),
     String(String),
@@ -209,7 +211,7 @@ pub enum RecordKey {
 }
 
 /// `RBS::Types::Record::Field` — one entry in a record type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RecordField {
     pub key: RecordKey,
     pub ty: Type,
@@ -217,14 +219,14 @@ pub struct RecordField {
 }
 
 /// `RBS::Types::Function | RBS::Types::UntypedFunction`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Function {
     Typed(FunctionType),
     Untyped(UntypedFunctionType),
 }
 
 /// `RBS::Types::Function` — the full parameter layout plus a return type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FunctionType {
     pub required_positionals: Vec<FunctionParam>,
     pub optional_positionals: Vec<FunctionParam>,
@@ -237,7 +239,7 @@ pub struct FunctionType {
 }
 
 /// `RBS::Types::Function::Param` — a positional parameter with optional name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FunctionParam {
     pub ty: Box<Type>,
     pub name: Option<Symbol>,
@@ -245,14 +247,14 @@ pub struct FunctionParam {
 }
 
 /// `RBS::Types::Function::KeywordParam` — a keyword parameter with name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct KeywordParam {
     pub name: Symbol,
     pub param: FunctionParam,
 }
 
 /// `RBS::Types::UntypedFunction` — `(?) -> T`, accepts any arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UntypedFunctionType {
     pub return_type: Box<Type>,
 }
@@ -261,7 +263,7 @@ pub struct UntypedFunctionType {
 ///
 /// `required = false` corresponds to the `?{ ... }` form.
 /// `self_type` is the `[self: T]` binding when present.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BlockType {
     pub required: bool,
     pub function: Function,

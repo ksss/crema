@@ -182,7 +182,10 @@ fn alias_map(draft: &EnvironmentDraft) -> AliasMap {
                     ModuleAliasDeclaration::Ruby(_) => continue,
                 },
             };
-            aliases.insert(*name, (names.resolve(old_name), Arc::clone(context)));
+            aliases.insert(
+                *name,
+                (names.display_type_name(old_name), Arc::clone(context)),
+            );
         }
     }
     aliases
@@ -205,10 +208,16 @@ fn collect_nested_alias(
 ) {
     match decl {
         Declaration::ClassAlias(a) => {
-            aliases.insert(a.new_name, (names.resolve(a.old_name), Arc::clone(context)));
+            aliases.insert(
+                a.new_name,
+                (names.display_type_name(a.old_name), Arc::clone(context)),
+            );
         }
         Declaration::ModuleAlias(a) => {
-            aliases.insert(a.new_name, (names.resolve(a.old_name), Arc::clone(context)));
+            aliases.insert(
+                a.new_name,
+                (names.display_type_name(a.old_name), Arc::clone(context)),
+            );
         }
         Declaration::Class(c) => {
             let inner = nested_context(context, c.name);

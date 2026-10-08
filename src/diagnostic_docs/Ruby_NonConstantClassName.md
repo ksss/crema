@@ -6,6 +6,8 @@ A class declaration name contains a dynamic expression instead of a constant pat
 ## Trigger
 The inline parser cannot convert the Ruby class name node into a static RBS type name.
 
+Reported only in inline mode (`inline = true`). Sig mode reads no declarations from Ruby files, so it does not report this.
+
 ## Example
 ```ruby
 class factory.call::User

@@ -43,25 +43,8 @@ impl<'env> TypeChecker<'env> {
                 .then_some(first)
         });
 
-        let loc = self.offset_to_location(node.location().start_offset());
-        let class_name = self
-            .ctx
-            .current_class_typename()
-            .map(|tn| self.env.names().resolve(tn))
-            .unwrap_or_else(|| "(top)".to_string());
-        let separator = if is_singleton { "." } else { "#" };
         if let Some(ref mt) = method_type {
             self.record_extract_signature_types(mt);
-            let sig = self.display_method_type(mt);
-            self.verbose_log(format_args!(
-                "{}:{} def {}{}{}: {}",
-                loc.range.start_byte, loc.range.end_byte, class_name, separator, method_name, sig
-            ));
-        } else {
-            self.verbose_log(format_args!(
-                "{}:{} def {}{}{} — RBS: not found",
-                loc.range.start_byte, loc.range.end_byte, class_name, separator, method_name
-            ));
         }
 
         // `def self.x` inside a `[self: T]` block defines a singleton method
@@ -310,6 +293,27 @@ impl<'env> TypeChecker<'env> {
                     self.ctx.set_local_variable(name, ty);
                 }
             }
+        }
+
+        // `**h` binds as `Hash[Symbol, V]` from the sig's `**V` (Steep
+        // parity), mirroring `*a` -> `Array[T]` above.
+        // An anonymous `**` has no name; it binds under the hidden
+        // `ANON_KWREST_LVAR` so a forwarding call `b(**)` types its kwsplat
+        // like the named `**h` (see `collect_arguments_from`).
+        if let Some(kwrest_node) = params.keyword_rest()
+            && let Some(kwrest) = kwrest_node.as_keyword_rest_parameter_node()
+            && let Some(rest_type) = method_type.rest_keyword()
+        {
+            let name = match kwrest.name() {
+                Some(name_id) => {
+                    let name_str = String::from_utf8_lossy(name_id.as_slice());
+                    self.checker_names().intern(&name_str)
+                }
+                None => self.checker_names().intern(super::ANON_KWREST_LVAR),
+            };
+            let hash_type = self.kwsplat_rest_hash_type(rest_type);
+            let hash_type = self.freeze_self_type_for_lvar_binding(hash_type);
+            self.ctx.set_local_variable(name, hash_type);
         }
 
         if let Some(block_param) = params.block()

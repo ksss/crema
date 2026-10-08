@@ -3,9 +3,9 @@
 //!
 //! Pure ast → Ty resolver: callers parse rbs source via `ast_builder`
 //! to obtain `ast::Type` / `ast::MethodType`, then call into this
-//! module with the environment tables (declared names, class aliases,
-//! intern tables, type-param scope) to mint interned `Ty` /
-//! `MethodType`. Used by `Environment::resolve` to walk the
+//! module with the frozen environment (its `TypeNameResolver` tables
+//! and class-alias normalization), the intern tables and the type-param
+//! scope to mint interned `Ty` / `MethodType`. Used by `Environment::resolve` to walk the
 //! buffered ast::* declarations exactly once after every source has
 //! been observed.
 //!
@@ -28,9 +28,9 @@ use crate::ast::types::{
     Literal as AstLiteral, RecordField as AstRecordField, RecordKey as AstRecordKey,
     Type as AstType, UntypedFunctionType as AstUntypedFunction,
 };
-use crate::definition::lowering_maps::LoweringMaps;
-use crate::name::{Name, NameTable, Symbol};
-use crate::resolver::type_name_resolver::resolve_relative_type_name;
+use crate::environment::Environment;
+use crate::environment::resolution::{TypeNameResolver, absolute_type_name_typename};
+use crate::name::{NameTable, Symbol};
 use crate::type_name::TypeName;
 use crate::type_param::{
     MethodKind, TypeParam, TypeParamScope, TypeVarKey, TypeVarScope, Variance,
@@ -44,8 +44,8 @@ use crate::types::{
 #[allow(clippy::too_many_arguments)]
 pub fn build_type(
     ast_ty: &AstType,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -60,39 +60,31 @@ pub fn build_type(
                     scope: key.scope,
                 });
             }
-            let raw = names.resolve(t.name);
-            let resolved = resolve_relative_type_name(&raw, context, maps, names);
-            let arg_tys = build_type_vec(&t.args, context, maps, names, types, type_param_scope);
-            let resolved = names.parse_type_name(&names.resolve(resolved));
+            let resolved = lower_type_name(t.name, context, env);
+            let arg_tys = build_type_vec(&t.args, context, env, names, types, type_param_scope);
             types.intern(Type::ClassInstance {
                 name: resolved,
                 args: arg_tys,
             })
         }
         AstType::Interface(t) => {
-            let raw = names.resolve(t.name);
-            let resolved = resolve_relative_type_name(&raw, context, maps, names);
-            let arg_tys = build_type_vec(&t.args, context, maps, names, types, type_param_scope);
-            let resolved = names.parse_type_name(&names.resolve(resolved));
+            let resolved = lower_type_name(t.name, context, env);
+            let arg_tys = build_type_vec(&t.args, context, env, names, types, type_param_scope);
             types.intern(Type::Interface {
                 name: resolved,
                 args: arg_tys,
             })
         }
         AstType::Alias(t) => {
-            let raw = names.resolve(t.name);
-            let resolved = resolve_relative_type_name(&raw, context, maps, names);
-            let arg_tys = build_type_vec(&t.args, context, maps, names, types, type_param_scope);
-            let resolved = names.parse_type_name(&names.resolve(resolved));
+            let resolved = lower_type_name(t.name, context, env);
+            let arg_tys = build_type_vec(&t.args, context, env, names, types, type_param_scope);
             types.intern(Type::Alias {
                 name: resolved,
                 args: arg_tys,
             })
         }
         AstType::ClassSingleton(t) => {
-            let raw = names.resolve(t.name);
-            let resolved = resolve_relative_type_name(&raw, context, maps, names);
-            let resolved = names.parse_type_name(&names.resolve(resolved));
+            let resolved = lower_type_name(t.name, context, env);
             types.intern(Type::ClassSingleton { name: resolved })
         }
         AstType::Variable(t) => {
@@ -109,7 +101,7 @@ pub fn build_type(
             })
         }
         AstType::Union(t) => {
-            let built = build_type_vec(&t.types, context, maps, names, types, type_param_scope);
+            let built = build_type_vec(&t.types, context, env, names, types, type_param_scope);
             if built.len() == 1 {
                 built[0]
             } else {
@@ -117,7 +109,7 @@ pub fn build_type(
             }
         }
         AstType::Intersection(t) => {
-            let built = build_type_vec(&t.types, context, maps, names, types, type_param_scope);
+            let built = build_type_vec(&t.types, context, env, names, types, type_param_scope);
             if built.len() == 1 {
                 built[0]
             } else {
@@ -125,11 +117,11 @@ pub fn build_type(
             }
         }
         AstType::Optional(t) => {
-            let inner_ty = build_type(&t.ty, context, maps, names, types, type_param_scope);
+            let inner_ty = build_type(&t.ty, context, env, names, types, type_param_scope);
             types.intern(Type::Optional(inner_ty))
         }
         AstType::Tuple(t) => {
-            let built = build_type_vec(&t.types, context, maps, names, types, type_param_scope);
+            let built = build_type_vec(&t.types, context, env, names, types, type_param_scope);
             types.intern(Type::Tuple(built))
         }
         AstType::Record(t) => {
@@ -138,7 +130,7 @@ pub fn build_type(
                 .iter()
                 .map(|f: &AstRecordField| {
                     let key = build_record_key(&f.key, names);
-                    let value = build_type(&f.ty, context, maps, names, types, type_param_scope);
+                    let value = build_type(&f.ty, context, env, names, types, type_param_scope);
                     (key, value, f.required)
                 })
                 .collect();
@@ -149,7 +141,7 @@ pub fn build_type(
             let func = build_function_type(
                 &proc_type.function,
                 context,
-                maps,
+                env,
                 names,
                 types,
                 type_param_scope,
@@ -157,11 +149,11 @@ pub fn build_type(
             let self_ty = proc_type
                 .self_type
                 .as_ref()
-                .map(|st| build_type(st, context, maps, names, types, type_param_scope));
+                .map(|st| build_type(st, context, env, names, types, type_param_scope));
             let blk = proc_type
                 .block
                 .as_ref()
-                .map(|b| build_block(b, context, maps, names, types, type_param_scope));
+                .map(|b| build_block(b, context, env, names, types, type_param_scope));
             types.intern(Type::Proc {
                 type_: func,
                 self_type: self_ty,
@@ -200,8 +192,8 @@ pub fn build_type(
 #[allow(clippy::too_many_arguments)]
 pub fn build_method_type(
     ast_mt: &AstMethodType,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -241,35 +233,22 @@ pub fn build_method_type(
             let scoped = scoped_keys[i].clone();
             let mut param = TypeParam::new(scoped, Variance::Invariant);
             if let Some(upper) = &tp.upper_bound {
-                param.upper_bound = Some(build_type(
-                    upper,
-                    context,
-                    maps,
-                    names,
-                    types,
-                    &merged_scope,
-                ));
+                param.upper_bound =
+                    Some(build_type(upper, context, env, names, types, &merged_scope));
             }
             if let Some(lower) = &tp.lower_bound {
-                param.lower_bound = Some(build_type(
-                    lower,
-                    context,
-                    maps,
-                    names,
-                    types,
-                    &merged_scope,
-                ));
+                param.lower_bound =
+                    Some(build_type(lower, context, env, names, types, &merged_scope));
             }
             param
         })
         .collect();
 
-    let function =
-        build_function_type(&ast_mt.function, context, maps, names, types, &merged_scope);
+    let function = build_function_type(&ast_mt.function, context, env, names, types, &merged_scope);
     let block = ast_mt
         .block
         .as_ref()
-        .map(|b| build_block(b, context, maps, names, types, &merged_scope));
+        .map(|b| build_block(b, context, env, names, types, &merged_scope));
 
     MethodType {
         type_params,
@@ -287,8 +266,8 @@ pub fn build_method_type(
 #[allow(clippy::too_many_arguments)]
 pub fn build_overloads(
     ast_overloads: &[AstOverload],
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -302,7 +281,7 @@ pub fn build_overloads(
             build_method_type(
                 &o.method_type,
                 context,
-                maps,
+                env,
                 names,
                 types,
                 type_param_scope,
@@ -319,32 +298,13 @@ pub fn build_overloads(
 ///
 /// This is the "resolve" counterpart to `MethodTypeAnnotation::build`
 /// — take the unresolved classification plus an environment and
-/// produce resolved method types. The pair replaces the inner logic of
+/// produce resolved method types. Replaces the inner logic of
 /// `src/inline_parser.rs::resolve_def_overloads`.
-#[allow(clippy::too_many_arguments)]
-pub fn build_overloads_from_annotation(
-    mta: &MethodTypeAnnotation,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
-    names: &NameTable,
-    types: &TypeTable,
-) -> Option<Vec<MethodType>> {
-    build_overloads_from_annotation_with_scope(
-        mta,
-        context,
-        maps,
-        names,
-        types,
-        &TypeParamScope::default(),
-        None,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn build_overloads_from_annotation_with_scope(
     mta: &MethodTypeAnnotation,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -360,7 +320,7 @@ pub fn build_overloads_from_annotation_with_scope(
                         result.push(build_method_type(
                             &annotation.method_type,
                             context,
-                            maps,
+                            env,
                             names,
                             types,
                             type_param_scope,
@@ -374,7 +334,7 @@ pub fn build_overloads_from_annotation_with_scope(
                             result.push(build_method_type(
                                 &overload.method_type,
                                 context,
-                                maps,
+                                env,
                                 names,
                                 types,
                                 type_param_scope,
@@ -398,8 +358,7 @@ pub fn build_overloads_from_annotation_with_scope(
             }
         }
         TypeAnnotations::DocStyle(doc) => {
-            let mt =
-                build_doc_style_method_type(doc, context, maps, names, types, type_param_scope);
+            let mt = build_doc_style_method_type(doc, context, env, names, types, type_param_scope);
             Some(vec![mt])
         }
         TypeAnnotations::None => None,
@@ -408,8 +367,8 @@ pub fn build_overloads_from_annotation_with_scope(
 
 fn build_doc_style_method_type(
     doc: &DocStyle,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -418,7 +377,7 @@ fn build_doc_style_method_type(
         Some(ann) => build_type(
             &ann.return_type,
             context,
-            maps,
+            env,
             names,
             types,
             type_param_scope,
@@ -432,7 +391,7 @@ fn build_doc_style_method_type(
         PositionalEntry::Annotated(ann) => build_type(
             &ann.param_type,
             context,
-            maps,
+            env,
             names,
             types,
             type_param_scope,
@@ -444,7 +403,7 @@ fn build_doc_style_method_type(
         SplatRestEntry::Annotated(ann) => build_type(
             &ann.param_type,
             context,
-            maps,
+            env,
             names,
             types,
             type_param_scope,
@@ -456,7 +415,7 @@ fn build_doc_style_method_type(
         DoubleSplatRestEntry::Annotated(ann) => build_type(
             &ann.param_type,
             context,
-            maps,
+            env,
             names,
             types,
             type_param_scope,
@@ -467,14 +426,7 @@ fn build_doc_style_method_type(
     let resolve_block = |entry: &BlockEntry| match entry {
         BlockEntry::Annotated(ann) => Block {
             required: ann.question_location.is_none(),
-            type_: build_function_type(
-                &ann.function,
-                context,
-                maps,
-                names,
-                types,
-                type_param_scope,
-            ),
+            type_: build_function_type(&ann.function, context, env, names, types, type_param_scope),
             self_type: None,
         },
         BlockEntry::ByName(_) | BlockEntry::Unnamed => Block {
@@ -521,6 +473,20 @@ fn build_doc_style_method_type(
     }
 }
 
+/// Resolve one reference-position type name against `context` and
+/// normalize class aliases away, in the two steps rbs keeps separate:
+/// `Environment#absolute_type_name` (relative → absolute; an alias
+/// `new_name` is kept as is) followed by
+/// `Environment#normalize_type_name` (alias → target). A name the
+/// environment does not declare comes back unchanged, in its source
+/// form, so an unresolved reference stays observable downstream (a
+/// relative raw keeps `namespace.is_absolute() == false`).
+fn lower_type_name(name: TypeName, context: &[TypeName], env: &Environment) -> TypeName {
+    let resolver = TypeNameResolver::new(&env.all_names, &env.aliases, env.names());
+    let resolved = absolute_type_name_typename(&resolver, name, context);
+    env.normalize_type_name(resolved)
+}
+
 fn scoped_type_variable_from_class_instance(
     name: &TypeName,
     args: &[AstType],
@@ -540,22 +506,22 @@ fn scoped_type_variable_from_class_instance(
 
 fn build_type_vec(
     nodes: &[AstType],
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
 ) -> Vec<Ty> {
     nodes
         .iter()
-        .map(|n| build_type(n, context, maps, names, types, type_param_scope))
+        .map(|n| build_type(n, context, env, names, types, type_param_scope))
         .collect()
 }
 
 fn build_function_type(
     ast_ft: &AstFunctionType,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -564,7 +530,7 @@ fn build_function_type(
         AstFunctionType::Typed(f) => FunctionType::Typed(build_function(
             f,
             context,
-            maps,
+            env,
             names,
             types,
             type_param_scope,
@@ -572,7 +538,7 @@ fn build_function_type(
         AstFunctionType::Untyped(u) => FunctionType::Untyped(build_untyped_function(
             u,
             context,
-            maps,
+            env,
             names,
             types,
             type_param_scope,
@@ -582,8 +548,8 @@ fn build_function_type(
 
 fn build_function(
     ast_f: &AstFunction,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -591,29 +557,29 @@ fn build_function(
     let required_positionals: Vec<Ty> = ast_f
         .required_positionals
         .iter()
-        .map(|p| build_type(&p.ty, context, maps, names, types, type_param_scope))
+        .map(|p| build_type(&p.ty, context, env, names, types, type_param_scope))
         .collect();
     let optional_positionals: Vec<Ty> = ast_f
         .optional_positionals
         .iter()
-        .map(|p| build_type(&p.ty, context, maps, names, types, type_param_scope))
+        .map(|p| build_type(&p.ty, context, env, names, types, type_param_scope))
         .collect();
     let rest_positional = ast_f
         .rest_positionals
         .as_ref()
-        .map(|p| build_type(&p.ty, context, maps, names, types, type_param_scope));
+        .map(|p| build_type(&p.ty, context, env, names, types, type_param_scope));
     let trailing_positionals: Vec<Ty> = ast_f
         .trailing_positionals
         .iter()
-        .map(|p| build_type(&p.ty, context, maps, names, types, type_param_scope))
+        .map(|p| build_type(&p.ty, context, env, names, types, type_param_scope))
         .collect();
     let required_keywords: Vec<(String, Ty)> = ast_f
         .required_keywords
         .iter()
         .map(|kp| {
             (
-                names.resolve(kp.name),
-                build_type(&kp.param.ty, context, maps, names, types, type_param_scope),
+                names.resolve(kp.name).to_string(),
+                build_type(&kp.param.ty, context, env, names, types, type_param_scope),
             )
         })
         .collect();
@@ -622,19 +588,19 @@ fn build_function(
         .iter()
         .map(|kp| {
             (
-                names.resolve(kp.name),
-                build_type(&kp.param.ty, context, maps, names, types, type_param_scope),
+                names.resolve(kp.name).to_string(),
+                build_type(&kp.param.ty, context, env, names, types, type_param_scope),
             )
         })
         .collect();
     let rest_keyword = ast_f
         .rest_keywords
         .as_ref()
-        .map(|p| build_type(&p.ty, context, maps, names, types, type_param_scope));
+        .map(|p| build_type(&p.ty, context, env, names, types, type_param_scope));
     let return_type = build_type(
         &ast_f.return_type,
         context,
-        maps,
+        env,
         names,
         types,
         type_param_scope,
@@ -654,8 +620,8 @@ fn build_function(
 
 fn build_untyped_function(
     ast_u: &AstUntypedFunction,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -663,7 +629,7 @@ fn build_untyped_function(
     let return_type = build_type(
         &ast_u.return_type,
         context,
-        maps,
+        env,
         names,
         types,
         type_param_scope,
@@ -673,8 +639,8 @@ fn build_untyped_function(
 
 fn build_block(
     ast_b: &AstBlock,
-    context: &[Option<Name>],
-    maps: &LoweringMaps,
+    context: &[TypeName],
+    env: &Environment,
     names: &NameTable,
     types: &TypeTable,
     type_param_scope: &TypeParamScope,
@@ -682,7 +648,7 @@ fn build_block(
     let function = build_function_type(
         &ast_b.function,
         context,
-        maps,
+        env,
         names,
         types,
         type_param_scope,
@@ -690,7 +656,7 @@ fn build_block(
     let self_type = ast_b
         .self_type
         .as_ref()
-        .map(|t| build_type(t, context, maps, names, types, type_param_scope));
+        .map(|t| build_type(t, context, env, names, types, type_param_scope));
     Block {
         required: ast_b.required,
         type_: function,
@@ -726,7 +692,7 @@ fn normalize_rbs_integer_string(s: &str) -> String {
 
 fn build_record_key(ast_key: &AstRecordKey, names: &NameTable) -> RecordKey {
     match ast_key {
-        AstRecordKey::Symbol(s) => RecordKey::Symbol(names.resolve(*s)),
+        AstRecordKey::Symbol(s) => RecordKey::Symbol(names.resolve(*s).to_string()),
         AstRecordKey::String(s) => RecordKey::String(s.clone()),
         AstRecordKey::Integer(s) => RecordKey::Integer(normalize_rbs_integer_string(s)),
         AstRecordKey::Bool(b) => RecordKey::Bool(*b),
@@ -737,7 +703,7 @@ fn build_literal(ast_lit: &AstLiteral, names: &NameTable) -> Literal {
     match ast_lit {
         AstLiteral::Integer(_) => unreachable!("Integer literal handled in build_type"),
         AstLiteral::String(s) => Literal::String(s.clone()),
-        AstLiteral::Symbol(s) => Literal::Symbol(names.resolve(*s)),
+        AstLiteral::Symbol(s) => Literal::Symbol(names.resolve(*s).to_string()),
         AstLiteral::Bool(b) => Literal::Bool(*b),
     }
 }

@@ -15,17 +15,24 @@
 //!   need every alias `old_name` up front; alias count is independent
 //!   of entry count)
 //! - **lazy, per reference**: decl entry payloads. A point lookup
-//!   decodes only the referenced entry (plus its nested children) and
-//!   memoizes the frozen value in an append-only cache
-//! - **full scans**: `*_all` materializes a per-kind map once and
-//!   memoizes it; the remaining full-scan callers (DefinitionBuilder
-//!   eager scans, validators) pay one decode-all per process until
-//!   slice 2b differentializes them
+//!   decodes only the referenced entry and memoizes the frozen value in
+//!   that key's slot. The key set is fixed at open, so every slot exists
+//!   up front: a probe fills one, never adds one. A filled slot is read
+//!   without a lock and the handed-out `&V` lives as long as the
+//!   backend, so the backend is `Send + Sync` (ADR-0034 Decision 1).
+//!   Two threads racing on an empty slot both decode; the first store
+//!   wins and the other value is dropped (Decision 3, no waiting)
+//! - **full scans**: the first `*_all` call materializes every kind's
+//!   map in one pass and memoizes them together. Unlike a point probe,
+//!   concurrent callers wait for that one pass instead of decoding in
+//!   parallel. The remaining full-scan callers (DefinitionBuilder eager
+//!   scans, validators) pay one decode-all per process until slice 2b
+//!   differentializes them
 
-use std::cell::{Cell, OnceCell};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::definition::{VariableDuplication, VariableDuplicationKind};
 use crate::definition_builder::{
@@ -40,12 +47,13 @@ use crate::environment::frozen::{
 };
 use crate::location::{DuplicateSource, LocationRange, RubyLocation, SourceLocation};
 use crate::name::{NameTable, Symbol};
-use crate::snapshot::append_map::AppendMap;
 use crate::snapshot::flat;
 use crate::snapshot::mirror::{
     MBakedDiagnostics, MBakedLoc, MBakedMethodGroup, MClassOrModule, MEntry,
 };
-use crate::snapshot::rebuild::{DecodeTables, Decoder, EntrySource, RebuildError, corrupt};
+use crate::snapshot::rebuild::{
+    DecodeTables, Decoder, EntryMemo, EntrySource, NestedDecls, RebuildError, corrupt,
+};
 use crate::snapshot::write::{DIAG_LEN_OFFSET, DIAG_OFF_OFFSET, HEADER_LEN};
 use crate::type_name::TypeName;
 
@@ -268,7 +276,7 @@ fn baked_from_mirror(
 /// was validated up front (`flat::Reader::try_open`), the invalidation
 /// key matched, and writes are atomic — a bincode error here means the
 /// file was corrupted in place, and silently dropping gem declarations
-/// would produce wrong diagnostics. Deleting `.crema/cache` recovers.
+/// would produce wrong diagnostics. Deleting `.crema` recovers.
 /// The snapshot file image (64-byte header + flat payload) a backend
 /// reads from. The warm path maps the file (`read_g_snapshot_backend`)
 /// so its pages stay file-backed instead of being copied into the heap;
@@ -304,42 +312,50 @@ pub struct GSnapshotBackend {
     /// Full snapshot file image (64-byte header + flat payload).
     bytes: SnapshotImage,
     tables: DecodeTables,
-    class_kinds: FxHashMap<TypeName, GClassKind>,
-    interface_keys: FxHashSet<TypeName>,
-    type_alias_keys: FxHashSet<TypeName>,
-    constant_keys: FxHashSet<TypeName>,
+    /// One slot per entry the snapshot lists, filled on first probe.
+    /// The key set is complete at open, so a probe never inserts a key:
+    /// it only fills the slot, and a filled slot is read without a lock.
+    class_kinds: FxHashMap<TypeName, (GClassKind, OnceLock<ClassOrModule>)>,
+    interface_keys: FxHashMap<TypeName, OnceLock<InterfaceEntry>>,
+    type_alias_keys: FxHashMap<TypeName, OnceLock<SingleEntry<TypeAlias>>>,
+    constant_keys: FxHashMap<TypeName, OnceLock<SingleEntry<Constant>>>,
     /// Global probe needs the snapshot-side id; runtime `Symbol` is not
     /// itself the flat id (the flat id hashes the resolved string).
-    global_ids: FxHashMap<Symbol, u64>,
+    global_ids: FxHashMap<Symbol, (u64, OnceLock<GlobalEntry>)>,
     /// Eagerly decoded `class A = B` / `module A = B` entries.
     alias_entries: FxHashMap<TypeName, ClassOrModuleAliasEntry>,
     /// G-only scan diagnostics baked at cold time (ADR-0028 slice 2b),
     /// decoded eagerly at open — size is O(findings), not O(entries).
     baked: RoastedGScan,
 
-    class_cache: AppendMap<TypeName, ClassOrModule>,
-    interface_cache: AppendMap<TypeName, InterfaceEntry>,
-    type_alias_cache: AppendMap<TypeName, SingleEntry<TypeAlias>>,
-    constant_cache: AppendMap<TypeName, SingleEntry<Constant>>,
-    global_cache: AppendMap<Symbol, GlobalEntry>,
-
-    class_all: OnceCell<FxHashMap<TypeName, ClassOrModule>>,
-    interface_all: OnceCell<FxHashMap<TypeName, InterfaceEntry>>,
-    type_alias_all: OnceCell<FxHashMap<TypeName, SingleEntry<TypeAlias>>>,
-    constant_all: OnceCell<FxHashMap<TypeName, SingleEntry<Constant>>>,
-    global_all: OnceCell<FxHashMap<Symbol, GlobalEntry>>,
-
-    /// Class/module declarations converted through nested-decl refs,
-    /// keyed by `(child entry id, pair index)`. The decode-all pass
-    /// reuses these Arcs for the children's flatten pairs (see
-    /// [`Decoder::with_nested_cache`]).
-    nested_decls: AppendMap<(u64, usize), crate::ast::declarations::Declaration>,
+    /// Decode-all result, every kind at once (see `materialize_all`).
+    all: OnceLock<Materialized>,
 
     /// Entry payload deserialization count (nested children included),
     /// bumped by every `EntrySource::Flat` fetch and the eager alias
     /// pass, for the `CREMA_DEBUG_SNAPSHOT_TIMING=1` observability line
     /// and the laziness regression tests.
-    decode_count: Cell<usize>,
+    decode_count: AtomicUsize,
+}
+
+struct Materialized {
+    class: FxHashMap<TypeName, ClassOrModule>,
+    interface: FxHashMap<TypeName, InterfaceEntry>,
+    type_alias: FxHashMap<TypeName, SingleEntry<TypeAlias>>,
+    constant: FxHashMap<TypeName, SingleEntry<Constant>>,
+    global: FxHashMap<Symbol, GlobalEntry>,
+}
+
+/// Fill `slot` with `compute()` unless it is already filled, and return
+/// the stored value. `compute` runs outside the slot: two threads may
+/// both decode the same entry, the first `set` wins and the loser's
+/// value is dropped. Nothing waits on another thread's decode.
+fn fill<V>(slot: &OnceLock<V>, compute: impl FnOnce() -> V) -> &V {
+    if let Some(v) = slot.get() {
+        return v;
+    }
+    let _ = slot.set(compute());
+    slot.get().expect("set just above")
 }
 
 impl std::fmt::Debug for GSnapshotBackend {
@@ -352,7 +368,7 @@ impl std::fmt::Debug for GSnapshotBackend {
             .field("constants", &self.constant_keys.len())
             .field("globals", &self.global_ids.len())
             .field("aliases", &self.alias_entries.len())
-            .field("decoded", &self.decode_count.get())
+            .field("decoded", &self.decode_count())
             .finish()
     }
 }
@@ -378,9 +394,9 @@ impl GSnapshotBackend {
             let tables = DecodeTables::intern_from(&reader, names)?;
 
             let mut class_kinds = FxHashMap::default();
-            let mut interface_keys = FxHashSet::default();
-            let mut type_alias_keys = FxHashSet::default();
-            let mut constant_keys = FxHashSet::default();
+            let mut interface_keys = FxHashMap::default();
+            let mut type_alias_keys = FxHashMap::default();
+            let mut constant_keys = FxHashMap::default();
             let mut global_ids = FxHashMap::default();
             let tn = |id: u64| -> Result<TypeName, RebuildError> { Ok(TypeName::from_hash(id)) };
             for (id, payload) in reader.iter_entries() {
@@ -391,20 +407,20 @@ impl GSnapshotBackend {
                             TAG_INNER_MODULE => GClassKind::Module,
                             t => return Err(corrupt(format!("unknown class/module tag {t}"))),
                         };
-                        class_kinds.insert(tn(id)?, kind);
+                        class_kinds.insert(tn(id)?, (kind, OnceLock::new()));
                     }
                     TAG_INTERFACE => {
-                        interface_keys.insert(tn(id)?);
+                        interface_keys.insert(tn(id)?, OnceLock::new());
                     }
                     TAG_CLASS_ALIAS => {} // decoded eagerly below
                     TAG_TYPE_ALIAS => {
-                        type_alias_keys.insert(tn(id)?);
+                        type_alias_keys.insert(tn(id)?, OnceLock::new());
                     }
                     TAG_CONSTANT => {
-                        constant_keys.insert(tn(id)?);
+                        constant_keys.insert(tn(id)?, OnceLock::new());
                     }
                     TAG_GLOBAL => {
-                        global_ids.insert(Symbol::from_raw_id(id), id);
+                        global_ids.insert(Symbol::from_raw_id(id), (id, OnceLock::new()));
                     }
                     t => return Err(corrupt(format!("unknown entry tag {t}"))),
                 }
@@ -449,18 +465,8 @@ impl GSnapshotBackend {
             global_ids,
             alias_entries: FxHashMap::default(),
             baked,
-            class_cache: AppendMap::default(),
-            interface_cache: AppendMap::default(),
-            type_alias_cache: AppendMap::default(),
-            constant_cache: AppendMap::default(),
-            global_cache: AppendMap::default(),
-            class_all: OnceCell::new(),
-            interface_all: OnceCell::new(),
-            type_alias_all: OnceCell::new(),
-            constant_all: OnceCell::new(),
-            global_all: OnceCell::new(),
-            nested_decls: AppendMap::default(),
-            decode_count: Cell::new(0),
+            all: OnceLock::new(),
+            decode_count: AtomicUsize::new(0),
         };
         backend.alias_entries = backend.decode_alias_entries()?;
         Ok(backend)
@@ -471,11 +477,11 @@ impl GSnapshotBackend {
     }
 
     fn count_decodes(&self, n: usize) {
-        self.decode_count.set(self.decode_count.get() + n);
+        self.decode_count.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn decode_count(&self) -> usize {
-        self.decode_count.get()
+        self.decode_count.load(Ordering::Relaxed)
     }
 
     /// Baked G-only scan diagnostics, spliced by the warm
@@ -502,7 +508,7 @@ impl GSnapshotBackend {
         &self,
         id: u64,
         dec: &mut Decoder<'_>,
-        memo: &AppendMap<u64, MEntry>,
+        memo: &EntryMemo,
         f: impl FnOnce(&mut Decoder<'_>, &EntrySource<'_>, &MEntry) -> Result<T, RebuildError>,
     ) -> Result<Option<T>, RebuildError> {
         let reader = self.reader();
@@ -514,7 +520,7 @@ impl GSnapshotBackend {
         let Some(entry) = source.get(id)? else {
             return Ok(None);
         };
-        let value = f(dec, &source, entry)?;
+        let value = f(dec, &source, &entry)?;
         Ok(Some(value))
     }
 
@@ -569,7 +575,7 @@ impl GSnapshotBackend {
     /// own entries (`Decoder::lazy`).
     fn decode_class_entry(&self, name: TypeName) -> Result<Option<ClassOrModule>, RebuildError> {
         let mut dec = Decoder::lazy(&self.tables);
-        let memo = AppendMap::default();
+        let memo = EntryMemo::default();
         self.decode_class_entry_with(name, &mut dec, &memo)
     }
 
@@ -582,7 +588,7 @@ impl GSnapshotBackend {
         &self,
         name: TypeName,
         dec: &mut Decoder<'_>,
-        memo: &AppendMap<u64, MEntry>,
+        memo: &EntryMemo,
     ) -> Result<Option<ClassOrModule>, RebuildError> {
         use crate::ast::declarations::Declaration;
         let id = name.get();
@@ -591,10 +597,8 @@ impl GSnapshotBackend {
                 let mut pairs: Vec<(DeclOrigin, Context, ClassDeclaration)> =
                     Vec::with_capacity(e.context_decls.len());
                 for (i, (ctx, d)) in e.context_decls.iter().enumerate() {
-                    let decl = match self.nested_decls.get(&(id, i)) {
-                        Some(Declaration::Class(arc)) => {
-                            ClassDeclaration::Signature(Arc::clone(arc))
-                        }
+                    let decl = match dec.nested_decl((id, i)) {
+                        Some(Declaration::Class(arc)) => ClassDeclaration::Signature(arc),
                         Some(_) => return Err(corrupt("nested-decl cache kind mismatch")),
                         None => {
                             ClassDeclaration::Signature(Arc::new(dec.class_decl(source, d, ctx)?))
@@ -621,10 +625,8 @@ impl GSnapshotBackend {
                 let mut pairs: Vec<(DeclOrigin, Context, ModuleDeclaration)> =
                     Vec::with_capacity(e.context_decls.len());
                 for (i, (ctx, d)) in e.context_decls.iter().enumerate() {
-                    let decl = match self.nested_decls.get(&(id, i)) {
-                        Some(Declaration::Module(arc)) => {
-                            ModuleDeclaration::Signature(Arc::clone(arc))
-                        }
+                    let decl = match dec.nested_decl((id, i)) {
+                        Some(Declaration::Module(arc)) => ModuleDeclaration::Signature(arc),
                         Some(_) => return Err(corrupt("nested-decl cache kind mismatch")),
                         None => {
                             ModuleDeclaration::Signature(Arc::new(dec.module_decl(source, d, ctx)?))
@@ -670,11 +672,11 @@ impl GSnapshotBackend {
             Ok(Some(v)) => v,
             Ok(None) => panic!(
                 "g-snapshot backend: {what} listed in entry index but absent on probe \
-                 (delete .crema/cache to recover)"
+                 (delete .crema to recover)"
             ),
             Err(e) => panic!(
                 "g-snapshot backend: {what} failed to decode after open-time validation: {e} \
-                 (delete .crema/cache to recover)"
+                 (delete .crema to recover)"
             ),
         }
     }
@@ -682,91 +684,55 @@ impl GSnapshotBackend {
     // ---- per-kind point lookups ----
 
     pub fn class_entry(&self, name: &TypeName) -> Option<&ClassOrModule> {
-        if let Some(all) = self.class_all.get() {
-            return all.get(name);
+        if let Some(all) = self.all.get() {
+            return all.class.get(name);
         }
-        self.class_kinds.get(name)?;
-        Some(
-            self.class_cache
-                .get_or_try_insert_with(*name, || {
-                    Ok::<_, RebuildError>(
-                        self.expect_decoded("class entry", self.decode_class_entry(*name)),
-                    )
-                })
-                .expect("decode errors already panic in expect_decoded"),
-        )
+        let (_, slot) = self.class_kinds.get(name)?;
+        Some(fill(slot, || {
+            self.expect_decoded("class entry", self.decode_class_entry(*name))
+        }))
     }
 
     pub fn interface_entry(&self, name: &TypeName) -> Option<&InterfaceEntry> {
-        if let Some(all) = self.interface_all.get() {
-            return all.get(name);
+        if let Some(all) = self.all.get() {
+            return all.interface.get(name);
         }
-        if !self.interface_keys.contains(name) {
-            return None;
-        }
-        Some(
-            self.interface_cache
-                .get_or_try_insert_with(*name, || {
-                    Ok::<_, RebuildError>(self.interface_entry_uncached(name))
-                })
-                .expect("decode errors already panic in expect_decoded"),
-        )
+        let slot = self.interface_keys.get(name)?;
+        Some(fill(slot, || self.interface_entry_uncached(name)))
     }
 
     pub fn type_alias_entry(&self, name: &TypeName) -> Option<&SingleEntry<TypeAlias>> {
-        if let Some(all) = self.type_alias_all.get() {
-            return all.get(name);
+        if let Some(all) = self.all.get() {
+            return all.type_alias.get(name);
         }
-        if !self.type_alias_keys.contains(name) {
-            return None;
-        }
-        Some(
-            self.type_alias_cache
-                .get_or_try_insert_with(*name, || {
-                    Ok::<_, RebuildError>(self.type_alias_entry_uncached(name))
-                })
-                .expect("decode errors already panic in expect_decoded"),
-        )
+        let slot = self.type_alias_keys.get(name)?;
+        Some(fill(slot, || self.type_alias_entry_uncached(name)))
     }
 
     pub fn constant_entry(&self, name: &TypeName) -> Option<&SingleEntry<Constant>> {
-        if let Some(all) = self.constant_all.get() {
-            return all.get(name);
+        if let Some(all) = self.all.get() {
+            return all.constant.get(name);
         }
-        if !self.constant_keys.contains(name) {
-            return None;
-        }
-        Some(
-            self.constant_cache
-                .get_or_try_insert_with(*name, || {
-                    Ok::<_, RebuildError>(self.constant_entry_uncached(name))
-                })
-                .expect("decode errors already panic in expect_decoded"),
-        )
+        let slot = self.constant_keys.get(name)?;
+        Some(fill(slot, || self.constant_entry_uncached(name)))
     }
 
     pub fn global_entry(&self, name: &Symbol) -> Option<&GlobalEntry> {
-        if let Some(all) = self.global_all.get() {
-            return all.get(name);
+        if let Some(all) = self.all.get() {
+            return all.global.get(name);
         }
-        let id = *self.global_ids.get(name)?;
-        Some(
-            self.global_cache
-                .get_or_try_insert_with(*name, || {
-                    Ok::<_, RebuildError>(self.global_entry_uncached(name, id))
-                })
-                .expect("decode errors already panic in expect_decoded"),
-        )
+        let (id, slot) = self.global_ids.get(name)?;
+        Some(fill(slot, || self.global_entry_uncached(name, *id)))
     }
 
     // ---- per-kind decode bodies, shared by point probes and `*_all` ----
 
     fn interface_entry_uncached(&self, name: &TypeName) -> InterfaceEntry {
-        self.interface_entry_in(name, &AppendMap::default())
+        self.interface_entry_in(name, &EntryMemo::default())
     }
 
-    fn interface_entry_in(&self, name: &TypeName, memo: &AppendMap<u64, MEntry>) -> InterfaceEntry {
-        if let Some(v) = self.interface_cache.get(name) {
+    fn interface_entry_in(&self, name: &TypeName, memo: &EntryMemo) -> InterfaceEntry {
+        if let Some(v) = self.interface_keys.get(name).and_then(OnceLock::get) {
             return v.clone();
         }
         let mut dec = Decoder::new(&self.tables);
@@ -784,15 +750,11 @@ impl GSnapshotBackend {
     }
 
     fn type_alias_entry_uncached(&self, name: &TypeName) -> SingleEntry<TypeAlias> {
-        self.type_alias_entry_in(name, &AppendMap::default())
+        self.type_alias_entry_in(name, &EntryMemo::default())
     }
 
-    fn type_alias_entry_in(
-        &self,
-        name: &TypeName,
-        memo: &AppendMap<u64, MEntry>,
-    ) -> SingleEntry<TypeAlias> {
-        if let Some(v) = self.type_alias_cache.get(name) {
+    fn type_alias_entry_in(&self, name: &TypeName, memo: &EntryMemo) -> SingleEntry<TypeAlias> {
+        if let Some(v) = self.type_alias_keys.get(name).and_then(OnceLock::get) {
             return v.clone();
         }
         let mut dec = Decoder::new(&self.tables);
@@ -810,15 +772,11 @@ impl GSnapshotBackend {
     }
 
     fn constant_entry_uncached(&self, name: &TypeName) -> SingleEntry<Constant> {
-        self.constant_entry_in(name, &AppendMap::default())
+        self.constant_entry_in(name, &EntryMemo::default())
     }
 
-    fn constant_entry_in(
-        &self,
-        name: &TypeName,
-        memo: &AppendMap<u64, MEntry>,
-    ) -> SingleEntry<Constant> {
-        if let Some(v) = self.constant_cache.get(name) {
+    fn constant_entry_in(&self, name: &TypeName, memo: &EntryMemo) -> SingleEntry<Constant> {
+        if let Some(v) = self.constant_keys.get(name).and_then(OnceLock::get) {
             return v.clone();
         }
         let mut dec = Decoder::new(&self.tables);
@@ -836,16 +794,11 @@ impl GSnapshotBackend {
     }
 
     fn global_entry_uncached(&self, name: &Symbol, id: u64) -> GlobalEntry {
-        self.global_entry_in(name, id, &AppendMap::default())
+        self.global_entry_in(name, id, &EntryMemo::default())
     }
 
-    fn global_entry_in(
-        &self,
-        name: &Symbol,
-        id: u64,
-        memo: &AppendMap<u64, MEntry>,
-    ) -> GlobalEntry {
-        if let Some(v) = self.global_cache.get(name) {
+    fn global_entry_in(&self, name: &Symbol, id: u64, memo: &EntryMemo) -> GlobalEntry {
+        if let Some(v) = self.global_ids.get(name).and_then(|(_, slot)| slot.get()) {
             return v.clone();
         }
         let mut dec = Decoder::new(&self.tables);
@@ -870,7 +823,7 @@ impl GSnapshotBackend {
     // ---- contains / len (no decode) ----
 
     pub fn class_kind(&self, name: &TypeName) -> Option<GClassKind> {
-        self.class_kinds.get(name).copied()
+        self.class_kinds.get(name).map(|(kind, _)| *kind)
     }
 
     pub fn class_contains(&self, name: &TypeName) -> bool {
@@ -878,15 +831,15 @@ impl GSnapshotBackend {
     }
 
     pub fn interface_contains(&self, name: &TypeName) -> bool {
-        self.interface_keys.contains(name)
+        self.interface_keys.contains_key(name)
     }
 
     pub fn type_alias_contains(&self, name: &TypeName) -> bool {
-        self.type_alias_keys.contains(name)
+        self.type_alias_keys.contains_key(name)
     }
 
     pub fn constant_contains(&self, name: &TypeName) -> bool {
-        self.constant_keys.contains(name)
+        self.constant_keys.contains_key(name)
     }
 
     pub fn global_contains(&self, name: &Symbol) -> bool {
@@ -927,15 +880,15 @@ impl GSnapshotBackend {
     }
 
     pub fn interface_key_iter(&self) -> Box<dyn Iterator<Item = &TypeName> + '_> {
-        Box::new(self.interface_keys.iter())
+        Box::new(self.interface_keys.keys())
     }
 
     pub fn type_alias_key_iter(&self) -> Box<dyn Iterator<Item = &TypeName> + '_> {
-        Box::new(self.type_alias_keys.iter())
+        Box::new(self.type_alias_keys.keys())
     }
 
     pub fn constant_key_iter(&self) -> Box<dyn Iterator<Item = &TypeName> + '_> {
-        Box::new(self.constant_keys.iter())
+        Box::new(self.constant_keys.keys())
     }
 
     pub fn global_key_iter(&self) -> Box<dyn Iterator<Item = &Symbol> + '_> {
@@ -952,8 +905,8 @@ impl GSnapshotBackend {
     pub fn resolver_names(&self) -> impl Iterator<Item = TypeName> + '_ {
         self.class_kinds
             .keys()
-            .chain(self.interface_keys.iter())
-            .chain(self.type_alias_keys.iter())
+            .chain(self.interface_keys.keys())
+            .chain(self.type_alias_keys.keys())
             .copied()
     }
 
@@ -967,31 +920,36 @@ impl GSnapshotBackend {
 
     // ---- full-scan materialization (decode-all, memoized) ----
 
-    /// Fill every `*_all` map that is still empty, in one pass sharing
-    /// one payload memo: a nested interface / type alias / constant
-    /// pulled in while converting its enclosing class is not
-    /// deserialized again on its own kind's turn, so materializing
-    /// costs at most one deserialization per entry. The memo is dropped
-    /// with the pass. Every `*_all` accessor routes through here, so
-    /// asking for one kind materializes all of them — acceptable because
-    /// decode-all is a cold-only / test path, never a warm point probe.
-    fn materialize_all(&self) {
-        let memo = AppendMap::default();
-        self.class_all.get_or_init(|| {
+    /// Build every kind's map in one pass sharing one payload memo: a
+    /// nested interface / type alias / constant pulled in while
+    /// converting its enclosing class is not deserialized again on its
+    /// own kind's turn, so materializing costs at most one
+    /// deserialization per entry. All five maps sit behind one
+    /// `OnceLock` so a single thread runs the whole pass — with one lock
+    /// per kind, a thread that lost the class pass could win a later
+    /// kind and re-decode what the winner's (thread-local) memo already
+    /// held. The memo is dropped with the pass. Every `*_all` accessor
+    /// routes through here, so asking for one kind materializes all of
+    /// them — acceptable because decode-all is a cold-only / test path,
+    /// never a warm point probe.
+    fn materialize_all(&self) -> &Materialized {
+        self.all.get_or_init(|| {
+            let memo = EntryMemo::default();
             // Parents first (see `tn_depth`), one decoder for the whole
             // pass so nested-decl consumption cursors and the shared
             // conversion cache span every entry — the same walk order a
             // draft-flatten build effectively performs.
             let mut names: Vec<TypeName> = self.class_kinds.keys().copied().collect();
             names.sort_by_cached_key(|n| self.tn_depth(n.get()));
-            let mut dec = Decoder::with_nested_cache(&self.tables, &self.nested_decls);
-            // Never reuse `class_cache` here: a value it holds came from a
-            // lazy point probe (`Decoder::lazy`), whose parent decl omits
-            // its nested decls — decode-all must hand out the rbs-shaped
-            // inline form, so every entry is re-decoded with the nested
-            // cache. Once `class_all` is set, `class_entry` reads from it
-            // and the point cache is dead weight anyway.
-            names
+            let nested = NestedDecls::default();
+            let mut dec = Decoder::with_nested_cache(&self.tables, &nested);
+            // Never reuse a filled point-probe slot here: its value came
+            // from a lazy point probe (`Decoder::lazy`), whose parent decl
+            // omits its nested decls — decode-all must hand out the
+            // rbs-shaped inline form, so every entry is re-decoded with the
+            // pass-local nested cache. Once `all` is set, the point probes
+            // read from it and the slots are dead weight.
+            let class = names
                 .into_iter()
                 .map(|name| {
                     let v = self.expect_decoded(
@@ -1000,59 +958,55 @@ impl GSnapshotBackend {
                     );
                     (name, v)
                 })
-                .collect()
-        });
-        self.interface_all.get_or_init(|| {
-            self.interface_keys
-                .iter()
+                .collect();
+            let interface = self
+                .interface_keys
+                .keys()
                 .map(|name| (*name, self.interface_entry_in(name, &memo)))
-                .collect()
-        });
-        self.type_alias_all.get_or_init(|| {
-            self.type_alias_keys
-                .iter()
+                .collect();
+            let type_alias = self
+                .type_alias_keys
+                .keys()
                 .map(|name| (*name, self.type_alias_entry_in(name, &memo)))
-                .collect()
-        });
-        self.constant_all.get_or_init(|| {
-            self.constant_keys
-                .iter()
+                .collect();
+            let constant = self
+                .constant_keys
+                .keys()
                 .map(|name| (*name, self.constant_entry_in(name, &memo)))
-                .collect()
-        });
-        self.global_all.get_or_init(|| {
-            self.global_ids
+                .collect();
+            let global = self
+                .global_ids
                 .iter()
-                .map(|(name, id)| (*name, self.global_entry_in(name, *id, &memo)))
-                .collect()
-        });
+                .map(|(name, (id, _))| (*name, self.global_entry_in(name, *id, &memo)))
+                .collect();
+            Materialized {
+                class,
+                interface,
+                type_alias,
+                constant,
+                global,
+            }
+        })
     }
 
     pub fn class_all(&self) -> &FxHashMap<TypeName, ClassOrModule> {
-        self.materialize_all();
-        self.class_all.get().expect("filled by materialize_all")
+        &self.materialize_all().class
     }
 
     pub fn interface_all(&self) -> &FxHashMap<TypeName, InterfaceEntry> {
-        self.materialize_all();
-        self.interface_all.get().expect("filled by materialize_all")
+        &self.materialize_all().interface
     }
 
     pub fn type_alias_all(&self) -> &FxHashMap<TypeName, SingleEntry<TypeAlias>> {
-        self.materialize_all();
-        self.type_alias_all
-            .get()
-            .expect("filled by materialize_all")
+        &self.materialize_all().type_alias
     }
 
     pub fn constant_all(&self) -> &FxHashMap<TypeName, SingleEntry<Constant>> {
-        self.materialize_all();
-        self.constant_all.get().expect("filled by materialize_all")
+        &self.materialize_all().constant
     }
 
     pub fn global_all(&self) -> &FxHashMap<Symbol, GlobalEntry> {
-        self.materialize_all();
-        self.global_all.get().expect("filled by materialize_all")
+        &self.materialize_all().global
     }
 }
 

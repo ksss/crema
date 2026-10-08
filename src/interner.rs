@@ -5,14 +5,18 @@
 //! Each [`SymbolId`] is the `xxh3_64` hash of the interned bytes, so the
 //! same string always produces the same `SymbolId` — regardless of which
 //! [`StringInterner`] (and therefore which thread) it was interned in. To merge
-//! per-thread interners into one, just take the union of their backing
-//! maps; no `Remap` walk is needed.
+//! independently built interners into one, just take the union of their
+//! entries; no `Remap` walk is needed.
+//!
+//! Unlike the rbs port, the methods take `&self` rather than `&mut self`:
+//! crema shares one interner across check threads (ADR-0034). The id
+//! recipe is unchanged.
 //!
 //! ```
 //! use crema::interner::StringInterner;
 //!
-//! let mut a = StringInterner::new();
-//! let mut b = StringInterner::new();
+//! let a = StringInterner::new();
+//! let b = StringInterner::new();
 //! let a_string = a.intern("String");
 //! let a_int = a.intern("Integer");
 //! let b_string = b.intern("String");
@@ -21,7 +25,7 @@
 //! // Same content ⇒ same id across independent interners.
 //! assert_eq!(a_string, b_string);
 //!
-//! let mut global = StringInterner::new();
+//! let global = StringInterner::new();
 //! global.merge(a);
 //! global.merge(b);
 //!
@@ -30,20 +34,24 @@
 //! ```
 
 use crate::ids::SymbolId;
-use rustc_hash::FxHashMap;
+use crate::once_table::OnceTable;
 use xxhash_rust::xxh3::xxh3_64;
 
 
 /// Interns strings and assigns each the content-addressed [`SymbolId`]
 /// `xxh3_64(s.as_bytes())`.
 ///
-/// One `StringInterner` per thread during parallel work, then [`merge`] them all
-/// into a single destination `StringInterner` for the final shared view.
+/// Every method takes `&self` and the interner is `Send + Sync`: threads
+/// can intern into and resolve from one shared `StringInterner`, and a
+/// string one thread interned resolves from any other. Reads and hits
+/// take no lock; adding a new string is serialized (see
+/// [`crate::once_table`]). Independently built interners (one per ingest
+/// worker, ADR-0033) can still be folded together with [`merge`].
 ///
 /// [`merge`]: Self::merge
 #[derive(Default, Clone)]
 pub struct StringInterner {
-    map: FxHashMap<SymbolId, Box<str>>,
+    map: OnceTable<Box<str>>,
 }
 
 impl StringInterner {
@@ -54,9 +62,10 @@ impl StringInterner {
 
     /// Returns the content-addressed [`SymbolId`] for `s`, allocating
     /// storage only when `s` is new to this interner.
-    pub fn intern(&mut self, s: &str) -> SymbolId {
+    pub fn intern(&self, s: &str) -> SymbolId {
         let id = SymbolId::from_hash(xxh3_64(s.as_bytes()));
-        self.map.entry(id).or_insert_with(|| Box::<str>::from(s));
+        self.map
+            .get_or_insert_with(id.get(), || Box::<str>::from(s));
         id
     }
 
@@ -66,13 +75,15 @@ impl StringInterner {
     /// If `id` was not issued by this interner (or one merged into it).
     #[must_use]
     pub fn resolve(&self, id: SymbolId) -> &str {
-        &self.map[&id]
+        self.map
+            .get(id.get())
+            .unwrap_or_else(|| panic!("SymbolId not interned: {id:?}"))
     }
 
     /// Returns the string for `id`, or `None` if it was never interned here.
     #[must_use]
     pub fn try_resolve(&self, id: SymbolId) -> Option<&str> {
-        self.map.get(&id).map(|s| &**s)
+        self.map.get(id.get()).map(|s| &**s)
     }
 
     /// Returns the number of interned strings.
@@ -89,9 +100,14 @@ impl StringInterner {
     /// Move every entry from `other` into `self`. Because IDs are
     /// content-addressed, entries already present in `self` are kept; new
     /// ones are absorbed without reallocating their `Box<str>` storage.
-    pub fn merge(&mut self, other: StringInterner) {
-        for (id, boxed) in other.map {
-            self.map.entry(id).or_insert(boxed);
+    pub fn merge(&self, other: StringInterner) {
+        for (id, boxed) in other.map.into_entries() {
+            self.map.insert(id, boxed);
         }
+    }
+
+    /// Folds the table's growth chain (see `OnceTable::compact`).
+    pub(crate) fn compact(&mut self) {
+        self.map.compact();
     }
 }

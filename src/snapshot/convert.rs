@@ -77,7 +77,7 @@ impl<'a> Cx<'a> {
 
     pub(crate) fn sym(&mut self, s: Symbol) -> Sym {
         let string = self.names.resolve(s);
-        let id = sym_id_of(&string);
+        let id = sym_id_of(string);
         self.symbols.entry(id).or_insert_with(|| string.into());
         id
     }
@@ -122,12 +122,12 @@ impl<'a> Cx<'a> {
 
     pub(crate) fn name_id(&mut self, n: Name) -> NameId {
         let s = self.names.resolve(n);
-        if let Some(&id) = self.name_ids.get(&s) {
+        if let Some(&id) = self.name_ids.get(s) {
             return id;
         }
         let id = self.names_vec.len() as u32;
-        self.names_vec.push(s.clone());
-        self.name_ids.insert(s, id);
+        self.names_vec.push(s.to_string());
+        self.name_ids.insert(s.to_string(), id);
         id
     }
 

@@ -17,8 +17,6 @@ use crate::ast::ruby::members::{
 use crate::type_name::TypeName;
 use crate::types::{MethodType, TypeTable, Visibility};
 
-type MethodSourceParts = (Option<crate::name::Name>, crate::location::LocationRange);
-
 /// Mirrors the duck union `RBS::Definition::Method::method_member`
 /// (`sig/definition.rbs:27-28`). One of the 7 AST member types that can
 /// originate a method type definition.
@@ -164,7 +162,7 @@ impl MemberRef {
 /// diagnostic emit (`Diagnostic::to_json_value_with_line`) derives the
 /// line number from `start_byte` and the file source, and the JSONL
 /// payload writes `start_byte` / `end_byte` directly.
-fn ruby_attribute_location(
+pub(crate) fn ruby_attribute_location(
     attribute: &crate::ast::ruby::members::AttributeMember,
 ) -> crate::location::LocationRange {
     ruby_byte_range_location(attribute.location)
@@ -173,13 +171,12 @@ fn ruby_attribute_location(
 /// Same widening as [`ruby_attribute_location`], for callers (like
 /// `MemberRef::RubyDef`) that already have a bare `PrismByteRange`
 /// rather than an `AttributeMember` to borrow it from.
-fn ruby_byte_range_location(
+pub(crate) fn ruby_byte_range_location(
     range: crate::ast::ruby::PrismByteRange,
 ) -> crate::location::LocationRange {
     let (start_byte, end_byte) = range;
     // start_char / end_char are placeholders — callers on this path
-    // (dup-diagnostic emit, verbose method-source display) read only
-    // bytes and file. New consumers wanting char offsets must derive
+    // (dup-diagnostic emit) read only bytes and file. New consumers wanting char offsets must derive
     // them from the source buffer via `line_index`, not read these zeros.
     crate::location::LocationRange::new(0, start_byte, 0, end_byte)
 }
@@ -480,47 +477,6 @@ impl Method {
                 .any(|a| a.string == names.intern_symbol("pure")),
         })
     }
-
-    /// First reachable source location: alias members report their own
-    /// location, otherwise walk `defs[*].member`. Used for diagnostic /
-    /// verbose-log paths that want to point at a file:line for the
-    /// method. Returns `None` only when every def is `Synthesized` (or
-    /// `defs` is empty) — every other `MemberRef` variant, including
-    /// `RubyDef`, now carries a location. Note `defs` order is walk
-    /// order, not "most authoritative": an untyped Ruby `def` reopening
-    /// a sig-declared method is spliced *before* the sig def
-    /// (`lower_bucket_defn_to_method`'s overloads-splice), so this can
-    /// return the Ruby reopen's location even though the sig def
-    /// supplied the actual type.
-    pub fn primary_location(&self) -> Option<crate::location::LocationRange> {
-        self.primary_source_parts().map(|(_, range)| range)
-    }
-
-    /// First reachable source location with file identity attached.
-    /// Returns `None` when the method has only file-less or synthesized
-    /// source members.
-    pub fn primary_source_location(
-        &self,
-        names: &crate::name::NameTable,
-    ) -> Option<crate::location::SourceLocation> {
-        self.primary_source_parts().and_then(|(file, range)| {
-            file.map(|file| crate::location::SourceLocation {
-                file: std::path::PathBuf::from(names.resolve(file)),
-                range,
-            })
-        })
-    }
-
-    fn primary_source_parts(&self) -> Option<MethodSourceParts> {
-        if let Some(am) = &self.alias_member {
-            return am.location.map(|location| (am.source_file, location.range));
-        }
-        self.defs.iter().find_map(|td| {
-            td.member
-                .location()
-                .map(|range| (td.member.source_file(), range))
-        })
-    }
 }
 
 /// `%a{crema:method_missing}` — stamped by infusion synthesis on a
@@ -566,7 +522,7 @@ pub fn deprecated_annotation(
 ) -> Option<Option<String>> {
     for a in annotations {
         let resolved = names.resolve(a.string);
-        if let Some(message) = match_deprecated(&resolved) {
+        if let Some(message) = match_deprecated(resolved) {
             return Some(message);
         }
     }

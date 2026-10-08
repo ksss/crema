@@ -33,7 +33,7 @@ use crate::types::{Ty, union_of};
 /// route a write back to the right env slot — `Lvar` writes go through
 /// [`crate::context::Context::set_local_variable`] (lvar scope), `Pure`
 /// writes go through `pure_call_env_mut().set` (pure-call cache).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scrutinee {
     Lvar(Name),
     Pure(PureKey),
@@ -123,7 +123,7 @@ impl CondEnv {
         let mut entries = FxHashMap::default();
         for (key, lhs_ty) in &self.entries {
             if let Some(&rhs_ty) = rhs.entries.get(key) {
-                entries.insert(key.clone(), union_of(*lhs_ty, rhs_ty, env.types()));
+                entries.insert(*key, union_of(*lhs_ty, rhs_ty, env.types()));
             }
         }
         CondEnv { entries }
@@ -135,6 +135,7 @@ mod tests {
     use super::*;
     use crate::definition_builder::DefinitionBuilder;
     use crate::name::NameTable;
+    use crate::pure_call_env::{PureKeyTable, PureNode};
 
     const RBS: &str = r#"
 class Integer
@@ -255,8 +256,9 @@ end
         let str_ty = string_ty(&env);
         let account = names.intern("account");
         let phone = names.intern_symbol("phone");
-        let key = PureKey::Send(Box::new(PureKey::Lvar(account)), phone);
-        let cond = CondEnv::single(Scrutinee::Pure(key.clone()), str_ty);
+        let keys = PureKeyTable::new();
+        let key = keys.intern(PureNode::Send(keys.intern(PureNode::Lvar(account)), phone));
+        let cond = CondEnv::single(Scrutinee::Pure(key), str_ty);
         let entries: Vec<_> = cond.iter().collect();
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0].0, Scrutinee::Pure(k) if k == &key));

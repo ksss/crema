@@ -18,7 +18,6 @@
 //! demand.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -31,28 +30,29 @@ use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::members::{DefMemberOrigin, Member as RubyMember};
 use crate::ast::types::Type as AstType;
 use crate::definition::ancestor_builder::{self, Ancestor, AncestorBuilder, AncestorSource};
-use crate::definition::lowering_maps::LoweringMaps;
 use crate::definition::method::{deprecated_annotation, has_method_missing_annotation};
-use crate::definition::method_builder;
+use crate::definition::method_builder::{self, BucketMember, MemberSite};
 use crate::definition::{
     ConstantContext, ConstantResolver, Definition, LoweringEnv, MemberRef, Method,
     ResolverConstant, TypeDef, Variable, VariableDuplication, VariableDuplicationKind,
     VariableSource,
 };
-use crate::environment::draft::EnvironmentDraft;
+use crate::environment::draft::{EnvironmentDraft, PathIndexKey};
 use crate::environment::frozen::{
     ClassAliasDeclaration, ClassDeclaration, ClassOrModule, ClassOrModuleAliasEntry,
     InterfaceEntry, ModuleAliasDeclaration, ModuleDeclaration,
 };
 use crate::environment::ruby_decl;
-use crate::environment::{DeclKindLocal, DeclOrigin, Environment, InfusionUnit};
+use crate::environment::{DeclKindLocal, DeclOrigin, Environment, InfusionUnit, ScanScope};
 use crate::location::{DuplicateSource, LocationRange, SourceLocation};
 use crate::name::{Name, NameTable, Symbol};
+use crate::once_map::OnceMap;
 use crate::substitution::Substitution;
 use crate::type_name::TypeName;
 use crate::type_param::{TypeParam, TypeParamScope, TypeVarKey, TypeVarScope};
 use crate::types::{
     Function, FunctionType, MethodType, Ty, Type, TypeTable, UntypedFunction, Visibility,
+    intersection_of, union_of_many,
 };
 use std::path::PathBuf;
 
@@ -68,7 +68,15 @@ pub(crate) struct SubtypeCacheKey {
     pub(crate) type_variables_are_wildcards: bool,
 }
 
-type SubtypeCache = FxHashMap<SubtypeCacheKey, bool>;
+/// A resolved method together with the type-var bindings in scope where
+/// it was found — the result shape of the args-aware lookups.
+type MethodWithBindings = (Arc<Method>, FxHashMap<TypeVarKey, Ty>);
+
+/// Key of the [`DefinitionBuilder::lookup_instance_method_with_args`]
+/// memo: `(class, method, receiver args)`. A probe goes through
+/// `OnceMap::get_by` with the caller's borrowed `&[Ty]`, so a hit does
+/// not allocate an owned key.
+type InstanceLookupKey = (TypeName, Symbol, Box<[Ty]>);
 
 /// Key of [`DefinitionBuilder::interface_unify_cache`]: `(interface name,
 /// interface args, arg type, widen-leaves mode)`.
@@ -79,10 +87,16 @@ pub(crate) type InterfaceUnifyKey = (TypeName, Vec<Ty>, Ty, bool);
 ///
 /// `build_instance` / `build_singleton` / `build_interface` are lazy:
 /// a `Definition` is built the first time a given `TypeName` is requested
-/// and then cached inside a `RefCell<FxHashMap>` for subsequent calls
-/// (ADR-0020). `RefCell` keeps the public API as `&self` while allowing
-/// interior mutation; it is `!Sync`, preserving the single-thread
-/// assumption (concurrency is out of scope per ADR-0020).
+/// and then cached for subsequent calls (ADR-0020).
+///
+/// The derived caches here, in [`AncestorBuilder`] and in
+/// [`ConstantResolver`] are insert-only `OnceMap`s (plus one `OnceLock`
+/// for the resolver's ancestors seed), so the builder is `Send + Sync`
+/// and threads share one `&DefinitionBuilder` (ADR-0034 Decision 3). A
+/// value is computed first and stored afterwards; when two computations
+/// of one key race, the first stored value wins. The entry points that
+/// hand out an `Arc` return the stored one, so both callers hold the
+/// same `Arc`; the ones that return by value return what they computed.
 #[derive(Debug)]
 pub struct DefinitionBuilder {
     env: Arc<Environment>,
@@ -97,27 +111,22 @@ pub struct DefinitionBuilder {
     /// `&self` lookup methods can walk ancestors without juggling
     /// references at call sites.
     constant_resolver: ConstantResolver,
-    /// Shared declared-name membership + class-alias map for on-the-fly
-    /// `LoweringEnv` construction. Built once in `from_environment`;
-    /// `Arc`-shared so per-lookup instances can be assembled without
-    /// re-walking every declaration.
-    lowering_maps: Arc<LoweringMaps>,
     /// Lazy cache: one entry per class/module for the instance side.
     /// Populated on first call to `build_instance`; empty at construction.
-    instance_definition_cache: RefCell<FxHashMap<TypeName, Arc<Definition>>>,
+    instance_definition_cache: OnceMap<TypeName, Arc<Definition>>,
     /// Lazy cache: one entry per class/module for the singleton side.
     /// Populated on first call to `build_singleton`; empty at construction.
-    singleton_definition_cache: RefCell<FxHashMap<TypeName, Arc<Definition>>>,
+    singleton_definition_cache: OnceMap<TypeName, Arc<Definition>>,
     /// Lazy cache: one entry per interface.
     /// Populated on first call to `build_interface`; empty at construction.
-    interface_definition_cache: RefCell<FxHashMap<TypeName, Arc<Definition>>>,
+    interface_definition_cache: OnceMap<TypeName, Arc<Definition>>,
     /// Memoized `SubtypeChecker::check` results keyed by the four inputs
     /// that fully determine the answer:
     /// `(sub, sup, self_bound, type_variables_are_wildcards)`.
     /// Mirrors `Steep::Subtyping::Cache` (`subtyping/cache.rb`): both
     /// positive and negative results are stored. No invalidation since
     /// the underlying environment is immutable post-build (ADR-0020).
-    subtype_cache: RefCell<SubtypeCache>,
+    subtype_cache: OnceMap<SubtypeCacheKey, bool>,
     /// Memoized `TypeChecker::unify_interface_into_bindings` results: the
     /// type-var bindings an interface-typed param extracts from a concrete
     /// arg, keyed by `(interface, its args, the arg, widen-leaves mode)`.
@@ -127,7 +136,15 @@ pub struct DefinitionBuilder {
     /// members, and the same `(_ToAry, [U], Array[X])` key recurs across
     /// files, so this lives here rather than on the per-file checker.
     /// Same no-persistence rule as `subtype_cache` (keyed by `Ty`).
-    interface_unify_cache: RefCell<FxHashMap<InterfaceUnifyKey, Vec<(TypeVarKey, Ty)>>>,
+    interface_unify_cache: OnceMap<InterfaceUnifyKey, Vec<(TypeVarKey, Ty)>>,
+    /// The consultations each `subtype_cache` / `interface_unify_cache`
+    /// entry was computed from, replayed into the caller's log on a hit so
+    /// every file records what a miss would (ADR-0034 Consequences). Only
+    /// a view with a log fills them, so `crema check` leaves them empty.
+    /// An entry is stored before its result, so a reader that sees the
+    /// result also sees it.
+    subtype_consultations: OnceMap<SubtypeCacheKey, Consultations>,
+    interface_unify_consultations: OnceMap<InterfaceUnifyKey, Consultations>,
     /// Memoized `expand_alias` results: input `Ty` → fully-expanded `Ty`
     /// (after fixpoint alias-to-alias chasing). The function is called
     /// from both the dispatch path (`resolve_call_target_at` /
@@ -136,16 +153,45 @@ pub struct DefinitionBuilder {
     /// `Type::Alias` arm), so the in-function cache amortizes across all
     /// callers. Cyclic aliases hitting `ALIAS_EXPANSION_LIMIT` are stored
     /// as the bottomed-out `Type::Alias` itself, mirroring the function's
-    /// return contract.
-    expand_alias_cache: RefCell<FxHashMap<Ty, Ty>>,
+    /// return contract. Each entry also carries the alias hops the
+    /// expansion consulted, replayed into the caller's log on a hit.
+    expand_alias_cache: OnceMap<Ty, (Ty, AliasHops)>,
     /// Memoized `normalize_receiver` results: input `Ty` → fully-normalized
     /// `Ty` (alias expand + Optional/Bool sugar widen + alias-of-union
     /// flatten, applied at the dispatch boundary). Keyed on the
     /// pre-normalization `Ty`. Independent of `expand_alias_cache` because
     /// the normalize result diverges (widen + flatten) and is only safe to
     /// reuse at dispatch sites, not at utility sites where widen would
-    /// change semantics.
-    normalize_receiver_cache: RefCell<FxHashMap<Ty, Ty>>,
+    /// change semantics. Carries the alias hops like `expand_alias_cache`.
+    normalize_receiver_cache: OnceMap<Ty, (Ty, AliasHops)>,
+    /// Memoized results of the three public method lookups
+    /// ([`Self::lookup_instance_method`], [`Self::lookup_instance_method_with_args`],
+    /// [`Self::lookup_singleton_method`]), misses included. crema keeps
+    /// `Definition.methods` own-only (ADR-0009 / ADR-0019), so each lookup
+    /// re-merges the ancestor chain; these hold that merge per key that
+    /// was actually asked for, instead of rbs's eager per-class merge.
+    ///
+    /// Invariants:
+    /// - The three stay separate: the plain lookup leaves inherited
+    ///   overloads unsubstituted, the args-aware one substitutes them, and
+    ///   instance / singleton sides differ for the same name.
+    /// - Only the public entry points read or write them. `super` and the
+    ///   build-time singleton walk hand the same walkers a partial chain,
+    ///   so a memo below the entry would serve them a full-chain result.
+    /// - A result is computed before it is stored, never inside the map:
+    ///   the walk re-enters these same lookups (alias targets, module
+    ///   self-type fallback).
+    /// - A stored `Method` is the `Arc` some `Definition` already holds
+    ///   whenever the walk found it and merged nothing, so the memo (and
+    ///   every hit) costs a pointer per key, not a copy per receiver.
+    ///   Merged results (overloads across ancestors, resolved aliases,
+    ///   interface implementer stamps) get their own allocation.
+    /// - Not carried over by [`Self::update`]: a result depends on every
+    ///   ancestor's members and the with-args key holds `Ty`s (ADR-0028
+    ///   Decision 3).
+    instance_method_memo: OnceMap<(TypeName, Symbol), Option<Arc<Method>>>,
+    instance_method_with_args_memo: OnceMap<InstanceLookupKey, Arc<Option<MethodWithBindings>>>,
+    singleton_method_memo: OnceMap<(TypeName, Symbol), Arc<Option<MethodWithBindings>>>,
     /// Resolved type-param cache keyed by class / module / interface
     /// `TypeName`. Mirrors the legacy `DefinitionBuilder.type_params`
     /// shape so Phase 5b consumers (subtyping / type_checker) can pull
@@ -207,28 +253,44 @@ impl DefinitionBuilder {
     /// A lightweight member-only dup scan runs at construction so that
     /// `DuplicatedMethodDefinition` diagnostics remain complete even for
     /// classes that are never actually touched during type checking.
+    /// Every owner is scanned ([`ScanScope::Whole`]); see
+    /// [`Self::from_environment_scoped`] for the filtered form.
     pub fn from_environment(env: Arc<Environment>) -> Self {
+        Self::from_environment_scoped(env, &ScanScope::Whole)
+    }
+
+    /// [`Self::from_environment`] with the diagnostics-only scans
+    /// (`method_dups` / `alias_cycles` / `variable_dups`) restricted to
+    /// `scope`'s owners (ADR-0036 Decision 4-2 — see [`ScanScope`] for
+    /// why that is output-preserving under the CLI file filter). The
+    /// scans are the only thing `scope` touches: `AncestorBuilder`,
+    /// `ConstantResolver`, the synthetic-concern index and every lazy
+    /// definition cache are built the same way for every scope, so type
+    /// checking never observes it.
+    pub fn from_environment_scoped(env: Arc<Environment>, scope: &ScanScope) -> Self {
         let ancestor_builder = Arc::new(AncestorBuilder::new(Arc::clone(&env)));
-        let lowering = LoweringEnv::from_environment(&env, ancestor_builder.types());
         let (method_dups, alias_cycles) =
-            scan_method_builder_diagnostics(&env, &lowering, ancestor_builder.types());
-        let variable_dups = scan_variable_dups(&env);
+            scan_method_builder_diagnostics(&env, ancestor_builder.types(), scope);
+        let variable_dups = scan_variable_dups(&env, scope);
         let synthetic_concern_index = scan_synthetic_concern_index(&env);
         let constant_resolver = ConstantResolver::new(Arc::clone(&ancestor_builder));
-        let lowering_maps = Arc::clone(&lowering.maps);
 
         Self {
             env,
             ancestor_builder,
             constant_resolver,
-            lowering_maps,
-            instance_definition_cache: RefCell::new(FxHashMap::default()),
-            singleton_definition_cache: RefCell::new(FxHashMap::default()),
-            interface_definition_cache: RefCell::new(FxHashMap::default()),
-            subtype_cache: RefCell::new(FxHashMap::default()),
-            interface_unify_cache: RefCell::new(FxHashMap::default()),
-            expand_alias_cache: RefCell::new(FxHashMap::default()),
-            normalize_receiver_cache: RefCell::new(FxHashMap::default()),
+            instance_definition_cache: OnceMap::default(),
+            singleton_definition_cache: OnceMap::default(),
+            interface_definition_cache: OnceMap::default(),
+            subtype_cache: OnceMap::default(),
+            interface_unify_cache: OnceMap::default(),
+            subtype_consultations: OnceMap::default(),
+            interface_unify_consultations: OnceMap::default(),
+            expand_alias_cache: OnceMap::default(),
+            normalize_receiver_cache: OnceMap::default(),
+            instance_method_memo: OnceMap::default(),
+            instance_method_with_args_memo: OnceMap::default(),
+            singleton_method_memo: OnceMap::default(),
             type_params: TypeParamsCache::default(),
             method_dups,
             alias_cycles,
@@ -252,16 +314,13 @@ impl DefinitionBuilder {
     ///
     /// Three fields are *not* carried over, each for a different reason:
     /// - `subtype_cache` / `interface_unify_cache` / `expand_alias_cache` /
-    ///   `normalize_receiver_cache`: forbidden outright (ADR-0028 Decision 3 — no persistence for a
+    ///   `normalize_receiver_cache` / the three method-lookup memos: forbidden outright (ADR-0028 Decision 3 — no persistence for a
     ///   cache keyed by `Ty`, since crema has no "changed `TypeName` ->
     ///   affected `Ty` keys" reverse index to invalidate by).
     /// - `type_params`: rbs has no correspondent (crema-only convenience
-    ///   cache read via [`TypeParamsCache::get_or_compute`]). Its backing
-    ///   [`crate::snapshot::append_map::AppendMap`] is insert-only by
-    ///   safety invariant (see that type's doc) with no removal op, so a
-    ///   partial except-aware carry is not implementable without touching
-    ///   that invariant; starting fresh is the safe choice and cheap
-    ///   (on-demand, same as a first build).
+    ///   cache read via [`TypeParamsCache::get_or_compute`]), so there is
+    ///   no carry-over rule to port; starting fresh is cheap (on-demand,
+    ///   same as a first build).
     /// - `constant_resolver`: rbs's `Resolver::ConstantResolver` has no
     ///   `update` either (checked: absent from
     ///   `lib/rbs/resolver/constant_resolver.rb`), but a fresh rebuild
@@ -271,12 +330,9 @@ impl DefinitionBuilder {
     ///   layer, same framing as F4c): only owners touched by `except` /
     ///   `constants` recompute, lookup semantics are unchanged.
     ///
-    /// `lowering_maps` is *not* recomputed here: `ancestor_builder` (per
-    /// the contract above) has already delta-patched it via
-    /// [`AncestorBuilder::update`](crate::definition::ancestor_builder::AncestorBuilder::update)
-    /// (ADR-0028 S4b), so `ancestor_builder.lowering()` is reused
-    /// verbatim — recomputing here would be the same O(env) work twice
-    /// for an identical result (both start from the same `env`).
+    /// The re-scans for `except` owners run the diagnostics-only
+    /// `MethodBuilder` (no lowering), so nothing from `ancestor_builder`
+    /// beyond its `TypeTable` is needed here.
     pub fn update(
         &self,
         env: Arc<Environment>,
@@ -285,15 +341,13 @@ impl DefinitionBuilder {
         ancestor_builder: Arc<AncestorBuilder>,
     ) -> Self {
         let types = ancestor_builder.types();
-        let lowering = ancestor_builder.lowering();
 
         let mut method_dups = self.method_dups.without(except);
         let mut alias_cycles = self.alias_cycles.without(except);
         let mut variable_dups = self.variable_dups.without(except);
         for &owner in except {
             if let Some(entry) = env.class_decls().get(&owner) {
-                let (_, _, dups, cycles) =
-                    extract_class_or_module_methods(&env, &lowering, types, &owner, entry);
+                let (dups, cycles) = scan_class_or_module_method_diagnostics(&env, types, &owner);
                 method_dups.push(owner, dups);
                 alias_cycles.push(owner, cycles);
 
@@ -311,9 +365,8 @@ impl DefinitionBuilder {
                     env.names(),
                 );
                 variable_dups.push(owner, owner_var_dups);
-            } else if let Some(entry) = env.interface_decls().get(&owner) {
-                let (_, dups, cycles) =
-                    extract_interface_methods(&env, &lowering, types, &owner, entry);
+            } else if env.interface_decls().get(&owner).is_some() {
+                let (dups, cycles) = scan_interface_method_diagnostics(&env, types, &owner);
                 method_dups.push(owner, dups);
                 alias_cycles.push(owner, cycles);
             }
@@ -335,20 +388,23 @@ impl DefinitionBuilder {
                 .table()
                 .update(&self.env, &env, except, constants),
         );
-        let lowering_maps = Arc::clone(&lowering.maps);
 
         Self {
             env,
             ancestor_builder,
             constant_resolver,
-            lowering_maps,
             instance_definition_cache,
             singleton_definition_cache,
             interface_definition_cache,
-            subtype_cache: RefCell::new(FxHashMap::default()),
-            interface_unify_cache: RefCell::new(FxHashMap::default()),
-            expand_alias_cache: RefCell::new(FxHashMap::default()),
-            normalize_receiver_cache: RefCell::new(FxHashMap::default()),
+            subtype_cache: OnceMap::default(),
+            interface_unify_cache: OnceMap::default(),
+            subtype_consultations: OnceMap::default(),
+            interface_unify_consultations: OnceMap::default(),
+            expand_alias_cache: OnceMap::default(),
+            normalize_receiver_cache: OnceMap::default(),
+            instance_method_memo: OnceMap::default(),
+            instance_method_with_args_memo: OnceMap::default(),
+            singleton_method_memo: OnceMap::default(),
             type_params: TypeParamsCache::default(),
             method_dups,
             alias_cycles,
@@ -383,7 +439,7 @@ impl DefinitionBuilder {
     /// feed it back via [`Self::store_subtype_result`]. Mirrors
     /// `Steep::Subtyping::Cache#[]` (`subtyping/cache.rb:15`).
     pub(crate) fn cached_subtype_result(&self, key: &SubtypeCacheKey) -> Option<bool> {
-        self.subtype_cache.borrow().get(key).copied()
+        self.subtype_cache.get(key).copied()
     }
 
     /// Memoize the result of a subtype check. The relation is
@@ -391,7 +447,7 @@ impl DefinitionBuilder {
     /// same key is idempotent. Mirrors `Steep::Subtyping::Cache#[]=`
     /// (`subtyping/cache.rb:20`).
     pub(crate) fn store_subtype_result(&self, key: SubtypeCacheKey, result: bool) {
-        self.subtype_cache.borrow_mut().insert(key, result);
+        self.subtype_cache.insert_first(key, result);
     }
 
     /// Memo read for `TypeChecker::unify_interface_into_bindings`; see
@@ -400,7 +456,7 @@ impl DefinitionBuilder {
         &self,
         key: &InterfaceUnifyKey,
     ) -> Option<Vec<(TypeVarKey, Ty)>> {
-        self.interface_unify_cache.borrow().get(key).cloned()
+        self.interface_unify_cache.get(key).cloned()
     }
 
     pub(crate) fn store_interface_unify(
@@ -408,25 +464,7 @@ impl DefinitionBuilder {
         key: InterfaceUnifyKey,
         bindings: Vec<(TypeVarKey, Ty)>,
     ) {
-        self.interface_unify_cache
-            .borrow_mut()
-            .insert(key, bindings);
-    }
-
-    /// Cache-state inspector for [`expand_alias`] tests. Returns the
-    /// previously-stored expansion of `ty`, or `None` if `expand_alias`
-    /// has not been invoked on this input yet.
-    #[cfg(test)]
-    pub(crate) fn cached_expand_alias(&self, ty: Ty) -> Option<Ty> {
-        self.expand_alias_cache.borrow().get(&ty).copied()
-    }
-
-    /// Cache-state inspector for [`normalize_receiver`] tests. Returns
-    /// the previously-stored normalization of `ty`, or `None` if
-    /// `normalize_receiver` has not been invoked on this input yet.
-    #[cfg(test)]
-    pub(crate) fn cached_normalize_receiver(&self, ty: Ty) -> Option<Ty> {
-        self.normalize_receiver_cache.borrow().get(&ty).copied()
+        self.interface_unify_cache.insert_first(key, bindings);
     }
 
     /// Instance-side `Definition` for a class / module.
@@ -435,7 +473,7 @@ impl DefinitionBuilder {
     /// memoized (ADR-0020): first call builds and caches; subsequent
     /// calls return the cached `Arc`. Returns `None` for unknown names.
     pub fn build_instance(&self, name: &TypeName) -> Option<Arc<Definition>> {
-        if let Some(arc) = self.instance_definition_cache.borrow().get(name).cloned() {
+        if let Some(arc) = self.instance_definition_cache.get(name).cloned() {
             return Some(arc);
         }
         self.build_class_pair(name).map(|(inst, _)| inst)
@@ -447,7 +485,7 @@ impl DefinitionBuilder {
     /// memoized; shares build work with `build_instance` so calling
     /// either side populates both caches for that `TypeName`.
     pub fn build_singleton(&self, name: &TypeName) -> Option<Arc<Definition>> {
-        if let Some(arc) = self.singleton_definition_cache.borrow().get(name).cloned() {
+        if let Some(arc) = self.singleton_definition_cache.get(name).cloned() {
             return Some(arc);
         }
         self.build_class_pair(name).map(|(_, sing)| sing)
@@ -458,7 +496,7 @@ impl DefinitionBuilder {
     /// Mirrors `RBS::DefinitionBuilder#build_interface`. On-demand
     /// memoized (ADR-0020).
     pub fn build_interface(&self, name: &TypeName) -> Option<Arc<Definition>> {
-        if let Some(arc) = self.interface_definition_cache.borrow().get(name).cloned() {
+        if let Some(arc) = self.interface_definition_cache.get(name).cloned() {
             return Some(arc);
         }
         let entry = self.env.interface_decls().get(name)?;
@@ -471,9 +509,7 @@ impl DefinitionBuilder {
             name,
             entry,
         ));
-        self.interface_definition_cache
-            .borrow_mut()
-            .insert(*name, Arc::clone(&arc));
+        let arc = Arc::clone(self.interface_definition_cache.insert_first(*name, arc));
         Some(arc)
     }
 
@@ -481,13 +517,13 @@ impl DefinitionBuilder {
     /// ancestor walk). Shields callers from the `Arc<Definition>` +
     /// `FxHashMap<Symbol, Method>` access shape so resolver code only
     /// references `Method`.
-    fn own_instance_method(&self, name: &TypeName, method: Symbol) -> Option<Method> {
+    fn own_instance_method(&self, name: &TypeName, method: Symbol) -> Option<Arc<Method>> {
         self.build_instance(name)
             .and_then(|d| d.methods.get(&method).cloned())
     }
 
     /// Singleton-side counterpart of [`Self::own_instance_method`].
-    fn own_singleton_method(&self, name: &TypeName, method: Symbol) -> Option<Method> {
+    fn own_singleton_method(&self, name: &TypeName, method: Symbol) -> Option<Arc<Method>> {
         self.build_singleton(name)
             .and_then(|d| d.methods.get(&method).cloned())
     }
@@ -495,7 +531,7 @@ impl DefinitionBuilder {
     /// Interface counterpart of [`Self::own_instance_method`]. Used by
     /// the instance walker as a fallback when a mixed-in interface owns
     /// the method.
-    fn own_interface_method(&self, name: &TypeName, method: Symbol) -> Option<Method> {
+    fn own_interface_method(&self, name: &TypeName, method: Symbol) -> Option<Arc<Method>> {
         self.build_interface(name)
             .and_then(|d| d.methods.get(&method).cloned())
     }
@@ -518,11 +554,13 @@ impl DefinitionBuilder {
         name: &TypeName,
         method: Symbol,
         includer: Option<TypeName>,
-    ) -> Option<Method> {
+    ) -> Option<Arc<Method>> {
         self.own_instance_method(name, method).or_else(|| {
             self.own_interface_method(name, method).map(|mut m| {
                 if let Some(includer) = includer {
-                    m.stamp_interface_implementer(includer);
+                    // Copy-on-write: the interface's own `Definition`
+                    // keeps `implemented_in: None`.
+                    Arc::make_mut(&mut m).stamp_interface_implementer(includer);
                 }
                 m
             })
@@ -572,7 +610,7 @@ impl DefinitionBuilder {
         name: &TypeName,
         method: Symbol,
         skip: &FxHashSet<TypeName>,
-    ) -> Option<Method> {
+    ) -> Option<Arc<Method>> {
         if self.declared_kind_by_type_name(name) != Some(DeclKindLocal::Module) {
             return None;
         }
@@ -626,7 +664,7 @@ impl DefinitionBuilder {
         anc_args: &[Ty],
         method: Symbol,
         skip: &FxHashSet<TypeName>,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         if self.declared_kind_by_type_name(name) != Some(DeclKindLocal::Module) {
             return None;
         }
@@ -691,9 +729,10 @@ impl DefinitionBuilder {
             entry,
         );
         let instance_arc = Arc::new(instance_def);
-        self.instance_definition_cache
-            .borrow_mut()
-            .insert(*name, Arc::clone(&instance_arc));
+        let instance_arc = Arc::clone(
+            self.instance_definition_cache
+                .insert_first(*name, instance_arc),
+        );
 
         if matches!(entry, ClassOrModule::Class(_)) {
             self.bake_typed_new(name, &mut singleton_def);
@@ -701,9 +740,10 @@ impl DefinitionBuilder {
         }
 
         let singleton_arc = Arc::new(singleton_def);
-        self.singleton_definition_cache
-            .borrow_mut()
-            .insert(*name, Arc::clone(&singleton_arc));
+        let singleton_arc = Arc::clone(
+            self.singleton_definition_cache
+                .insert_first(*name, singleton_arc),
+        );
         Some((instance_arc, singleton_arc))
     }
 
@@ -846,7 +886,7 @@ impl DefinitionBuilder {
             }
             None => synthesize_untyped_new(instance_ty, *name),
         };
-        singleton_def.methods.insert(new_sym, synth);
+        singleton_def.methods.insert(new_sym, Arc::new(synth));
     }
 
     /// Same chain walk as [`Self::lookup_singleton_method`] but skips
@@ -856,16 +896,30 @@ impl DefinitionBuilder {
     /// `Arc` and routing through `lookup_singleton_method` would re-enter
     /// `build_class_pair(class)`. Discards the bindings tuple — the gate
     /// only cares about `defs[*].member` / `defs[*].defined_in`.
+    ///
+    /// On a superclass cycle (`class A < B; class B < A`) it also skips
+    /// every ancestor whose own singleton chain leads back to `class`:
+    /// building that ancestor's pair would walk back into `class`'s
+    /// in-flight build and recurse without end.
     fn lookup_singleton_method_skip_self(
         &self,
         class: &TypeName,
         method: Symbol,
-    ) -> Option<Method> {
-        let chain = self.ancestor_builder.singleton_ancestors(class);
+    ) -> Option<Arc<Method>> {
+        let (chain, on_cycle) = self.ancestor_builder.singleton_ancestors_on_cycle(class);
+        let reaches_back = |name: &TypeName| {
+            on_cycle
+                && self
+                    .ancestor_builder
+                    .singleton_ancestors(name)
+                    .ancestors
+                    .iter()
+                    .any(|a| matches!(a, Ancestor::Singleton { name } if name == class))
+        };
         self.walk_singleton_chain(
-            chain.ancestors.iter().filter(
-                |ancestor| !matches!(ancestor, Ancestor::Singleton { name } if name == class),
-            ),
+            chain.ancestors.iter().filter(|ancestor| {
+                !matches!(ancestor, Ancestor::Singleton { name } if name == class || reaches_back(name))
+            }),
             method,
             None,
         )
@@ -879,41 +933,29 @@ impl DefinitionBuilder {
     /// environment is frozen.
     ///
     /// `context` is the lexical class/module nesting at the assertion
-    /// site, formatted the same way `type_builder::build_type` expects:
-    /// each entry is the absolute `Name` of one enclosing scope
-    /// (`Some(::A)`, `Some(::A::B)`). Inline assertions parse fresh AST
-    /// at check time, so unlike the frozen-environment lowering path
-    /// (which sees AST already canonicalized to absolute paths), the
-    /// resolver here must walk this stack to canonicalize relative
-    /// names like `Inner` against the enclosing namespace.
+    /// site, innermost last, the shape the type checker's cref stack has.
+    /// Inline assertions parse fresh AST at check time, so unlike the
+    /// frozen-environment lowering path (which sees AST already
+    /// canonicalized to absolute paths), the resolver here must walk this
+    /// stack to canonicalize relative names like `Inner` against the
+    /// enclosing namespace.
     ///
     /// `scope` carries any in-scope type parameters; pass
     /// [`TypeParamScope::new`] when no class/method type params apply.
     pub fn lower_ast_type(
         &self,
         ast_ty: &crate::ast::types::Type,
-        context: &[Option<Name>],
+        context: &[TypeName],
         scope: &crate::type_param::TypeParamScope,
     ) -> Ty {
-        let lowering = self.make_lowering_env();
-        crate::definition_builder::type_builder::build_type(
-            ast_ty,
-            context,
-            &lowering.maps,
-            lowering.names,
-            lowering.types,
-            scope,
-        )
+        self.make_lowering_env()
+            .build_type_in_context(ast_ty, context, scope)
     }
 
-    /// Construct a call-frame `LoweringEnv` by sharing the pre-built `Arc`.
-    /// Cheap: one `Arc::clone` call plus borrows of `names` and `types`.
+    /// Construct a call-frame `LoweringEnv`: borrows of `env`, `names`
+    /// and `types`, nothing is cloned.
     fn make_lowering_env(&self) -> LoweringEnv<'_> {
-        LoweringEnv::from_maps(
-            Arc::clone(&self.lowering_maps),
-            self.env.names(),
-            self.ancestor_builder.types(),
-        )
+        LoweringEnv::from_environment(&self.env, self.ancestor_builder.types())
     }
 
     /// Expand a type alias to its body, substituting `args` for the
@@ -922,7 +964,131 @@ impl DefinitionBuilder {
     ///
     /// Returns `None` when `name` is not declared as a type alias, or when
     /// `args.len() != params.len()` (mirrors rbs `expand_alias2` raise).
+    ///
+    /// An alias that recurs through `|` / `&` / `?` with no type
+    /// constructor in between (`type t = ::Integer | t`, rbs's
+    /// `RecursiveTypeAliasError`) has no finite unfolding: every walker
+    /// that descends into union members would re-expose it forever. Each
+    /// such self-reference is replaced by the identity of the operator
+    /// around it, which for a union is the least fixed point (`t` is
+    /// `::Integer`). rbs rejects these aliases and Steep overflows on
+    /// them, so there is no reference behavior to follow.
     pub fn expand_type_alias(&self, name: &TypeName, args: &[Ty]) -> Option<Ty> {
+        let body = self.lower_type_alias(name, args)?;
+        if !self.transparently_reaches(*name, &[*name]) {
+            return Some(body);
+        }
+        let mut unfolding = vec![(*name, args.to_vec())];
+        Some(match self.close_alias_cycles(body, &mut unfolding) {
+            Some(closed) => closed,
+            // A bare alias (`type a = b`, `type b = a`) is left to
+            // `expand_alias`'s hop limit, as before.
+            None if matches!(
+                self.ancestor_builder.types().resolve(body),
+                Type::Alias { .. }
+            ) =>
+            {
+                body
+            }
+            // Every member leads back (`type a = b | a`, `type b = a | b`):
+            // the fixed point is empty. `bot` would read as a call that
+            // never returns and silence the code after it, so degrade to
+            // `untyped` instead.
+            None => Ty::UNTYPED,
+        })
+    }
+
+    /// Whether an alias in `targets` is reachable from `from` through
+    /// `|` / `&` / `?` alone — the edges of rbs's
+    /// `TypeAliasDependency#direct_dependency`.
+    fn transparently_reaches(&self, from: TypeName, targets: &[TypeName]) -> bool {
+        let decls = self.env.type_alias_decls();
+        let mut seen: FxHashSet<TypeName> = FxHashSet::default();
+        let mut stack = vec![from];
+        let mut deps = Vec::new();
+        while let Some(current) = stack.pop() {
+            let Some(entry) = decls.get(&current) else {
+                continue;
+            };
+            deps.clear();
+            collect_direct_alias_deps(&entry.decl.ty, &mut deps);
+            for &dep in &deps {
+                if targets.contains(&dep) {
+                    return true;
+                }
+                if seen.insert(dep) {
+                    stack.push(dep);
+                }
+            }
+        }
+        false
+    }
+
+    /// Unfold the aliases of `ty` that lead back into `unfolding` and drop
+    /// the references that close the cycle. `None` stands for a dropped
+    /// reference — the identity of the enclosing `|` / `&`, or `nil` under
+    /// `?`. Aliases outside the cycle keep their shape.
+    ///
+    /// A re-entry with different arguments (`type l[T] = T | l[Array[T]]`)
+    /// unfolds to an infinite union with no finite form; it becomes
+    /// `untyped` rather than being dropped, which would claim `l[T]` is
+    /// just `T`.
+    fn close_alias_cycles(&self, ty: Ty, unfolding: &mut Vec<(TypeName, Vec<Ty>)>) -> Option<Ty> {
+        let types = self.ancestor_builder.types();
+        match types.resolve(ty) {
+            Type::Alias { name, args } => {
+                let name = *name;
+                if let Some((_, outer_args)) = unfolding.iter().find(|(n, _)| *n == name) {
+                    return (outer_args != args).then_some(Ty::UNTYPED);
+                }
+                let names: Vec<TypeName> = unfolding.iter().map(|(n, _)| *n).collect();
+                if !self.transparently_reaches(name, &names) {
+                    return Some(ty);
+                }
+                let args = args.clone();
+                let Some(body) = self.lower_type_alias(&name, &args) else {
+                    return Some(ty);
+                };
+                unfolding.push((name, args));
+                let closed = self.close_alias_cycles(body, unfolding);
+                unfolding.pop();
+                closed
+            }
+            Type::Union(members) => {
+                let members = members.clone();
+                let kept: Vec<Ty> = members
+                    .iter()
+                    .filter_map(|&m| self.close_alias_cycles(m, unfolding))
+                    .collect();
+                if kept == members {
+                    Some(ty)
+                } else {
+                    (!kept.is_empty()).then(|| union_of_many(&kept, types))
+                }
+            }
+            Type::Intersection(members) => {
+                let members = members.clone();
+                let kept: Vec<Ty> = members
+                    .iter()
+                    .filter_map(|&m| self.close_alias_cycles(m, unfolding))
+                    .collect();
+                if kept == members {
+                    Some(ty)
+                } else {
+                    kept.into_iter().reduce(|a, b| intersection_of(a, b, types))
+                }
+            }
+            &Type::Optional(inner) => Some(match self.close_alias_cycles(inner, unfolding) {
+                Some(closed) if closed == inner => ty,
+                Some(closed) => types.intern(Type::Optional(closed)),
+                None => Ty::NIL,
+            }),
+            _ => Some(ty),
+        }
+    }
+
+    /// The alias body with `args` substituted, unfolded no further.
+    fn lower_type_alias(&self, name: &TypeName, args: &[Ty]) -> Option<Ty> {
         let entry = self.env.type_alias_decls().get(name)?;
         let lowering = self.make_lowering_env();
         let class_scope = build_class_param_scope(&entry.decl.type_params, name);
@@ -1044,22 +1210,12 @@ impl DefinitionBuilder {
     /// Flat, insertion-order view of every duplicate-method finding.
     /// Collected on demand from the per-owner cache; kept as an owned
     /// `Vec` so callers that want `.len()` / `[i]` / `.iter()` can use
-    /// them uniformly. Per-owner lookup goes through
-    /// [`Self::method_dups_for`].
+    /// them uniformly.
     pub fn method_dups(&self) -> Vec<MethodDupEntry> {
         self.method_dups
             .iter()
             .flat_map(|(_, e)| e.to_vec())
             .collect()
-    }
-
-    /// Duplicate methods for a single owner. `None` for owners the
-    /// scan never saw a dup on (i.e. every well-behaved class). Used
-    /// by consumers that want to hand-craft per-name views (tests,
-    /// and future `update(except:)`).
-    #[allow(dead_code)]
-    pub(crate) fn method_dups_for(&self, owner: &TypeName) -> Option<Vec<MethodDupEntry>> {
-        self.method_dups.get(owner).map(|v| v.to_vec())
     }
 
     /// Recursive-alias cycles detected during the same construction-time
@@ -1077,11 +1233,6 @@ impl DefinitionBuilder {
             .iter()
             .flat_map(|(_, e)| e.to_vec())
             .collect()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn variable_dups_for(&self, owner: &TypeName) -> Option<Vec<VariableDuplication>> {
-        self.variable_dups.get(owner).map(|v| v.to_vec())
     }
 
     /// ADR-0032 Decision 5b: injection-target owners for a synthetic
@@ -1162,18 +1313,9 @@ impl DefinitionBuilder {
         self.ancestor_builder.types()
     }
 
-    /// Mirror of legacy `DefinitionBuilder::declared_kind(&str)` — class
-    /// / module / interface lookup against the frozen environment.
-    pub fn declared_kind(&self, class_name: &str) -> Option<DeclKindLocal> {
-        let n = self.names().lookup(class_name)?;
-        let tn = self.declared_type_name_by_name(n)?;
-        self.declared_kind_by_type_name(&tn)
-    }
-
-    /// `TypeName`-keyed variant of [`declared_kind`](Self::declared_kind).
-    /// Class / module aliases (`module YAML = Psych`) are normalized
-    /// through the frozen environment's alias table so the alias resolves
-    /// to the target's kind, mirroring legacy `DefinitionBuilder::declared_kind`.
+    /// Class / module / interface kind of a declared name. Class / module
+    /// aliases (`module YAML = Psych`) are normalized through the frozen
+    /// environment's alias table so the alias resolves to the target's kind.
     pub fn declared_kind_by_type_name(&self, tn: &TypeName) -> Option<DeclKindLocal> {
         if let Some(com) = self.env.class_decls().get(tn) {
             return Some(match com {
@@ -1245,13 +1387,13 @@ impl DefinitionBuilder {
     /// when no declaration is found in the frozen environment.
     pub fn declared_type_name_by_name(&self, name: Name) -> Option<TypeName> {
         let s = self.names().resolve(name);
-        let class_tn = self.names().parse_type_name(&s);
+        let class_tn = self.names().parse_type_name(s);
         if self.env.class_decls().contains_key(&class_tn)
             || self.env.class_alias_decls().contains_key(&class_tn)
         {
             return Some(class_tn);
         }
-        let interface_tn = self.names().parse_type_name(&s);
+        let interface_tn = self.names().parse_type_name(s);
         if self.env.interface_decls().contains_key(&interface_tn) {
             return Some(interface_tn);
         }
@@ -1266,15 +1408,7 @@ impl DefinitionBuilder {
             return Some(name);
         }
 
-        self.declared_type_name_by_name(self.names().intern(&self.names().resolve(name)))
-    }
-
-    /// `Name`-in / `Name`-out wrapper around the frozen environment's
-    /// `TypeName`-based normalize. Folds the `class X = Y` alias chain.
-    pub fn normalize_module_name(&self, name: Name) -> Name {
-        let tn = self.names().parse_type_name(&self.names().resolve(name));
-        let normalized = self.env.normalize_module_name(&tn);
-        self.names().intern(&self.names().resolve(normalized))
+        self.declared_type_name_by_name(self.names().intern(&self.names().display_type_name(name)))
     }
 
     /// Resolved type parameters of a class / module / interface, keyed
@@ -1323,7 +1457,7 @@ impl DefinitionBuilder {
     /// the type-view `Definition` carries `methods: FxHashMap`, not a
     /// declaration-order `Vec<Symbol>` field.
     pub fn interface_method_names_by_name(&self, name: Name) -> Option<Vec<Symbol>> {
-        let tn = self.names().parse_type_name(&self.names().resolve(name));
+        let tn = self.names().parse_type_name(self.names().resolve(name));
         self.interface_method_names_by_type_name(&tn)
     }
 
@@ -1391,7 +1525,23 @@ impl DefinitionBuilder {
     /// applied to the receiver are *not* substituted here — callers
     /// (type checker) hold the receiver's `Ty` and run the
     /// substitution themselves.
-    pub fn lookup_instance_method(&self, class: &TypeName, method: Symbol) -> Option<Method> {
+    ///
+    /// Memoized per `(class, method)`; see [`Self::instance_method_memo`].
+    pub fn lookup_instance_method(&self, class: &TypeName, method: Symbol) -> Option<Arc<Method>> {
+        let key = (*class, method);
+        if let Some(hit) = self.instance_method_memo.get(&key) {
+            return hit.clone();
+        }
+        let result = self.resolve_instance_method_unsubstituted(class, method);
+        self.instance_method_memo.insert_first(key, result.clone());
+        result
+    }
+
+    fn resolve_instance_method_unsubstituted(
+        &self,
+        class: &TypeName,
+        method: Symbol,
+    ) -> Option<Arc<Method>> {
         let chain = self
             .ancestor_builder
             .instance_ancestors(class)
@@ -1408,7 +1558,7 @@ impl DefinitionBuilder {
                 _ => None,
             })
             .collect();
-        let mut acc: Option<Method> = None;
+        let mut acc: Option<Arc<Method>> = None;
         // Nearest non-interface ancestor passed so far — the implementer
         // a mixed-in interface's methods are attributed to. Seeded with
         // the first non-interface entry rather than `None` because a
@@ -1455,7 +1605,7 @@ impl DefinitionBuilder {
                 let Some(target) = self.lookup_instance_method(name, am.old_name) else {
                     continue;
                 };
-                m = self.build_resolved_alias(&target, &am, name);
+                m = Arc::new(self.build_resolved_alias(&target, &am, name));
             }
             let is_overloading = m.is_overloading();
             match acc.as_mut() {
@@ -1464,10 +1614,13 @@ impl DefinitionBuilder {
                     // Merge child + parent annotations and re-apply
                     // rbs step C across all defs (lookup-time equivalent
                     // of rbs `define_method` lines 891-967).
-                    let parent_anns = m.annotations;
-                    prev.defs.extend(m.defs);
+                    // `make_mut` detaches `prev` from the child's
+                    // `Definition` on the first merge; the merged result
+                    // never flows back into any `Definition`.
+                    let prev = Arc::make_mut(prev);
+                    prev.defs.extend(m.defs.iter().cloned());
                     prev.drop_unannotated_placeholder_defs();
-                    merge_inherited_annotations(prev, parent_anns);
+                    merge_inherited_annotations(prev, m.annotations.clone());
                 }
             }
             if !is_overloading {
@@ -1582,17 +1735,30 @@ impl DefinitionBuilder {
     /// `method`; subsequent overload entries along the chain extend
     /// `defs` but do not change the binding scope, matching the
     /// args-free [`Self::lookup_instance_method`] ascent rule.
+    ///
+    /// Memoized per `(class, args, method)`; see [`Self::instance_method_memo`].
     pub fn lookup_instance_method_with_args(
         &self,
         class: &TypeName,
         args: &[Ty],
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
+        if let Some(hit) = self
+            .instance_method_with_args_memo
+            .get_by(&(*class, method, args), |k| {
+                k.0 == *class && k.1 == method && *k.2 == *args
+            })
+        {
+            return (**hit).clone();
+        }
         let chain = self
             .ancestor_builder
             .instance_ancestors(class)
             .apply(args, self.ancestor_builder.types());
-        self.resolve_instance_method_in_chain(&chain, method)
+        let result = self.resolve_instance_method_in_chain(&chain, method);
+        self.instance_method_with_args_memo
+            .insert_first((*class, method, args.into()), Arc::new(result.clone()));
+        result
     }
 
     /// Interface counterpart of [`Self::lookup_instance_method_with_args`].
@@ -1611,7 +1777,7 @@ impl DefinitionBuilder {
         interface: &TypeName,
         args: &[Ty],
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         let chain = self
             .ancestor_builder
             .interface_ancestors(interface)
@@ -1636,8 +1802,8 @@ impl DefinitionBuilder {
         &self,
         chain: &[Ancestor],
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
-        // See `lookup_instance_method` for the rationale of pre-collecting
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
+        // See `resolve_instance_method_unsubstituted` for the rationale of pre-collecting
         // chain names to break Object/Kernel-style self_type cycles.
         let chain_names: FxHashSet<TypeName> = chain
             .iter()
@@ -1646,8 +1812,8 @@ impl DefinitionBuilder {
                 _ => None,
             })
             .collect();
-        let mut acc: Option<(Method, FxHashMap<TypeVarKey, Ty>)> = None;
-        // See `lookup_instance_method` — same cursor, same seed, same
+        let mut acc: Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> = None;
+        // See `resolve_instance_method_unsubstituted` — same cursor, same seed, same
         // reason.
         let mut includer: Option<TypeName> = self.seed_includer(chain.iter());
         for ancestor in chain {
@@ -1693,7 +1859,7 @@ impl DefinitionBuilder {
                 else {
                     continue;
                 };
-                m = self.build_resolved_alias(&target, &am, name);
+                m = Arc::new(self.build_resolved_alias(&target, &am, name));
                 if acc.is_none() {
                     alias_bindings_override = Some(target_bindings);
                 }
@@ -1708,12 +1874,15 @@ impl DefinitionBuilder {
                     // class-level type params into the appended defs so
                     // a `(T) -> T` overload inherited under
                     // `Child < Parent[Integer]` lands as `(Integer) -> Integer`.
+                    // `make_mut` detaches `prev` from its `Definition`
+                    // before the first append (copy-on-write).
                     let subst = Substitution::from_mapping(bindings);
                     let substituted =
                         substitute_method_defs(&m.defs, &subst, self.ancestor_builder.types());
+                    let prev = Arc::make_mut(prev);
                     prev.defs.extend(substituted);
                     prev.drop_unannotated_placeholder_defs();
-                    merge_inherited_annotations(prev, m.annotations);
+                    merge_inherited_annotations(prev, m.annotations.clone());
                 }
             }
             if !is_overloading {
@@ -1721,7 +1890,7 @@ impl DefinitionBuilder {
             }
         }
         // Phase 2: chain-final self_types fallback. See
-        // `lookup_instance_method` for the rationale (rbs merge order).
+        // `resolve_instance_method_unsubstituted` for the rationale (rbs merge order).
         if acc.is_none() {
             for ancestor in chain {
                 let Ancestor::Instance {
@@ -1771,7 +1940,7 @@ impl DefinitionBuilder {
         &self,
         self_type: Ty,
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         match &self.types().resolve(self_type) {
             Type::ClassInstance { name, args } => {
                 let chain = self
@@ -1805,13 +1974,22 @@ impl DefinitionBuilder {
     /// but uses `singleton_ancestors` directly (no `apply` call) and handles
     /// both `Ancestor::Instance` (extend / super instance-flip) and
     /// `Ancestor::Singleton` arms.
+    ///
+    /// Memoized per `(class, method)`; see [`Self::instance_method_memo`].
     pub fn lookup_singleton_method(
         &self,
         class: &TypeName,
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
+        let key = (*class, method);
+        if let Some(hit) = self.singleton_method_memo.get(&key) {
+            return (**hit).clone();
+        }
         let chain = self.ancestor_builder.singleton_ancestors(class);
-        self.walk_singleton_chain(chain.ancestors.iter(), method, Some(class))
+        let result = self.walk_singleton_chain(chain.ancestors.iter(), method, Some(class));
+        self.singleton_method_memo
+            .insert_first(key, Arc::new(result.clone()));
+        result
     }
 
     /// Shared body for the public [`Self::lookup_singleton_method`] and
@@ -1822,8 +2000,8 @@ impl DefinitionBuilder {
         ancestors: impl Iterator<Item = &'a Ancestor>,
         method: Symbol,
         reentrant_root: Option<&TypeName>,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
-        let mut acc: Option<(Method, FxHashMap<TypeVarKey, Ty>)> = None;
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
+        let mut acc: Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> = None;
         let mut includer: Option<TypeName> = None;
         for ancestor in ancestors {
             if acc.is_some()
@@ -1879,14 +2057,14 @@ impl DefinitionBuilder {
                         let Some(target) = self.lookup_instance_method(name, am.old_name) else {
                             continue;
                         };
-                        self.build_resolved_alias(&target, &am, name)
+                        Arc::new(self.build_resolved_alias(&target, &am, name))
                     }
                     Ancestor::Singleton { name } => {
                         let Some((target, _)) = self.lookup_singleton_method(name, am.old_name)
                         else {
                             continue;
                         };
-                        self.build_resolved_alias(&target, &am, name)
+                        Arc::new(self.build_resolved_alias(&target, &am, name))
                     }
                 };
             }
@@ -1897,13 +2075,15 @@ impl DefinitionBuilder {
                     // Same eager substitution as the instance walker:
                     // `extend Bag[Integer]` contributes `T -> Integer`,
                     // and the inherited overload must reach the type
-                    // checker already bound.
+                    // checker already bound. Copy-on-write; see
+                    // `resolve_instance_method_in_chain`.
                     let subst = Substitution::from_mapping(bindings);
                     let substituted =
                         substitute_method_defs(&m.defs, &subst, self.ancestor_builder.types());
+                    let prev = Arc::make_mut(prev);
                     prev.defs.extend(substituted);
                     prev.drop_unannotated_placeholder_defs();
-                    merge_inherited_annotations(prev, m.annotations);
+                    merge_inherited_annotations(prev, m.annotations.clone());
                 }
             }
             if !is_overloading {
@@ -2078,20 +2258,6 @@ impl DefinitionBuilder {
         );
         Ok(Self::from_environment(env))
     }
-
-    /// Same as [`from_rbs_source`] for a directory tree — recurses
-    /// over every `.rbs` file and accumulates them into a single
-    /// draft before building.
-    pub fn from_rbs_dir(dir: &std::path::Path) -> Result<Self, String> {
-        let mut draft = EnvironmentDraft::new();
-        draft.load_dir(dir, false)?;
-        let env = Arc::new(
-            draft
-                .build()
-                .map_err(|(e, names)| format!("draft build: {}", e.format_with(&names)))?,
-        );
-        Ok(Self::from_environment(env))
-    }
 }
 
 /// Apply `subst` to every [`MethodType`] in `defs`, returning a new
@@ -2112,6 +2278,17 @@ impl DefinitionBuilder {
 /// `Method#map_type` (line 176-181) both route their per-def rewrite
 /// through `defn.update`. crema mirrors that by cloning the source
 /// annotation vectors here.
+/// Hand a freshly extracted own-method map to a `Definition`. From here
+/// on every `Method` is shared by pointer: lookups return these `Arc`s
+/// unchanged when they have nothing to merge (see
+/// [`Definition::methods`]).
+fn share_methods(methods: FxHashMap<Symbol, Method>) -> FxHashMap<Symbol, Arc<Method>> {
+    methods
+        .into_iter()
+        .map(|(sym, m)| (sym, Arc::new(m)))
+        .collect()
+}
+
 pub(crate) fn substitute_method_defs(
     defs: &[TypeDef],
     subst: &Substitution,
@@ -2270,16 +2447,16 @@ impl<T> PerNameCache<T> {
 /// `build_instance` / `build_singleton` / `build_interface` call, mirroring
 /// rbs's `instance_cache.delete(name)` (`definition_builder.rb:1027-1031`).
 fn carry_over_definitions(
-    cache: &RefCell<FxHashMap<TypeName, Arc<Definition>>>,
+    cache: &OnceMap<TypeName, Arc<Definition>>,
     except: &FxHashSet<TypeName>,
-) -> RefCell<FxHashMap<TypeName, Arc<Definition>>> {
-    let mut result = FxHashMap::default();
-    for (name, def) in cache.borrow().iter() {
+) -> OnceMap<TypeName, Arc<Definition>> {
+    let result = OnceMap::default();
+    for (name, def) in cache.iter() {
         if !except.contains(name) {
-            result.insert(*name, Arc::clone(def));
+            result.insert_first(*name, Arc::clone(def));
         }
     }
-    RefCell::new(result)
+    result
 }
 
 /// Resolve a [`MemberRef`]'s file identity and range to a
@@ -2291,8 +2468,8 @@ fn carry_over_definitions(
 /// tell "no location for a real reason" apart from "this member is
 /// crema's own infusion synthesis" go through [`member_provenance`]
 /// instead, which checks the member's `DeclOrigin` first.
-fn resolve_member_source(
-    member: &crate::definition::MemberRef,
+fn resolve_member_source<M: BucketMember>(
+    member: &M,
     names: &crate::name::NameTable,
 ) -> Option<SourceLocation> {
     member
@@ -2333,8 +2510,8 @@ impl Provenance {
 /// infusion-synthesized decl is always `Synthesized`, regardless of
 /// what `member`'s own location fields happen to hold), falling back to
 /// [`resolve_member_source`] for every other origin.
-fn member_provenance(
-    member: &crate::definition::MemberRef,
+fn member_provenance<M: BucketMember>(
+    member: &M,
     origin: DeclOrigin,
     names: &crate::name::NameTable,
 ) -> Provenance {
@@ -2383,8 +2560,8 @@ fn resolve_dup_locations(
 /// collectors ([`extract_class_or_module_methods`] /
 /// [`extract_interface_methods`]) — both walk the same
 /// `err.members`/`err.origins` shape.
-fn collect_method_dups(
-    errors: &[method_builder::DuplicatedMethodDefinitionError],
+fn collect_method_dups<M: BucketMember>(
+    errors: &[method_builder::DuplicatedMethodDefinitionError<M>],
     names: &crate::name::NameTable,
 ) -> MethodDups {
     errors
@@ -2399,7 +2576,7 @@ fn collect_method_dups(
                 let dup_provenance = member_provenance(m, *o, names);
                 let (location, source) =
                     resolve_dup_locations(dup_provenance, original_provenance.clone());
-                (names.resolve(err.method_name), location, source)
+                (names.resolve(err.method_name).to_string(), location, source)
             })
         })
         .collect()
@@ -2436,7 +2613,6 @@ fn extract_class_or_module_methods(
     AliasCycles,
 ) {
     let names = env.names();
-    let owner_context = legacy_context_from_type_name(name, names);
 
     let primary_params: &[AstTypeParam] = match entry {
         ClassOrModule::Class(c) => ancestor_builder::primary_signature_class_type_params(c),
@@ -2470,7 +2646,6 @@ fn extract_class_or_module_methods(
         names,
         lowering,
         &primary_scope,
-        &owner_context,
         None,
         Some(*name),
         &mut instance,
@@ -2487,7 +2662,6 @@ fn extract_class_or_module_methods(
         names,
         lowering,
         &primary_scope,
-        &owner_context,
         None,
         Some(*name),
         &mut singleton,
@@ -2495,6 +2669,94 @@ fn extract_class_or_module_methods(
     );
 
     (instance, singleton, dups, cycles)
+}
+
+/// Diagnostics-only counterpart of [`extract_class_or_module_methods`]:
+/// same `MethodBuilder` rules (dup / overloading / attr classification)
+/// and the same Sorter SCC walk, but with the [`MemberSite`] payload —
+/// no member AST clone, no type rewrite, and no `Method` lowering. Used
+/// by the construction-time scan, [`DefinitionBuilder::update`]'s
+/// re-scan and the G roast, none of which read the lowered methods.
+fn scan_class_or_module_method_diagnostics(
+    env: &Environment,
+    types: &TypeTable,
+    name: &TypeName,
+) -> (MethodDups, AliasCycles) {
+    let names = env.names();
+    let mut mb = method_builder::MethodBuilder::<MemberSite>::new(env, types);
+    mb.build_instance(name);
+    mb.build_singleton(name);
+    let dups: MethodDups = collect_method_dups(mb.errors(), names);
+    let mut cycles: AliasCycles = Vec::new();
+    for bucket in [
+        mb.instance_methods().get(name),
+        mb.singleton_methods().get(name),
+    ] {
+        let bucket = bucket.expect("MethodBuilder::build_* must populate the cache for `name`");
+        collect_alias_cycles(bucket, name, names, &mut cycles);
+    }
+    (dups, cycles)
+}
+
+/// Diagnostics-only counterpart of [`extract_interface_methods`]; see
+/// [`scan_class_or_module_method_diagnostics`].
+fn scan_interface_method_diagnostics(
+    env: &Environment,
+    types: &TypeTable,
+    name: &TypeName,
+) -> (MethodDups, AliasCycles) {
+    let names = env.names();
+    let mut mb = method_builder::MethodBuilder::<MemberSite>::new(env, types);
+    mb.build_interface(name);
+    let dups: MethodDups = collect_method_dups(mb.errors(), names);
+    let mut cycles: AliasCycles = Vec::new();
+    let bucket = mb
+        .interface_methods()
+        .get(name)
+        .expect("MethodBuilder::build_interface must populate the cache for `name`");
+    collect_alias_cycles(bucket, name, names, &mut cycles);
+    (dups, cycles)
+}
+
+/// Walk a bucket's alias SCCs and push one [`AliasCycleEntry`] per
+/// cyclic SCC (size > 1). The cycle shape mirrors the `scc.len() > 1`
+/// branch of [`flush_bucket_via_sorter`], which keeps lowering the
+/// acyclic entries; this walker does nothing with them.
+fn collect_alias_cycles<M: BucketMember>(
+    bucket: &method_builder::Methods<M>,
+    owner: &TypeName,
+    names: &NameTable,
+    cycles: &mut AliasCycles,
+) {
+    let sorter = method_builder::Sorter::new(&bucket.methods);
+    sorter.each_strongly_connected_component(|scc| {
+        if scc.len() > 1 {
+            cycles.push(alias_cycle_entry(scc, owner, names));
+        }
+    });
+}
+
+/// Build the [`AliasCycleEntry`] for one cyclic SCC. Per rbs
+/// convention (`RecursiveAliasDefinitionError#defs.first`),
+/// `primary_location` is the first participant's alias-member location.
+fn alias_cycle_entry<M: BucketMember>(
+    scc: &[&method_builder::methods::Definition<M>],
+    owner: &TypeName,
+    names: &NameTable,
+) -> AliasCycleEntry {
+    let primary_location = scc
+        .first()
+        .and_then(|d| d.originals.first())
+        .filter(|m| m.alias_old_name().is_some())
+        .and_then(|m| resolve_member_source(m, names));
+    AliasCycleEntry {
+        type_name: names.display_type_name(*owner),
+        alias_names: scc
+            .iter()
+            .map(|d| names.resolve(d.name).to_string())
+            .collect(),
+        primary_location,
+    }
 }
 
 /// Port of `RBS::DefinitionBuilder#special_accessibility`
@@ -2507,7 +2769,7 @@ fn special_accessibility(is_instance: bool, name: Symbol, names: &NameTable) -> 
         return None;
     }
     matches!(
-        names.resolve(name).as_str(),
+        names.resolve(name),
         "initialize"
             | "initialize_copy"
             | "initialize_clone"
@@ -2541,7 +2803,6 @@ fn flush_bucket_via_sorter(
     names: &NameTable,
     lowering: &LoweringEnv<'_>,
     class_scope: &TypeParamScope,
-    context: &[Option<Name>],
     accessibility_override: Option<Visibility>,
     implemented_in: Option<TypeName>,
     dest: &mut FxHashMap<Symbol, Method>,
@@ -2553,25 +2814,8 @@ fn flush_bucket_via_sorter(
             // Cyclic alias chain (true SCC). rbs raises
             // `RecursiveAliasDefinitionError`; crema collects a diagnostic
             // here and still skips lowering so lookup-time has no entry
-            // to recurse on. Per rbs convention, `primary_location` is
-            // the first participant's alias-member location.
-            let primary_location = match scc.first().and_then(|d| d.originals.first()) {
-                Some(MemberRef::Alias(alias)) => {
-                    alias
-                        .source_file
-                        .zip(alias.location)
-                        .map(|(f, l)| SourceLocation {
-                            file: PathBuf::from(names.resolve(f)),
-                            range: l.range,
-                        })
-                }
-                _ => None,
-            };
-            cycles.push(AliasCycleEntry {
-                type_name: names.resolve(owner),
-                alias_names: scc.iter().map(|d| names.resolve(d.name)).collect(),
-                primary_location,
-            });
+            // to recurse on.
+            cycles.push(alias_cycle_entry(scc, owner, names));
             return;
         }
         let defn = scc[0];
@@ -2609,7 +2853,6 @@ fn flush_bucket_via_sorter(
                 names,
                 lowering,
                 class_scope,
-                context,
                 accessibility_override,
                 implemented_in,
             );
@@ -2632,7 +2875,6 @@ fn lower_bucket_defn_to_method(
     names: &NameTable,
     lowering: &LoweringEnv<'_>,
     class_scope: &TypeParamScope,
-    context: &[Option<Name>],
     accessibility_override: Option<Visibility>,
     implemented_in: Option<TypeName>,
 ) -> Method {
@@ -2680,7 +2922,7 @@ fn lower_bucket_defn_to_method(
         .copied()
         .or_else(|| {
             if matches!(method_kind, crate::type_param::MethodKind::Instance) {
-                special_instance_visibility(&names.resolve(defn.name))
+                special_instance_visibility(names.resolve(defn.name))
             } else {
                 None
             }
@@ -2706,7 +2948,6 @@ fn lower_bucket_defn_to_method(
                 names,
                 lowering,
                 class_scope,
-                context,
                 implemented_in,
             );
             let base_len = u16::try_from(base.defs.len()).unwrap_or(u16::MAX);
@@ -2735,7 +2976,6 @@ fn lower_bucket_defn_to_method(
             names,
             lowering,
             class_scope,
-            context,
             implemented_in,
         );
         next_overload_index = next_overload_index
@@ -2774,19 +3014,6 @@ fn untyped_method_type() -> MethodType {
         }),
         block: None,
     }
-}
-
-fn legacy_context_from_type_name(name: &TypeName, names: &NameTable) -> Vec<Option<Name>> {
-    let mut context = Vec::new();
-    let mut path = String::from("::");
-    for (index, segment) in names.type_name_segments(*name).iter().enumerate() {
-        if index > 0 {
-            path.push_str("::");
-        }
-        path.push_str(&names.resolve(*segment));
-        context.push(Some(names.intern(&path)));
-    }
-    context
 }
 
 /// Build a per-decl `TypeParamScope` that **alpha-renames** the decl's
@@ -2864,7 +3091,7 @@ pub(crate) fn type_params_as_variable_args(
 /// already-baked `:new` is NOT a real `def self.new` override — without it,
 /// `class Child < Base[Integer]` would inherit `Base`'s synthesised
 /// typed_new and never get its own substitution applied. The trade-off is
-/// that verbose-log source lookups for `.new` no longer trace back to
+/// that member-location lookups for `.new` no longer trace back to
 /// `#initialize`'s AST location (rbs reaches that location through the
 /// real `Class#new` declaration in core.rbs; crema doesn't load core.rbs
 /// yet — the long-term fix lives alongside `MemberRef::Synthesized`).
@@ -3654,8 +3881,7 @@ fn build_one_class_definition(
     let instance_def = Definition {
         type_name: *name,
         self_type: instance_self_type,
-        ancestors: OnceCell::new(),
-        methods: instance_methods,
+        methods: share_methods(instance_methods),
         instance_variables,
         class_variables,
     };
@@ -3663,8 +3889,7 @@ fn build_one_class_definition(
     let singleton_def = Definition {
         type_name: *name,
         self_type: types.class_singleton(*name),
-        ancestors: OnceCell::new(),
-        methods: singleton_methods,
+        methods: share_methods(singleton_methods),
         // rbs `build_singleton0` stores `self.@foo: T` (ClassInstanceVariable)
         // and singleton-side `attr_*`'s ivar in the singleton-side
         // `instance_variables` (definition_builder.rb:301-317).
@@ -3688,19 +3913,28 @@ fn build_one_class_definition(
 }
 
 /// Method-builder diagnostic scan run once at construction: calls
-/// `extract_class_or_module_methods` for every class / module declaration
-/// to collect duplicate method names AND recursive-alias cycles. Full
-/// method extraction cost applies; `Definition`s themselves are not built.
+/// `scan_class_or_module_method_diagnostics` for every class / module
+/// declaration to collect duplicate method names AND recursive-alias
+/// cycles. Only the `MemberSite` buckets are built — no member clone,
+/// no lowering; `Definition`s themselves are not built.
 ///
 /// ADR-0020: lazy populate builds definitions on demand, so the eager loop
 /// that previously collected dups as a side effect is gone. This scan runs
 /// once at `from_environment` time to keep both `method_dups` and
 /// `alias_cycles` complete (matching rbs's `MethodBuilder` two-error
 /// surface: `DuplicatedMethodDefinitionError` + `RecursiveAliasDefinitionError`).
+///
+/// `scope` narrows which owners are scanned; the maps are still iterated
+/// in full so the owner order (and with it the tie order of the emitted
+/// diagnostics) matches the unscoped walk — see [`ScanScope`]. The baked
+/// G groups are spliced regardless of `scope`: the filter means "this
+/// file's diagnostics", and what to do with the G layer is a separate
+/// decision from narrowing the A walk (its locations never survive a
+/// filter anyway).
 fn scan_method_builder_diagnostics(
     env: &Environment,
-    lowering: &LoweringEnv<'_>,
     types: &TypeTable,
+    scope: &ScanScope,
 ) -> (PerNameCache<MethodDupEntry>, PerNameCache<AliasCycleEntry>) {
     let mut all_dups: PerNameCache<MethodDupEntry> = PerNameCache::new();
     let mut all_cycles: PerNameCache<AliasCycleEntry> = PerNameCache::new();
@@ -3723,9 +3957,11 @@ fn scan_method_builder_diagnostics(
         // baked groups below.
         Some(g) => {
             let baked = g.baked();
-            for (name, entry) in env.class_decls().a_iter() {
-                let (_, _, dups, cycles) =
-                    extract_class_or_module_methods(env, lowering, types, name, entry);
+            for (name, _) in env.class_decls().a_iter() {
+                if !scope.admits(PathIndexKey::ClassOrModule(*name)) {
+                    continue;
+                }
+                let (dups, cycles) = scan_class_or_module_method_diagnostics(env, types, name);
                 all_dups.push(*name, dups);
                 all_cycles.push(*name, cycles);
             }
@@ -3735,9 +3971,11 @@ fn scan_method_builder_diagnostics(
                     all_cycles.push(*owner, cycles.clone());
                 }
             }
-            for (name, entry) in env.interface_decls().a_iter() {
-                let (_, dups, cycles) =
-                    extract_interface_methods(env, lowering, types, name, entry);
+            for (name, _) in env.interface_decls().a_iter() {
+                if !scope.admits(PathIndexKey::Interface(*name)) {
+                    continue;
+                }
+                let (dups, cycles) = scan_interface_method_diagnostics(env, types, name);
                 all_dups.push(*name, dups);
                 all_cycles.push(*name, cycles);
             }
@@ -3749,15 +3987,19 @@ fn scan_method_builder_diagnostics(
             }
         }
         None => {
-            for (name, entry) in env.class_decls() {
-                let (_, _, dups, cycles) =
-                    extract_class_or_module_methods(env, lowering, types, name, entry);
+            for (name, _) in env.class_decls() {
+                if !scope.admits(PathIndexKey::ClassOrModule(*name)) {
+                    continue;
+                }
+                let (dups, cycles) = scan_class_or_module_method_diagnostics(env, types, name);
                 all_dups.push(*name, dups);
                 all_cycles.push(*name, cycles);
             }
-            for (name, entry) in env.interface_decls() {
-                let (_, dups, cycles) =
-                    extract_interface_methods(env, lowering, types, name, entry);
+            for (name, _) in env.interface_decls() {
+                if !scope.admits(PathIndexKey::Interface(*name)) {
+                    continue;
+                }
+                let (dups, cycles) = scan_interface_method_diagnostics(env, types, name);
                 all_dups.push(*name, dups);
                 all_cycles.push(*name, cycles);
             }
@@ -3766,13 +4008,18 @@ fn scan_method_builder_diagnostics(
     (all_dups, all_cycles)
 }
 
-fn scan_variable_dups(env: &Environment) -> PerNameCache<VariableDuplication> {
+/// Variable-dup scan, same shape and same `scope` contract as
+/// [`scan_method_builder_diagnostics`].
+fn scan_variable_dups(env: &Environment, scope: &ScanScope) -> PerNameCache<VariableDuplication> {
     let names = env.names();
     let mut all_dups: PerNameCache<VariableDuplication> = PerNameCache::new();
     let mut owner_buf: Vec<VariableDuplication> = Vec::new();
     match env.g_backend() {
         Some(g) => {
             for (name, entry) in env.class_decls().a_iter() {
+                if !scope.admits(PathIndexKey::ClassOrModule(*name)) {
+                    continue;
+                }
                 let (instance_variables, singleton_instance_variables) =
                     extract_class_or_module_variable_dup_candidates(env, name, entry);
                 collect_variable_dups_from_map(&instance_variables, &mut owner_buf, names);
@@ -3791,6 +4038,9 @@ fn scan_variable_dups(env: &Environment) -> PerNameCache<VariableDuplication> {
         }
         None => {
             for (name, entry) in env.class_decls() {
+                if !scope.admits(PathIndexKey::ClassOrModule(*name)) {
+                    continue;
+                }
                 owner_buf.clear();
                 let (instance_variables, singleton_instance_variables) =
                     extract_class_or_module_variable_dup_candidates(env, name, entry);
@@ -3998,13 +4248,11 @@ pub(crate) struct BakedArityViolation {
 /// (Decision 3's persistence ban).
 pub(crate) fn roast_g_scan(env: &Environment) -> RoastedGScan {
     let types = TypeTable::new();
-    let lowering = LoweringEnv::from_environment(env, &types);
     let names = env.names();
     let mut classes = Vec::new();
     let mut variables = Vec::new();
     for (name, entry) in env.class_decls() {
-        let (_, _, dups, cycles) =
-            extract_class_or_module_methods(env, &lowering, &types, name, entry);
+        let (dups, cycles) = scan_class_or_module_method_diagnostics(env, &types, name);
         if !dups.is_empty() || !cycles.is_empty() {
             classes.push((*name, dups, cycles));
         }
@@ -4018,8 +4266,8 @@ pub(crate) fn roast_g_scan(env: &Environment) -> RoastedGScan {
         }
     }
     let mut interfaces = Vec::new();
-    for (name, entry) in env.interface_decls() {
-        let (_, dups, cycles) = extract_interface_methods(env, &lowering, &types, name, entry);
+    for (name, _) in env.interface_decls() {
+        let (dups, cycles) = scan_interface_method_diagnostics(env, &types, name);
         if !dups.is_empty() || !cycles.is_empty() {
             interfaces.push((*name, dups, cycles));
         }
@@ -4118,8 +4366,7 @@ fn build_one_interface_definition(
     Definition {
         type_name: *name,
         self_type,
-        ancestors: OnceCell::new(),
-        methods,
+        methods: share_methods(methods),
         instance_variables: FxHashMap::default(),
         class_variables: FxHashMap::default(),
     }
@@ -4157,9 +4404,7 @@ fn extract_interface_methods(
     // calls `build_method(accessibility: :public)` and rbs `define_method`
     // pipes `implemented_in: nil` for interfaces (declaration-only types).
     // We mirror both by passing `accessibility_override = Some(Public)`
-    // and `implemented_in = None`. The `context` argument feeds the
-    // RubyDef lowering branch only — interfaces never carry RubyDef
-    // members (classify_member rejects them), so an empty slice is safe.
+    // and `implemented_in = None`.
     flush_bucket_via_sorter(
         bucket,
         name,
@@ -4167,7 +4412,6 @@ fn extract_interface_methods(
         names,
         lowering,
         &class_scope,
-        &[],
         Some(Visibility::Public),
         None,
         &mut methods,
@@ -4185,8 +4429,8 @@ fn extract_interface_methods(
 /// 2b-3): resolving a G name now decodes just that snapshot entry, and
 /// the resolved `Vec<TypeParam>` — which contains `Ty` and therefore
 /// can never be baked into the snapshot (ADR-0028 Decision 3) — is
-/// computed on first demand per run. `AppendMap` keeps the handed-out
-/// `&Vec<TypeParam>` stable across later inserts, so the read API shape
+/// computed on first demand per run. `OnceMap` keeps the handed-out
+/// `&Vec<TypeParam>` valid across later inserts, so the read API shape
 /// matches the old `FxHashMap::get`.
 ///
 /// Only the `Signature` variant contributes — the inline (Ruby) path is
@@ -4194,7 +4438,7 @@ fn extract_interface_methods(
 /// those names cache `None`.
 #[derive(Default)]
 pub(crate) struct TypeParamsCache {
-    cache: crate::snapshot::append_map::AppendMap<TypeName, Option<Vec<TypeParam>>>,
+    cache: OnceMap<TypeName, Option<Vec<TypeParam>>>,
 }
 
 impl std::fmt::Debug for TypeParamsCache {
@@ -4212,13 +4456,12 @@ impl TypeParamsCache {
         lowering: &LoweringEnv<'_>,
         name: &TypeName,
     ) -> Option<&Vec<TypeParam>> {
-        let entry = self
-            .cache
-            .get_or_try_insert_with(*name, || {
-                Ok::<_, std::convert::Infallible>(compute_type_params(env, lowering, name))
-            })
-            .expect("compute is infallible");
-        entry.as_ref()
+        if let Some(entry) = self.cache.get(name) {
+            return entry.as_ref();
+        }
+        self.cache
+            .insert_first(*name, compute_type_params(env, lowering, name))
+            .as_ref()
     }
 }
 
@@ -4352,7 +4595,6 @@ fn lower_member_to_method(
     names: &NameTable,
     lowering: &LoweringEnv<'_>,
     class_scope: &TypeParamScope,
-    context: &[Option<Name>],
     implemented_in: Option<TypeName>,
 ) -> Method {
     match member {
@@ -4382,7 +4624,7 @@ fn lower_member_to_method(
         MemberRef::AttrReader(r) => {
             let ty = lowering.build_type(&r.ty, class_scope);
             let effective = if r.visibility.is_none() && matches!(r.kind, AttributeKind::Instance) {
-                special_instance_visibility(&names.resolve(r.name)).unwrap_or(accessibility)
+                special_instance_visibility(names.resolve(r.name)).unwrap_or(accessibility)
             } else {
                 accessibility
             };
@@ -4417,7 +4659,7 @@ fn lower_member_to_method(
             } else {
                 let effective =
                     if a.visibility.is_none() && matches!(a.kind, AttributeKind::Instance) {
-                        special_instance_visibility(&names.resolve(a.name)).unwrap_or(accessibility)
+                        special_instance_visibility(names.resolve(a.name)).unwrap_or(accessibility)
                     } else {
                         accessibility
                     };
@@ -4461,7 +4703,6 @@ fn lower_member_to_method(
             let overloads = lowering
                 .build_overloads_from_annotation(
                     &def.method_type,
-                    context,
                     class_scope,
                     Some((owner, name, method_kind)),
                 )
@@ -4475,7 +4716,7 @@ fn lower_member_to_method(
         MemberRef::RubyAttrReader(r) => {
             let ty = ruby_attr_member_lowered_type(&r.attribute, names, lowering, class_scope);
             let effective =
-                special_instance_visibility(&names.resolve(bucket_name)).unwrap_or(accessibility);
+                special_instance_visibility(names.resolve(bucket_name)).unwrap_or(accessibility);
             let defs = vec![TypeDef::new(
                 MethodType::getter(ty),
                 member.clone(),
@@ -4500,7 +4741,7 @@ fn lower_member_to_method(
             let (method_type, effective) = if name_str.ends_with('=') {
                 (MethodType::setter(ty), accessibility)
             } else {
-                let effective = special_instance_visibility(&name_str).unwrap_or(accessibility);
+                let effective = special_instance_visibility(name_str).unwrap_or(accessibility);
                 (MethodType::getter(ty), effective)
             };
             let defs = vec![TypeDef::new(
@@ -4546,10 +4787,6 @@ fn variable_priority_walk(chain: &[Ancestor]) -> impl Iterator<Item = &Ancestor>
         .chain(chain[self_pos + 1..].iter())
 }
 
-fn class_key(env: &DefinitionBuilder, name: Name) -> TypeName {
-    env.names().parse_type_name(&env.names().resolve(name))
-}
-
 fn declared_type_name_key(env: ConsultationView, name: TypeName) -> TypeName {
     env.declared_type_name_by_type_name(name).unwrap_or(name)
 }
@@ -4561,7 +4798,7 @@ fn declared_type_name_key(env: ConsultationView, name: TypeName) -> TypeName {
 /// - instance receiver `Foo[A]`   → (`Foo[A]`, `singleton(Foo)`)
 /// - singleton receiver `singleton(Foo)` with generic params → (`Foo[untyped, ...]`, `singleton(Foo)`)
 /// - anything else → (`None`, `None`), leaving the keyword untouched.
-pub fn base_types_for_receiver(env: ConsultationView, receiver: Ty) -> (Option<Ty>, Option<Ty>) {
+fn base_types_for_receiver(env: ConsultationView, receiver: Ty) -> (Option<Ty>, Option<Ty>) {
     match env.types().resolve(receiver) {
         Type::ClassInstance { name, .. } => {
             (Some(receiver), Some(env.types().class_singleton(*name)))
@@ -4610,61 +4847,17 @@ pub fn lookup_instance_method(
     env: ConsultationView,
     class_name: &str,
     method_name: &str,
-) -> Option<Method> {
+) -> Option<Arc<Method>> {
     let mn = env.names().lookup_symbol(method_name)?;
-    let cn = env.names().lookup(class_name)?;
-    lookup_instance_method_by_name(env, cn, mn)
-}
-
-/// Look up a singleton (class) method by string name. Thin `&str` boundary
-/// over the linearized [`DefinitionBuilder::lookup_singleton_method`]: it
-/// interns the method symbol, parses + normalizes the class name, then
-/// delegates the chain walk and drops the bindings the method version
-/// returns. Callers that need bindings call the method version directly.
-///
-/// `extend M` contributes M's instance methods (transitively via M's own
-/// `include` chain) as singleton methods of the current class; `include`
-/// does not affect singleton lookup. Those semantics live in
-/// `singleton_ancestors`, which the method version consumes.
-pub fn lookup_singleton_method(
-    env: &DefinitionBuilder,
-    class_name: &str,
-    method_name: &str,
-) -> Option<Method> {
-    // `intern_symbol` (not `lookup_symbol`): typed `.new` is now baked
-    // into `singleton_def.methods` by `bake_typed_new`, which interns
-    // "new" lazily on its first run. If we early-returned on
-    // `lookup_symbol("new") -> None` here, callers reaching this entry
-    // point *before* any `build_singleton` had been triggered would
-    // miss the to-be-baked entry. Interning is a no-op when the symbol
-    // already exists; for genuinely-unknown method names the downstream
-    // `methods.get(&mn)` still returns None.
-    let mn = env.names().intern_symbol(method_name);
-    let raw = env.names().parse_type_name(class_name);
-    lookup_singleton_method_by_type_name(ConsultationView::new(env, None), raw, mn)
-}
-
-/// Like [`resolve_singleton_method`] but returns the type-variable
-/// bindings that were in scope at the matched method's level, ready to
-/// feed into `substitute_type_vars`. Thin adapter over
-/// [`resolve_singleton_method_with_type_name_args`] for callers that
-/// still hold a `Name`-keyed class reference.
-pub fn resolve_singleton_method_with_args(
-    env: &DefinitionBuilder,
-    class_name: Name,
-    method_name: Symbol,
-) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
-    let raw = env
-        .names()
-        .parse_type_name(&env.names().resolve(class_name));
-    resolve_singleton_method_with_type_name_args(ConsultationView::new(env, None), raw, method_name)
+    let class_name = env.names().parse_type_name(class_name);
+    lookup_instance_method_by_type_name(env, class_name, mn)
 }
 
 pub fn resolve_singleton_method_with_type_name_args(
     env: ConsultationView,
     class_name: TypeName,
     method_name: Symbol,
-) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
     let class_name = normalized_declared_type_name(env, class_name);
     if let Some(found) = env.lookup_singleton_method(&class_name, method_name) {
         return Some(found);
@@ -4676,88 +4869,15 @@ pub fn resolve_singleton_method_with_type_name_args(
         DeclKindLocal::Interface => return None,
     };
 
-    lookup_instance_method(env, metaclass, &env.names().resolve(method_name))
+    lookup_instance_method(env, metaclass, env.names().resolve(method_name))
         .map(|def| (def, FxHashMap::default()))
-}
-
-/// Look up a method for a singleton type `singleton(class_name)`.
-///
-/// Resolution order (mirrors RBS `ancestor_builder.rb`):
-/// 1. Walk singleton_methods along the superclass chain
-/// 2. Fall through to the metaclass's instance_methods:
-///    - class → `::Class` → `::Module` → `::Object` → ...
-///    - module → `::Module` → `::Object` → ...
-pub fn lookup_method_for_singleton(
-    env: &DefinitionBuilder,
-    class_name: &str,
-    method_name: &str,
-) -> Option<Method> {
-    if let Some(def) = lookup_singleton_method(env, class_name, method_name) {
-        return Some(def);
-    }
-
-    let cn = env.names().lookup(class_name)?;
-    let metaclass = match env.declared_kind_by_type_name(&class_key(env, cn))? {
-        DeclKindLocal::Class => "::Class",
-        DeclKindLocal::Module => "::Module",
-        DeclKindLocal::Interface => return None,
-    };
-
-    lookup_instance_method(ConsultationView::new(env, None), metaclass, method_name)
-}
-
-/// Resolve a method on a singleton type. Runs the chain walk and the
-/// metaclass fallback; typed `.new` synthesis is no longer special-cased
-/// here — `DefinitionBuilder::bake_typed_new` writes the synth into the
-/// singleton table during `build_class_pair`, so the chain walk above
-/// picks it up like any other method.
-pub fn resolve_singleton_method(
-    env: &DefinitionBuilder,
-    class_name: &str,
-    method_name: &str,
-) -> Option<Method> {
-    if let Some(def) = lookup_singleton_method(env, class_name, method_name) {
-        return Some(def);
-    }
-
-    let cn = env.names().lookup(class_name)?;
-    let metaclass = match env.declared_kind_by_type_name(&class_key(env, cn))? {
-        DeclKindLocal::Class => "::Class",
-        DeclKindLocal::Module => "::Module",
-        DeclKindLocal::Interface => return None,
-    };
-
-    lookup_instance_method(ConsultationView::new(env, None), metaclass, method_name)
-}
-
-/// Look up an instance method by [`Name`] (avoids string round-trip).
-pub fn lookup_instance_method_by_name(
-    env: ConsultationView,
-    class_name: Name,
-    method_name: Symbol,
-) -> Option<Method> {
-    let raw = env
-        .names()
-        .parse_type_name(&env.names().resolve(class_name));
-    lookup_instance_method_by_type_name(env, raw, method_name)
-}
-
-pub fn lookup_singleton_method_by_name(
-    env: &DefinitionBuilder,
-    class_name: Name,
-    method_name: Symbol,
-) -> Option<Method> {
-    let raw = env
-        .names()
-        .parse_type_name(&env.names().resolve(class_name));
-    lookup_singleton_method_by_type_name(ConsultationView::new(env, None), raw, method_name)
 }
 
 pub fn lookup_instance_method_by_type_name(
     env: ConsultationView,
     class_name: TypeName,
     method_name: Symbol,
-) -> Option<Method> {
+) -> Option<Arc<Method>> {
     let class_name = normalized_declared_type_name(env, class_name);
     env.lookup_instance_method(&class_name, method_name)
 }
@@ -4864,7 +4984,7 @@ pub fn lookup_singleton_method_by_type_name(
     env: ConsultationView,
     class_name: TypeName,
     method_name: Symbol,
-) -> Option<Method> {
+) -> Option<Arc<Method>> {
     let class_name = normalized_declared_type_name(env, class_name);
     env.lookup_singleton_method(&class_name, method_name)
         .map(|(m, _)| m)
@@ -4897,31 +5017,102 @@ fn normalized_declared_type_name(env: ConsultationView, class_name: TypeName) ->
 /// (`type fields = ...`) is dispatched on repeatedly. Cyclic aliases that
 /// hit `ALIAS_EXPANSION_LIMIT` are also cached, mirroring the function's
 /// bottom-out return.
+///
+/// The memo is shared by every file (ADR-0034 Decision 3), so it stores
+/// the alias hops next to the result and a hit replays them: each file's
+/// log gets the same `ExpandTypeAlias` keys whether it computed the
+/// expansion or found it cached.
 pub fn expand_alias(env: ConsultationView, ty: Ty) -> Ty {
+    expand_alias_into(env, ty, &mut HopSink::Record)
+}
+
+/// One `ExpandTypeAlias` consultation: the alias name and whether it was
+/// declared (the recorded hit flag).
+type AliasHop = (TypeName, bool);
+
+/// The alias hops one memoized expansion consulted, deduplicated.
+type AliasHops = Box<[AliasHop]>;
+
+/// Where an expansion's alias hops go. `Record` writes them to the view's
+/// log (nothing when the log is `None`); `Collect` gathers them for a
+/// caller that memoizes a composite result over several expansions.
+enum HopSink<'s> {
+    Record,
+    Collect(&'s mut Vec<AliasHop>),
+}
+
+impl HopSink<'_> {
+    fn push(&mut self, env: ConsultationView, hops: &[AliasHop]) {
+        match self {
+            HopSink::Record => env.record_alias_hops(hops),
+            HopSink::Collect(out) => {
+                for hop in hops {
+                    if !out.contains(hop) {
+                        out.push(*hop);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn expand_alias_into(env: ConsultationView, ty: Ty, sink: &mut HopSink) -> Ty {
     // `env.builder.expand_alias_cache` (not a view-forwarded accessor):
     // this is the function's own memoization cache, not a checker-facing
     // query — same same-module private-field access as
     // `normalized_declared_type_name`'s `env.builder.env()` above.
-    if let Some(hit) = env.builder.expand_alias_cache.borrow().get(&ty).copied() {
-        return hit;
+    if let Some((hit, hops)) = env.builder.expand_alias_cache.get(&ty) {
+        sink.push(env, hops);
+        return *hit;
     }
-    let original = ty;
+    let mut hops: Vec<AliasHop> = Vec::new();
     let mut current = ty;
     for _ in 0..ALIAS_EXPANSION_LIMIT {
         let Type::Alias { name, args } = env.types().resolve(current) else {
-            env.builder
-                .expand_alias_cache
-                .borrow_mut()
-                .insert(original, current);
-            return current;
+            break;
         };
-        current = env.expand_type_alias(name, args).unwrap_or(Ty::UNTYPED);
+        // The builder's unrecorded query: the hop is recorded through
+        // `sink` below, from the same list a later hit replays.
+        let body = env.builder.expand_type_alias(name, args);
+        let hop = (*name, body.is_some());
+        if !hops.contains(&hop) {
+            hops.push(hop);
+        }
+        current = body.unwrap_or(Ty::UNTYPED);
     }
+    sink.push(env, &hops);
     env.builder
         .expand_alias_cache
-        .borrow_mut()
-        .insert(original, current);
+        .insert_first(ty, (current, hops.into_boxed_slice()));
     current
+}
+
+/// Mirrors rbs `TypeAliasDependency#direct_dependency`
+/// (`lib/rbs/type_alias_dependency.rb` L65-78): walk through `Union`,
+/// `Intersection`, `Optional`; record `Alias` names; treat every other
+/// type constructor as opaque. The walker therefore distinguishes
+/// circular (`type a = a?`) from regular (`type a = Array[a]`) the same
+/// way rbs does.
+pub(crate) fn collect_direct_alias_deps(body: &AstType, out: &mut Vec<TypeName>) {
+    match body {
+        AstType::Union(t) => {
+            for ty in &t.types {
+                collect_direct_alias_deps(ty, out);
+            }
+        }
+        AstType::Intersection(t) => {
+            for ty in &t.types {
+                collect_direct_alias_deps(ty, out);
+            }
+        }
+        AstType::Optional(t) => {
+            collect_direct_alias_deps(&t.ty, out);
+        }
+        AstType::Alias(t) => {
+            out.push(t.name);
+        }
+        _ => {}
+    }
 }
 
 /// Maximum alias-to-alias hops `expand_alias` follows before giving up,
@@ -5002,7 +5193,7 @@ fn expand_optional_bool_sugar(env: ConsultationView, ty: Ty, out: &mut Vec<Ty>) 
 pub fn flatten_alias_union_members(env: ConsultationView, members: &[Ty]) -> Vec<Ty> {
     let mut out = Vec::new();
     let mut visited = FxHashSet::default();
-    flatten_alias_union_into(env, members, &mut out, &mut visited);
+    flatten_alias_union_into(env, members, &mut out, &mut visited, &mut HopSink::Record);
     out
 }
 
@@ -5011,14 +5202,15 @@ fn flatten_alias_union_into(
     members: &[Ty],
     out: &mut Vec<Ty>,
     visited: &mut FxHashSet<Ty>,
+    sink: &mut HopSink,
 ) {
     for &m in members {
         if !visited.insert(m) {
             continue;
         }
-        let expanded = expand_alias(env, m);
+        let expanded = expand_alias_into(env, m, sink);
         match env.types().resolve(expanded) {
-            Type::Union(inner) => flatten_alias_union_into(env, inner, out, visited),
+            Type::Union(inner) => flatten_alias_union_into(env, inner, out, visited, sink),
             _ => out.push(expanded),
         }
     }
@@ -5044,21 +5236,25 @@ fn flatten_alias_union_into(
 pub fn normalize_receiver(env: ConsultationView, ty: Ty) -> Ty {
     // `env.builder.normalize_receiver_cache`: this function's own
     // memoization cache, not a checker-facing query (see `expand_alias`'s
-    // comment on the same pattern).
-    if let Some(hit) = env
-        .builder
-        .normalize_receiver_cache
-        .borrow()
-        .get(&ty)
-        .copied()
-    {
-        return hit;
+    // comment on the same pattern). A hit replays the hops of every
+    // expansion below, as `expand_alias` does for its own memo.
+    if let Some((hit, hops)) = env.builder.normalize_receiver_cache.get(&ty) {
+        env.record_alias_hops(hops);
+        return *hit;
     }
-    let expanded = expand_alias(env, ty);
+    let mut hops: Vec<AliasHop> = Vec::new();
+    let expanded = expand_alias_into(env, ty, &mut HopSink::Collect(&mut hops));
     let widened = widen_optional_bool(env, expanded);
     let normalized = match env.types().resolve(widened) {
         Type::Union(members) => {
-            let flattened = flatten_alias_union_members(env, members);
+            let mut flattened = Vec::new();
+            flatten_alias_union_into(
+                env,
+                members,
+                &mut flattened,
+                &mut FxHashSet::default(),
+                &mut HopSink::Collect(&mut hops),
+            );
             if flattened.len() == 1 {
                 flattened[0]
             } else {
@@ -5067,10 +5263,10 @@ pub fn normalize_receiver(env: ConsultationView, ty: Ty) -> Ty {
         }
         _ => widened,
     };
+    env.record_alias_hops(&hops);
     env.builder
         .normalize_receiver_cache
-        .borrow_mut()
-        .insert(ty, normalized);
+        .insert_first(ty, (normalized, hops.into_boxed_slice()));
     normalized
 }
 
@@ -5173,9 +5369,7 @@ pub enum ConsultedKey {
         source_file: Option<String>,
         current: Option<TypeName>,
     },
-    /// `DefinitionBuilder::concern_block_targets`. Projects `concern`'s
-    /// dedicated probe id (`incremental::concern_targets_probe_id`),
-    /// matched by a `FingerprintKey::ConcernTargets(concern)` change.
+    /// `DefinitionBuilder::concern_block_targets`.
     ConcernBlockTargets {
         concern: TypeName,
         location: PrismByteRange,
@@ -5204,7 +5398,15 @@ pub enum ConsultedKey {
 #[derive(Debug, Default)]
 pub struct ConsultationLog {
     entries: RefCell<FxHashMap<ConsultedKey, bool>>,
+    /// Open captures, innermost last: what a memoized computation records
+    /// while it runs, so the memo can store it next to the result. A
+    /// closed capture folds into the one around it, so an outer
+    /// computation also holds everything its inner ones recorded.
+    captures: RefCell<Vec<FxHashMap<ConsultedKey, bool>>>,
 }
+
+/// The consultations one memoized computation recorded, deduplicated.
+pub(crate) type Consultations = Arc<[(ConsultedKey, bool)]>;
 
 impl ConsultationLog {
     pub fn new() -> Self {
@@ -5212,10 +5414,32 @@ impl ConsultationLog {
     }
 
     fn record(&self, key: ConsultedKey, hit: bool) {
+        if let Some(capture) = self.captures.borrow_mut().last_mut() {
+            capture.insert(key.clone(), hit);
+        }
         self.entries.borrow_mut().insert(key, hit);
     }
 
-    /// Drains the recorded set for persistence (cache_io) or inspection.
+    fn replay(&self, consultations: &[(ConsultedKey, bool)]) {
+        for (key, hit) in consultations {
+            self.record(key.clone(), *hit);
+        }
+    }
+
+    fn begin_capture(&self) {
+        self.captures.borrow_mut().push(FxHashMap::default());
+    }
+
+    fn end_capture(&self) -> Consultations {
+        let mut captures = self.captures.borrow_mut();
+        let capture = captures.pop().expect("end_capture without begin_capture");
+        if let Some(outer) = captures.last_mut() {
+            outer.extend(capture.iter().map(|(key, hit)| (key.clone(), *hit)));
+        }
+        capture.into_iter().collect()
+    }
+
+    /// Drains the recorded set for `crema extract` or inspection.
     /// Consumes `self` — a log is per-file and one-shot, never replayed.
     pub fn into_entries(self) -> FxHashMap<ConsultedKey, bool> {
         self.entries.into_inner()
@@ -5229,7 +5453,7 @@ impl ConsultationLog {
 /// around the same way `Ty` / `Symbol` / `TypeName` already are in this
 /// codebase, rather than through an extra layer of borrowing.
 ///
-/// `log` is `None` on the default (incremental off) path — every recording
+/// `log` is `None` on the `crema check` path — every recording
 /// method degrades to a plain forward-and-discard call, so the only
 /// per-query cost paid there is one `Option` check.
 #[derive(Clone, Copy)]
@@ -5243,8 +5467,8 @@ impl<'a> ConsultationView<'a> {
         Self { builder, log }
     }
 
-    /// `key` is a closure, not a value: `log: None` (the default,
-    /// incremental-off path) must not pay for constructing a `ConsultedKey`
+    /// `key` is a closure, not a value: `log: None` (the `crema check`
+    /// path) must not pay for constructing a `ConsultedKey`
     /// it will immediately discard. Eagerly-evaluated arguments would defeat
     /// that — `ConstantContext` clones a heap-allocated `Box<[TypeName]>`,
     /// and `lookup_global`'s key used to force a permanent interner entry
@@ -5258,10 +5482,16 @@ impl<'a> ConsultationView<'a> {
 
     // -- recorded queries --------------------------------------------------
 
-    pub fn expand_type_alias(&self, name: &TypeName, args: &[Ty]) -> Option<Ty> {
-        let result = self.builder.expand_type_alias(name, args);
-        self.record(|| ConsultedKey::ExpandTypeAlias(*name), result.is_some());
-        result
+    /// Records `ExpandTypeAlias` for each hop of an alias expansion.
+    /// `expand_alias` / `normalize_receiver` expand through the builder's
+    /// unrecorded query and record here, so a memo hit can replay the
+    /// same hops a miss records.
+    fn record_alias_hops(&self, hops: &[AliasHop]) {
+        if let Some(log) = self.log {
+            for &(name, hit) in hops {
+                log.record(ConsultedKey::ExpandTypeAlias(name), hit);
+            }
+        }
     }
 
     pub fn constant_deprecated_message(&self, name: &TypeName) -> Option<Option<String>> {
@@ -5381,7 +5611,7 @@ impl<'a> ConsultationView<'a> {
         result
     }
 
-    pub fn lookup_instance_method(&self, class: &TypeName, method: Symbol) -> Option<Method> {
+    pub fn lookup_instance_method(&self, class: &TypeName, method: Symbol) -> Option<Arc<Method>> {
         let result = self.builder.lookup_instance_method(class, method);
         self.record(
             || ConsultedKey::MethodResolution {
@@ -5398,7 +5628,7 @@ impl<'a> ConsultationView<'a> {
         class: &TypeName,
         args: &[Ty],
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         let result = self
             .builder
             .lookup_instance_method_with_args(class, args, method);
@@ -5417,7 +5647,7 @@ impl<'a> ConsultationView<'a> {
         interface: &TypeName,
         args: &[Ty],
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         let result = self
             .builder
             .lookup_interface_method_with_args(interface, args, method);
@@ -5435,7 +5665,7 @@ impl<'a> ConsultationView<'a> {
         &self,
         self_type: Ty,
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         let result = self.builder.lookup_super_method(self_type, method);
         match self.builder.types().resolve(self_type) {
             Type::ClassInstance { name, .. } => self.record(
@@ -5461,7 +5691,7 @@ impl<'a> ConsultationView<'a> {
         &self,
         class: &TypeName,
         method: Symbol,
-    ) -> Option<(Method, FxHashMap<TypeVarKey, Ty>)> {
+    ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         let result = self.builder.lookup_singleton_method(class, method);
         self.record(
             || ConsultedKey::SingletonMethodResolution {
@@ -5536,7 +5766,7 @@ impl<'a> ConsultationView<'a> {
                 method,
                 kind,
                 location,
-                source_file: source_file.map(|n| self.builder.names().resolve(n)),
+                source_file: source_file.map(|n| self.builder.names().resolve(n).to_string()),
                 current,
             },
             !result.is_empty(),
@@ -5557,7 +5787,7 @@ impl<'a> ConsultationView<'a> {
             || ConsultedKey::ConcernBlockTargets {
                 concern,
                 location,
-                source_file: source_file.map(|n| self.builder.names().resolve(n)),
+                source_file: source_file.map(|n| self.builder.names().resolve(n).to_string()),
             },
             result.is_some(),
         );
@@ -5686,17 +5916,51 @@ impl<'a> ConsultationView<'a> {
     pub fn lower_ast_type(
         &self,
         ast_ty: &crate::ast::types::Type,
-        context: &[Option<Name>],
+        context: &[TypeName],
         scope: &TypeParamScope,
     ) -> Ty {
         self.builder.lower_ast_type(ast_ty, context, scope)
     }
 
-    pub(crate) fn cached_subtype_result(&self, key: &SubtypeCacheKey) -> Option<bool> {
-        self.builder.cached_subtype_result(key)
+    // -- shared memos -------------------------------------------------------
+    //
+    // A memoized computation runs between `begin_capture` and
+    // `end_capture`, and its store takes what the capture returned; a hit
+    // replays that into this view's log. With a log, a hit on an entry
+    // that has no consultations (stored through a view without a log)
+    // reads as a miss, so the caller computes it and this log still gets
+    // them.
+
+    pub(crate) fn begin_capture(&self) {
+        if let Some(log) = self.log {
+            log.begin_capture();
+        }
     }
 
-    pub(crate) fn store_subtype_result(&self, key: SubtypeCacheKey, result: bool) {
+    /// `None` when there is no log (nothing was captured).
+    pub(crate) fn end_capture(&self) -> Option<Consultations> {
+        self.log.map(ConsultationLog::end_capture)
+    }
+
+    pub(crate) fn cached_subtype_result(&self, key: &SubtypeCacheKey) -> Option<bool> {
+        let result = self.builder.cached_subtype_result(key)?;
+        if let Some(log) = self.log {
+            log.replay(self.builder.subtype_consultations.get(key)?);
+        }
+        Some(result)
+    }
+
+    pub(crate) fn store_subtype_result(
+        &self,
+        key: SubtypeCacheKey,
+        result: bool,
+        consultations: Option<Consultations>,
+    ) {
+        if let Some(consultations) = consultations {
+            self.builder
+                .subtype_consultations
+                .insert_first(key, consultations);
+        }
         self.builder.store_subtype_result(key, result);
     }
 
@@ -5704,14 +5968,24 @@ impl<'a> ConsultationView<'a> {
         &self,
         key: &InterfaceUnifyKey,
     ) -> Option<Vec<(TypeVarKey, Ty)>> {
-        self.builder.cached_interface_unify(key)
+        let result = self.builder.cached_interface_unify(key)?;
+        if let Some(log) = self.log {
+            log.replay(self.builder.interface_unify_consultations.get(key)?);
+        }
+        Some(result)
     }
 
     pub(crate) fn store_interface_unify(
         &self,
         key: InterfaceUnifyKey,
         bindings: Vec<(TypeVarKey, Ty)>,
+        consultations: Option<Consultations>,
     ) {
+        if let Some(consultations) = consultations {
+            self.builder
+                .interface_unify_consultations
+                .insert_first(key.clone(), consultations);
+        }
         self.builder.store_interface_unify(key, bindings);
     }
 }

@@ -8,25 +8,18 @@
 //! lockfile's *content*, and a `Gemfile` without a resolved
 //! `Gemfile.lock` has nothing to hash into the key yet.
 //!
-//! Two entry points in crema used to disagree with the bundler resolver
-//! on how the lockfile is located:
-//!
-//! - Cache-invalidation and g-snapshot key computation flat-joined
-//!   `project_root/Gemfile.lock`. Under a separated layout — the
-//!   Gemfile.lock lives above the `crema.toml` directory — this file
-//!   simply did not exist, so nothing invalidated the caches when the
-//!   real lockfile changed (silent stale).
-//! - The bundler side (`find_gemfile` in `main.rs`) walked ancestors
-//!   starting from `cwd`, found the real Gemfile, and spawned
-//!   `bundle exec`; the child bundler then walked up from its
-//!   inherited `cwd` to the same Gemfile.lock — the version the flat
-//!   join missed.
-//!
-//! This module unifies the "find the lockfile" side onto a `project_root`
-//! walk-up. Cache-invalidation and key computation must run off
+//! Cache-invalidation and g-snapshot key computation run off
 //! `project_root` (not `cwd`) — ADR-0028 Decision 4 requires
 //! subdirectory execution and root execution to produce the same key,
-//! and `cwd` differs between the two.
+//! and `cwd` differs between the two. A flat join of
+//! `project_root/Gemfile.lock` would miss a separated layout (the
+//! Gemfile.lock above the `crema.toml` directory) and never invalidate
+//! when the real lockfile changes, hence the walk-up.
+//!
+//! The bundler side starts from the same place: `ResolverAnchor` in
+//! `main.rs` decides bundler mode with `find_gemfile` from
+//! `project_root` and runs the bundler probe there, so bundler's own
+//! walk-up (from its cwd) reaches the lockfile this walk-up hashes.
 //!
 //! # Stop marker
 //!
@@ -49,8 +42,7 @@ pub const GEMFILE_LOCK: &str = "Gemfile.lock";
 /// Walk up from `project_root` looking for the directory that holds
 /// `Gemfile.lock` — the file whose *content* is the cache invalidation
 /// source and g-snapshot key input. Returns the *directory* (callers
-/// join `GEMFILE_LOCK` / `GEMFILE` themselves; the enumerator also
-/// uses the directory as the child process's `current_dir`).
+/// join `GEMFILE_LOCK` / `GEMFILE` themselves).
 ///
 /// Anchor rationale: bundler's own resolver anchors on `Gemfile` (it
 /// derives `Gemfile.lock = Gemfile + ".lock"`). Under the standard
@@ -58,10 +50,7 @@ pub const GEMFILE_LOCK: &str = "Gemfile.lock";
 /// share a directory. crema anchors on `Gemfile.lock` directly because
 /// what we actually consume is the *lockfile content*; a project with
 /// a `Gemfile` but no resolved `Gemfile.lock` has nothing to hash into
-/// the invalidation key yet. The `enumerate_bundled_gems_in` guard
-/// re-checks that both files exist at the discovered dir before
-/// spawning bundler, so a stray `Gemfile.lock` without a `Gemfile`
-/// still gates the child process correctly.
+/// the invalidation key yet.
 ///
 /// Returns `None` when no `Gemfile.lock` is found before the walk
 /// stops at a `.git` boundary or reaches the filesystem root. Also

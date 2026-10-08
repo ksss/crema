@@ -31,7 +31,6 @@ use crate::environment::draft::{Context, EnvironmentDraft};
 use crate::environment::frozen::{ClassDeclaration, ClassOrModule, Environment, ModuleDeclaration};
 use crate::location as cl;
 use crate::name::{Name, NameTable, Symbol};
-use crate::snapshot::append_map::AppendMap;
 use crate::snapshot::backend::GSnapshotBackend;
 use crate::snapshot::convert::sym_id_of;
 use crate::snapshot::flat;
@@ -322,31 +321,56 @@ pub(crate) enum EntrySource<'a> {
     Map(&'a FxHashMap<u64, MEntry>),
     Flat {
         reader: &'a flat::Reader<'a>,
-        memo: &'a AppendMap<u64, MEntry>,
-        decodes: &'a std::cell::Cell<usize>,
+        memo: &'a EntryMemo,
+        decodes: &'a std::sync::atomic::AtomicUsize,
     },
 }
 
-impl EntrySource<'_> {
-    pub(crate) fn get(&self, id: u64) -> Result<Option<&MEntry>, RebuildError> {
+/// Payloads one decode pass has deserialized, keyed by entry id. Scoped
+/// to a single call on a single thread; hands out `Rc` clones so a
+/// caller can keep an entry while later fetches add more.
+pub(crate) type EntryMemo = std::cell::RefCell<FxHashMap<u64, std::rc::Rc<MEntry>>>;
+
+/// Class/module declarations a decode-all pass converted through
+/// nested-decl refs, keyed by `(child entry id, pair index)`.
+pub(crate) type NestedDecls = std::cell::RefCell<FxHashMap<(u64, usize), cd::Declaration>>;
+
+pub(crate) enum EntryRef<'a> {
+    Borrowed(&'a MEntry),
+    Shared(std::rc::Rc<MEntry>),
+}
+
+impl std::ops::Deref for EntryRef<'_> {
+    type Target = MEntry;
+    fn deref(&self) -> &MEntry {
         match self {
-            EntrySource::Map(map) => Ok(map.get(&id)),
+            EntryRef::Borrowed(e) => e,
+            EntryRef::Shared(e) => e,
+        }
+    }
+}
+
+impl EntrySource<'_> {
+    pub(crate) fn get(&self, id: u64) -> Result<Option<EntryRef<'_>>, RebuildError> {
+        match self {
+            EntrySource::Map(map) => Ok(map.get(&id).map(EntryRef::Borrowed)),
             EntrySource::Flat {
                 reader,
                 memo,
                 decodes,
             } => {
-                if let Some(e) = memo.get(&id) {
-                    return Ok(Some(e));
+                if let Some(e) = memo.borrow().get(&id) {
+                    return Ok(Some(EntryRef::Shared(std::rc::Rc::clone(e))));
                 }
                 let Some(bytes) = reader.lookup_entry(id) else {
                     return Ok(None);
                 };
-                let entry = memo.get_or_try_insert_with(id, || {
-                    decodes.set(decodes.get() + 1);
-                    bincode::deserialize(bytes).map_err(RebuildError::BincodeDecode)
-                })?;
-                Ok(Some(entry))
+                decodes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let entry: std::rc::Rc<MEntry> = std::rc::Rc::new(
+                    bincode::deserialize(bytes).map_err(RebuildError::BincodeDecode)?,
+                );
+                memo.borrow_mut().insert(id, std::rc::Rc::clone(&entry));
+                Ok(Some(EntryRef::Shared(entry)))
             }
         }
     }
@@ -366,7 +390,7 @@ pub(crate) struct Decoder<'t> {
     /// for the child entries' flatten pairs — restoring the sharing a
     /// draft-flatten build gets for free, instead of re-converting
     /// every nested subtree once per ancestor level.
-    nested_out: Option<&'t AppendMap<(u64, usize), cd::Declaration>>,
+    nested_out: Option<&'t NestedDecls>,
     depth: usize,
     /// G backend to fall back to when a nested decl ref's target has no
     /// A-layer entry: a parent pulled into the overlay can carry a
@@ -389,6 +413,13 @@ pub(crate) struct Decoder<'t> {
 }
 
 impl<'t> Decoder<'t> {
+    /// The declaration a decode-all pass already converted for
+    /// `(child entry id, pair index)`, if this decoder carries the
+    /// pass's nested cache.
+    pub(crate) fn nested_decl(&self, key: (u64, usize)) -> Option<cd::Declaration> {
+        self.nested_out?.borrow().get(&key).cloned()
+    }
+
     pub(crate) fn new(tables: &'t DecodeTables) -> Self {
         Decoder {
             tables,
@@ -409,10 +440,7 @@ impl<'t> Decoder<'t> {
         }
     }
 
-    pub(crate) fn with_nested_cache(
-        tables: &'t DecodeTables,
-        nested_out: &'t AppendMap<(u64, usize), cd::Declaration>,
-    ) -> Self {
+    pub(crate) fn with_nested_cache(tables: &'t DecodeTables, nested_out: &'t NestedDecls) -> Self {
         Decoder {
             tables,
             cursors: FxHashMap::default(),
@@ -571,7 +599,7 @@ impl<'t> Decoder<'t> {
         let Some(entry) = entries.get(r.id)? else {
             return self.decl_ref_from_g(r, expected_ctx);
         };
-        match (r.kind, entry) {
+        match (r.kind, &*entry) {
             (0, MEntry::ClassOrModule(MClassOrModule::Class(e))) => {
                 let idx = self.consume_pair(
                     r.id,
@@ -581,7 +609,10 @@ impl<'t> Decoder<'t> {
                 let (ctx, d) = &e.context_decls[idx];
                 let decl = cd::Declaration::Class(Arc::new(self.class_decl(entries, d, ctx)?));
                 if let Some(cache) = self.nested_out {
-                    cache.insert_first((r.id, idx), decl.clone());
+                    cache
+                        .borrow_mut()
+                        .entry((r.id, idx))
+                        .or_insert_with(|| decl.clone());
                 }
                 Ok(decl)
             }
@@ -594,7 +625,10 @@ impl<'t> Decoder<'t> {
                 let (ctx, d) = &e.context_decls[idx];
                 let decl = cd::Declaration::Module(Arc::new(self.module_decl(entries, d, ctx)?));
                 if let Some(cache) = self.nested_out {
-                    cache.insert_first((r.id, idx), decl.clone());
+                    cache
+                        .borrow_mut()
+                        .entry((r.id, idx))
+                        .or_insert_with(|| decl.clone());
                 }
                 Ok(decl)
             }

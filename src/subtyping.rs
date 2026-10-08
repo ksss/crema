@@ -21,12 +21,12 @@ pub struct BoundViolation {
 }
 
 /// Cap on `SubtypeChecker::check`'s in-flight recursion depth
-/// (`assumptions.len()` at entry), mirroring Steep's
+/// (number of in-flight relations at entry), mirroring Steep's
 /// `Subtyping::Check::ABORT_LIMIT` (`subtyping/check.rb:4`, default 50).
 /// Coinductive self-referential shapes (e.g. a block param typed
 /// `Box[E, self]` checked against an interface block param typed `self`)
 /// re-derive a structurally *new* `Ty` on every recursion — one more layer
-/// of wrapping each time — so the exact-match `assumptions` guard below
+/// of wrapping each time — so the exact-match in-flight guard below
 /// never revisits the same key and never short-circuits. Steep hits the
 /// same growth and fails closed past this depth (`Result::Failure::
 /// LoopAbort`, verified via steep-playground 2026-07-21: `Box[Integer,
@@ -36,6 +36,12 @@ pub struct BoundViolation {
 /// in-flight `check()` frames, not self-referential growth specifically, so
 /// a legitimately deep (51+ level) but non-recursive type comparison would
 /// also abort — the same trade-off Steep's own `ABORT_LIMIT` makes.
+///
+/// A relation that hits the shared memo returns without pushing a frame, so
+/// whether a deep comparison reaches this cap depends on what earlier queries
+/// memoized. Only non-diverging comparisons nested 50+ levels are affected,
+/// and the order changes only false positives, never missed errors. This is
+/// an accepted limitation (ADR-0034), not a spec.
 const SUBTYPE_ASSUMPTION_ABORT_LIMIT: usize = 50;
 
 /// Checks subtype relations between types.
@@ -43,17 +49,61 @@ pub struct SubtypeChecker<'a> {
     env: ConsultationView<'a>,
     type_variables_are_wildcards: bool,
     self_bound: Option<Ty>,
-    assumptions: RefCell<FxHashSet<SubtypeCacheKey>>,
+    search: RefCell<Search>,
 }
 
-struct AssumptionGuard<'a> {
-    assumptions: &'a RefCell<FxHashSet<SubtypeCacheKey>>,
+/// Per-query state of the coinductive search behind
+/// [`SubtypeChecker::check`].
+///
+/// Invariant: every `provisional` dependency names a frame that is still
+/// on `frames` — when a frame ends, the results resting on it are either
+/// confirmed into the shared memo, discarded, or re-pointed at the outer
+/// frame the ending one itself rests on.
+#[derive(Default)]
+struct Search {
+    /// In-flight relations, outermost first. A relation re-entered while
+    /// in flight is assumed to hold (coinduction).
+    frames: Vec<Frame>,
+    /// `key -> index into frames` for the in-flight relations.
+    in_flight: FxHashMap<SubtypeCacheKey, usize>,
+    /// Relations that came out `true` only by assuming an in-flight one,
+    /// in the order they finished. Not shared: they are sound only once
+    /// the frame they rest on also finishes `true`.
+    provisional: Vec<SubtypeCacheKey>,
+    /// `key -> lowest frame index it rests on`, for each `provisional` key.
+    provisional_rests_on: FxHashMap<SubtypeCacheKey, usize>,
+    /// Relations that came out `false` through the depth cap during the
+    /// current outermost query. Not shared (a shallower start may prove
+    /// them), but reused within the query: a self-wrapping shape reaches
+    /// each level's key once per overload, and recomputing it every time
+    /// branches exponentially before the cap is hit.
+    aborted_false: FxHashSet<SubtypeCacheKey>,
+}
+
+struct Frame {
     key: SubtypeCacheKey,
+    /// Lowest frame index a `true` inside this frame was derived from by
+    /// assumption (`usize::MAX` when none).
+    rests_on: usize,
+    /// Whether a `false` inside this frame came from the depth cap.
+    aborted: bool,
+    /// `provisional.len()` when this frame was pushed.
+    provisional_start: usize,
 }
 
-impl Drop for AssumptionGuard<'_> {
-    fn drop(&mut self) {
-        self.assumptions.borrow_mut().remove(&self.key);
+impl Search {
+    fn rest_innermost_on(&mut self, index: usize) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.rests_on = frame.rests_on.min(index);
+        }
+    }
+
+    fn drain_provisional_from(&mut self, start: usize) -> Vec<SubtypeCacheKey> {
+        let drained: Vec<_> = self.provisional.drain(start..).collect();
+        for key in &drained {
+            self.provisional_rests_on.remove(key);
+        }
+        drained
     }
 }
 
@@ -63,7 +113,7 @@ impl<'a> SubtypeChecker<'a> {
             env,
             type_variables_are_wildcards: true,
             self_bound: None,
-            assumptions: RefCell::new(FxHashSet::default()),
+            search: RefCell::default(),
         }
     }
 
@@ -72,7 +122,7 @@ impl<'a> SubtypeChecker<'a> {
             env,
             type_variables_are_wildcards: false,
             self_bound: None,
-            assumptions: RefCell::new(FxHashSet::default()),
+            search: RefCell::default(),
         }
     }
 
@@ -89,20 +139,35 @@ impl<'a> SubtypeChecker<'a> {
     /// Returns true if `sub` is a subtype of `sup`.
     ///
     /// Wraps [`Self::check_uncached`] with an env-shared memoization layer
-    /// keyed by `(sub, sup, self_bound, type_variables_are_wildcards)`.
-    /// Mirrors `Steep::Subtyping::Check#check_type` which consults
-    /// `@cache` before running the relation (`subtyping/check.rb:195`).
-    /// The untyped short-circuit runs ahead of the cache lookup since
-    /// it's O(1) and avoids polluting the cache with trivial entries.
+    /// keyed by `(sub, sup, self_bound, type_variables_are_wildcards)`,
+    /// like `Steep::Subtyping::Check#check_type` consults `@cache`
+    /// (`subtyping/check.rb:195`). The untyped short-circuit runs ahead of
+    /// the cache lookup since it's O(1) and avoids polluting the cache with
+    /// trivial entries.
+    ///
+    /// The memo is shared across files (and threads, ADR-0034), so it only
+    /// takes values that do not depend on this query's context — unlike
+    /// Steep, which stores whatever the in-flight search produced. The
+    /// relation is monotone (sub-results combine only through `all`/`any`,
+    /// never negated), which splits the results in two:
+    /// - `true` derived by assuming an in-flight relation holds only if that
+    ///   relation also ends `true`; it is kept per query until then
+    /// - `false` derived from the depth cap may be `true` from a shallower
+    ///   start; it is never stored
+    ///
+    /// Every other result equals what an empty search would compute.
     pub fn check(&self, sub: Ty, sup: Ty) -> bool {
         if sub.is_untyped() || sup.is_untyped() {
             return true;
         }
 
-        // Fail closed past the depth cap, ahead of the cache lookup so an
-        // aborted result never gets memoized (mirrors Steep's `check_type`,
-        // which returns `Failure(LoopAbort)` before consulting `@cache`).
-        if self.assumptions.borrow().len() >= SUBTYPE_ASSUMPTION_ABORT_LIMIT {
+        // Fail closed past the depth cap, ahead of the cache lookup (mirrors
+        // Steep's `check_type`, which returns `Failure(LoopAbort)` before
+        // consulting `@cache`).
+        if self.search.borrow().frames.len() >= SUBTYPE_ASSUMPTION_ABORT_LIMIT {
+            if let Some(frame) = self.search.borrow_mut().frames.last_mut() {
+                frame.aborted = true;
+            }
             return false;
         }
 
@@ -116,28 +181,118 @@ impl<'a> SubtypeChecker<'a> {
             return cached;
         }
 
-        if self.assumptions.borrow().contains(&cache_key) {
-            return true;
+        {
+            let mut search = self.search.borrow_mut();
+            let search = &mut *search;
+            if let Some(&index) = search
+                .provisional_rests_on
+                .get(&cache_key)
+                .or_else(|| search.in_flight.get(&cache_key))
+            {
+                search.rest_innermost_on(index);
+                return true;
+            }
+            if search.aborted_false.contains(&cache_key) {
+                if let Some(frame) = search.frames.last_mut() {
+                    frame.aborted = true;
+                }
+                return false;
+            }
+            let index = search.frames.len();
+            search.in_flight.insert(cache_key, index);
+            let provisional_start = search.provisional.len();
+            search.frames.push(Frame {
+                key: cache_key,
+                rests_on: usize::MAX,
+                aborted: false,
+                provisional_start,
+            });
         }
-        let _guard = self.push_assumption(cache_key);
 
+        self.env.begin_capture();
         let result = self.check_uncached(sub, sup);
-        self.env.store_subtype_result(cache_key, result);
+        self.finish_frame(result);
         result
     }
 
-    fn push_assumption(&self, key: SubtypeCacheKey) -> AssumptionGuard<'_> {
-        self.assumptions.borrow_mut().insert(key);
-        AssumptionGuard {
-            assumptions: &self.assumptions,
-            key,
+    /// Pop the innermost frame and settle what it (and everything that
+    /// rested on it) may contribute to the shared memo.
+    ///
+    /// A stored relation carries the consultations captured over its
+    /// frame. The relations established together with a frame were each
+    /// proven inside it, and each reaches the frame's relation back
+    /// through the assumption it rested on, so a fresh check of any of
+    /// them would make the same consultations: they all carry the frame's.
+    fn finish_frame(&self, result: bool) {
+        let consultations = self.env.end_capture();
+        let mut search = self.search.borrow_mut();
+        let frame = search.frames.pop().expect("finish_frame without a frame");
+        search.in_flight.remove(&frame.key);
+        let index = search.frames.len();
+        if index == 0 {
+            search.aborted_false.clear();
+        } else if !result && frame.aborted {
+            search.aborted_false.insert(frame.key);
         }
+
+        if !result {
+            // A `false` holds in any context (monotonicity), but the `true`s
+            // derived while this relation was assumed are now unfounded.
+            search.drain_provisional_from(frame.provisional_start);
+            drop(search);
+            if frame.aborted {
+                if let Some(parent) = self.search.borrow_mut().frames.last_mut() {
+                    parent.aborted = true;
+                }
+            } else {
+                self.env
+                    .store_subtype_result(frame.key, false, consultations);
+            }
+            return;
+        }
+
+        if frame.rests_on >= index {
+            // Rests on nothing outside itself: this relation and every result
+            // assumed under it are established.
+            let established = search.drain_provisional_from(frame.provisional_start);
+            drop(search);
+            for key in established {
+                self.env
+                    .store_subtype_result(key, true, consultations.clone());
+            }
+            self.env
+                .store_subtype_result(frame.key, true, consultations);
+            return;
+        }
+
+        let rests_on = frame.rests_on;
+        let Search {
+            provisional,
+            provisional_rests_on,
+            ..
+        } = &mut *search;
+        for key in &provisional[frame.provisional_start..] {
+            if let Some(dep) = provisional_rests_on.get_mut(key)
+                && *dep >= index
+            {
+                *dep = rests_on;
+            }
+        }
+        provisional.push(frame.key);
+        provisional_rests_on.insert(frame.key, rests_on);
+        search.rest_innermost_on(rests_on);
     }
 
     fn check_uncached(&self, sub: Ty, sup: Ty) -> bool {
         // Expand type aliases before comparison
         let sub = definition_builder::expand_alias(self.env, sub);
         let sup = definition_builder::expand_alias(self.env, sup);
+
+        // `check` short-circuits `untyped` before expansion; an alias that
+        // expands to `untyped` (`type u = untyped`) only shows it here.
+        if sub.is_untyped() || sup.is_untyped() {
+            return true;
+        }
 
         if sub == sup {
             return true;
@@ -265,10 +420,17 @@ impl<'a> SubtypeChecker<'a> {
                 }
                 // Tuples widen to `Array[union-of-elements]` for any non-tuple sup.
                 // This lets inheritance, interface conformance, and gradual typing
-                // all reuse the existing ClassInstance machinery uniformly.
+                // all reuse the existing ClassInstance machinery uniformly. An
+                // interface sup gets a second chance below with `self` kept as
+                // the tuple (Steep's `Any(widened, shape)` for a Tuple sub).
                 _ => {
                     let array_ty = self.tuple_as_array(sub_members);
-                    return self.check(array_ty, sup);
+                    if self.check(array_ty, sup) {
+                        return true;
+                    }
+                    if !matches!(sup_type, Type::Interface { .. }) {
+                        return false;
+                    }
                 }
             }
         }
@@ -282,7 +444,12 @@ impl<'a> SubtypeChecker<'a> {
                 // ClassInstance-based inheritance/interface/Hash-method logic.
                 _ => {
                     let hash_ty = self.record_as_hash(sub_fields);
-                    return self.check(hash_ty, sup);
+                    if self.check(hash_ty, sup) {
+                        return true;
+                    }
+                    if !matches!(sup_type, Type::Interface { .. }) {
+                        return false;
+                    }
                 }
             }
         }
@@ -710,6 +877,33 @@ impl<'a> SubtypeChecker<'a> {
             // Nil` to `NilClass` at `steep/lib/steep/interface/
             // builder.rb`).
             Type::Nil => (self.env.names().builtins().nil_class, Vec::new(), false),
+            // Structural types take their methods from the class they widen
+            // to, while `sub` (the structural type itself) stays the `self`
+            // those methods are substituted with. Steep `raw_shape` builds
+            // the same split: `object_shape(Array)` with `self_type: tuple`.
+            Type::Literal(lit) => {
+                let widened = self
+                    .env
+                    .class_instance_type(*lit.class_typename(self.env.names().builtins()));
+                let Some((name, args)) = class_instance_parts(types, widened) else {
+                    return false;
+                };
+                (name, args, false)
+            }
+            Type::Tuple(members) => {
+                let Some((name, args)) = class_instance_parts(types, self.tuple_as_array(members))
+                else {
+                    return false;
+                };
+                (name, args, false)
+            }
+            Type::Record { fields } => {
+                let Some((name, args)) = class_instance_parts(types, self.record_as_hash(fields))
+                else {
+                    return false;
+                };
+                (name, args, false)
+            }
             _ => return false,
         };
 
@@ -797,7 +991,7 @@ impl<'a> SubtypeChecker<'a> {
             // end`: the return-type check recurses into `check(Base,
             // _Dupable)`, and if `Base` also only has `dup: () -> Base`, that
             // recursion re-derives the exact relation already in
-            // `self.assumptions` (pushed by the outer `check()` call for
+            // the in-flight relations (pushed by the outer `check()` call for
             // `Sub <: _Dupable`), so the coinductive assumption closes the
             // loop — mirroring Steep's `assumptions.member?(relation)`
             // short-circuit. Binding directly to `sub` instead (the naive
@@ -1228,6 +1422,15 @@ impl<'a> SubtypeChecker<'a> {
                 None => return false,
             }
         }
+    }
+}
+
+/// `(name, args)` of a widened structural type, which is always a
+/// `ClassInstance` (`Array[...]` / `Hash[...]` / a literal's class).
+fn class_instance_parts(types: &crate::types::TypeTable, ty: Ty) -> Option<(TypeName, Vec<Ty>)> {
+    match types.resolve(ty) {
+        Type::ClassInstance { name, args } => Some((*name, args.clone())),
+        _ => None,
     }
 }
 

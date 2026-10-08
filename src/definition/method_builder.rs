@@ -18,6 +18,14 @@
 //! Interface bucket build mirrors rbs's `build_interface` (single-decl
 //! walk, no reopen, no subst); the same Sorter machinery resolves alias
 //! buckets at flush time.
+//!
+//! The bucket payload is generic over [`BucketMember`]: the definition
+//! path stores [`MemberRef`] (the member AST, type-rewritten, ready for
+//! lowering), while the diagnostics-only scans store [`MemberSite`]
+//! (just what `DuplicatedMethodDefinition` / `RecursiveAliasDefinition`
+//! read: file, range, alias edge). Both go through the same
+//! `build_method` / `build_attribute` / `build_alias` rules, so the
+//! dup / overloading / attr classification lives in one place.
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -25,11 +33,17 @@ use std::sync::Arc;
 use crate::ast::MethodKind;
 use crate::ast::declarations::{AsMember, Member};
 use crate::ast::members::{
-    AliasKind, AttrAccessorMember as AstAttrAccessor, AttrReaderMember as AstAttrReader,
-    AttrWriterMember as AstAttrWriter, AttributeKind, MethodDefinitionMember as MethodDefinition,
+    AliasKind, AliasMember, AttrAccessorMember as AstAttrAccessor,
+    AttrReaderMember as AstAttrReader, AttrWriterMember as AstAttrWriter, AttributeKind,
+    MethodDefinitionMember as MethodDefinition,
 };
-use crate::ast::ruby::members::Member as RubyMember;
+use crate::ast::ruby::members::{
+    AttrAccessorMember as RubyAttrAccessorMember, AttrReaderMember as RubyAttrReaderMember,
+    AttrWriterMember as RubyAttrWriterMember, DefMember as RubyDefMember, Member as RubyMember,
+};
 use crate::ast::types::substitution::Substitution as AstSubst;
+use crate::location::LocationRange;
+use crate::name::Name;
 
 /// Instance vs. singleton discriminator for the `build_class_or_module` pass.
 ///
@@ -51,6 +65,268 @@ use crate::types::{Ty, Type, TypeTable, Visibility};
 use super::MemberRef;
 use crate::definition_builder::{attribute_visibility, special_instance_visibility};
 
+/// Which attribute buckets a member contributes to. Mirrors the
+/// `is_a?(AttrReader) || is_a?(AttrAccessor)` / `is_a?(AttrWriter) ||
+/// is_a?(AttrAccessor)` pair of checks in rbs `build_attribute` /
+/// `build_ruby_attribute`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttributeRole {
+    Reader,
+    Writer,
+    Accessor,
+}
+
+impl AttributeRole {
+    fn contributes_reader(self) -> bool {
+        matches!(self, AttributeRole::Reader | AttributeRole::Accessor)
+    }
+
+    fn contributes_writer(self) -> bool {
+        matches!(self, AttributeRole::Writer | AttributeRole::Accessor)
+    }
+}
+
+/// Borrowed view of one AST member about to be pushed into a bucket.
+/// The single constructor input for every [`BucketMember`] payload, so
+/// `push_signature_members` / `push_ruby_members` /
+/// `build_interface_inner` stay payload-agnostic. `subst` is `Some` on
+/// the class / module signature path (reopen decls are rewritten onto
+/// the primary decl's type params) and `None` on the interface path.
+pub enum MemberSource<'a> {
+    Method {
+        md: &'a MethodDefinition,
+        subst: Option<&'a AstSubst>,
+    },
+    AttrReader {
+        r: &'a AstAttrReader,
+        subst: &'a AstSubst,
+    },
+    AttrWriter {
+        w: &'a AstAttrWriter,
+        subst: &'a AstSubst,
+    },
+    AttrAccessor {
+        a: &'a AstAttrAccessor,
+        subst: &'a AstSubst,
+    },
+    Alias(&'a AliasMember),
+    RubyDef(&'a RubyDefMember),
+    RubyAttrReader(&'a RubyAttrReaderMember),
+    RubyAttrWriter(&'a RubyAttrWriterMember),
+    RubyAttrAccessor(&'a RubyAttrAccessorMember),
+}
+
+/// Payload stored per bucket entry. Implemented by [`MemberRef`] (the
+/// definition path: owns the rewritten member AST so lowering can read
+/// overload types) and [`MemberSite`] (the diagnostics-only path: file,
+/// range, alias edge, nothing else). The accessors are exactly what the
+/// dup / alias-cycle collectors and [`Sorter`] consume.
+pub trait BucketMember: Clone {
+    fn from_source(src: MemberSource<'_>, names: &NameTable) -> Self;
+
+    /// Source file of the originating AST member (`None` for in-memory
+    /// RBS and for `MemberRef::Synthesized`).
+    fn source_file(&self) -> Option<Name>;
+
+    /// Range of the originating AST member.
+    fn location(&self) -> Option<LocationRange>;
+
+    /// `Some(old_name)` when this entry is an `alias new_name old_name`
+    /// member — the Sorter's only edge source.
+    fn alias_old_name(&self) -> Option<Symbol>;
+
+    /// `Some` when this entry is an attribute member; drives which
+    /// buckets `push_attribute_buckets` fills.
+    fn attribute_role(&self) -> Option<AttributeRole>;
+}
+
+impl BucketMember for MemberRef {
+    fn from_source(src: MemberSource<'_>, names: &NameTable) -> Self {
+        match src {
+            MemberSource::Method { md, subst: None } => MemberRef::Method(Arc::new(md.clone())),
+            MemberSource::Method {
+                md,
+                subst: Some(subst),
+            } => MemberRef::Method(Arc::new(MethodDefinition {
+                name: md.name,
+                kind: md.kind,
+                overloads: subst.apply_overloads(&md.overloads, names),
+                annotations: md.annotations.clone(),
+                overloading: md.overloading,
+                visibility: md.visibility,
+                location: md.location,
+                source_file: md.source_file,
+                comment: md.comment.clone(),
+            })),
+            MemberSource::AttrReader { r, subst } => {
+                MemberRef::AttrReader(Arc::new(AstAttrReader {
+                    name: r.name,
+                    ty: subst.apply_type(&r.ty),
+                    kind: r.kind,
+                    ivar_name: r.ivar_name.clone(),
+                    annotations: r.annotations.clone(),
+                    location: r.location,
+                    source_file: r.source_file,
+                    comment: r.comment.clone(),
+                    visibility: r.visibility,
+                }))
+            }
+            MemberSource::AttrWriter { w, subst } => {
+                MemberRef::AttrWriter(Arc::new(AstAttrWriter {
+                    name: w.name,
+                    ty: subst.apply_type(&w.ty),
+                    kind: w.kind,
+                    ivar_name: w.ivar_name.clone(),
+                    annotations: w.annotations.clone(),
+                    location: w.location,
+                    source_file: w.source_file,
+                    comment: w.comment.clone(),
+                    visibility: w.visibility,
+                }))
+            }
+            MemberSource::AttrAccessor { a, subst } => {
+                MemberRef::AttrAccessor(Arc::new(AstAttrAccessor {
+                    name: a.name,
+                    ty: subst.apply_type(&a.ty),
+                    kind: a.kind,
+                    ivar_name: a.ivar_name.clone(),
+                    annotations: a.annotations.clone(),
+                    location: a.location,
+                    source_file: a.source_file,
+                    comment: a.comment.clone(),
+                    visibility: a.visibility,
+                }))
+            }
+            MemberSource::Alias(alias) => MemberRef::Alias(Arc::new(alias.clone())),
+            MemberSource::RubyDef(def) => MemberRef::RubyDef(Arc::new(def.clone())),
+            MemberSource::RubyAttrReader(r) => MemberRef::RubyAttrReader(Arc::new(r.clone())),
+            MemberSource::RubyAttrWriter(w) => MemberRef::RubyAttrWriter(Arc::new(w.clone())),
+            MemberSource::RubyAttrAccessor(a) => MemberRef::RubyAttrAccessor(Arc::new(a.clone())),
+        }
+    }
+
+    fn source_file(&self) -> Option<Name> {
+        MemberRef::source_file(self)
+    }
+
+    fn location(&self) -> Option<LocationRange> {
+        MemberRef::location(self)
+    }
+
+    fn alias_old_name(&self) -> Option<Symbol> {
+        match self {
+            MemberRef::Alias(alias) => Some(alias.old_name),
+            _ => None,
+        }
+    }
+
+    fn attribute_role(&self) -> Option<AttributeRole> {
+        match self {
+            MemberRef::AttrReader(_) | MemberRef::RubyAttrReader(_) => Some(AttributeRole::Reader),
+            MemberRef::AttrWriter(_) | MemberRef::RubyAttrWriter(_) => Some(AttributeRole::Writer),
+            MemberRef::AttrAccessor(_) | MemberRef::RubyAttrAccessor(_) => {
+                Some(AttributeRole::Accessor)
+            }
+            MemberRef::Method(_)
+            | MemberRef::RubyDef(_)
+            | MemberRef::Alias(_)
+            | MemberRef::Synthesized => None,
+        }
+    }
+}
+
+/// Diagnostics-only bucket payload: where a member sits, and nothing
+/// about its types. Built from the borrowed AST without cloning or
+/// type-rewriting it, so a whole-environment dup / alias-cycle scan
+/// costs a few words per member instead of a member deep-clone plus
+/// `Substitution::apply_overloads`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemberSite {
+    source_file: Option<Name>,
+    location: Option<LocationRange>,
+    alias_old_name: Option<Symbol>,
+    attribute_role: Option<AttributeRole>,
+}
+
+impl MemberSite {
+    fn plain(source_file: Option<Name>, location: Option<LocationRange>) -> Self {
+        MemberSite {
+            source_file,
+            location,
+            alias_old_name: None,
+            attribute_role: None,
+        }
+    }
+}
+
+impl BucketMember for MemberSite {
+    fn from_source(src: MemberSource<'_>, _names: &NameTable) -> Self {
+        use super::method::{ruby_attribute_location, ruby_byte_range_location};
+        match src {
+            MemberSource::Method { md, .. } => {
+                Self::plain(md.source_file, md.location.map(|l| l.range))
+            }
+            MemberSource::AttrReader { r, .. } => MemberSite {
+                attribute_role: Some(AttributeRole::Reader),
+                ..Self::plain(r.source_file, r.location.map(|l| l.range))
+            },
+            MemberSource::AttrWriter { w, .. } => MemberSite {
+                attribute_role: Some(AttributeRole::Writer),
+                ..Self::plain(w.source_file, w.location.map(|l| l.range))
+            },
+            MemberSource::AttrAccessor { a, .. } => MemberSite {
+                attribute_role: Some(AttributeRole::Accessor),
+                ..Self::plain(a.source_file, a.location.map(|l| l.range))
+            },
+            MemberSource::Alias(alias) => MemberSite {
+                alias_old_name: Some(alias.old_name),
+                ..Self::plain(alias.source_file, alias.location.map(|l| l.range))
+            },
+            MemberSource::RubyDef(def) => Self::plain(
+                def.source_file,
+                Some(ruby_byte_range_location(def.location)),
+            ),
+            MemberSource::RubyAttrReader(r) => MemberSite {
+                attribute_role: Some(AttributeRole::Reader),
+                ..Self::plain(
+                    r.attribute.source_file,
+                    Some(ruby_attribute_location(&r.attribute)),
+                )
+            },
+            MemberSource::RubyAttrWriter(w) => MemberSite {
+                attribute_role: Some(AttributeRole::Writer),
+                ..Self::plain(
+                    w.attribute.source_file,
+                    Some(ruby_attribute_location(&w.attribute)),
+                )
+            },
+            MemberSource::RubyAttrAccessor(a) => MemberSite {
+                attribute_role: Some(AttributeRole::Accessor),
+                ..Self::plain(
+                    a.attribute.source_file,
+                    Some(ruby_attribute_location(&a.attribute)),
+                )
+            },
+        }
+    }
+
+    fn source_file(&self) -> Option<Name> {
+        self.source_file
+    }
+
+    fn location(&self) -> Option<LocationRange> {
+        self.location
+    }
+
+    fn alias_old_name(&self) -> Option<Symbol> {
+        self.alias_old_name
+    }
+
+    fn attribute_role(&self) -> Option<AttributeRole> {
+        self.attribute_role
+    }
+}
+
 /// Mirrors `RBS::DefinitionBuilder::MethodBuilder`.
 ///
 /// Owns one cache per type kind (instance / singleton / interface). Each
@@ -64,16 +340,16 @@ use crate::definition_builder::{attribute_visibility, special_instance_visibilit
 /// rbs's `update(env:, except:)` is not ported: crema's environment is
 /// eagerly populated (ADR-0017) and has no mutation path that would
 /// invalidate the cache.
-pub struct MethodBuilder<'env> {
+pub struct MethodBuilder<'env, M: BucketMember = MemberRef> {
     env: &'env Environment,
     types: &'env TypeTable,
-    instance_methods: FxHashMap<TypeName, Methods>,
-    singleton_methods: FxHashMap<TypeName, Methods>,
-    interface_methods: FxHashMap<TypeName, Methods>,
-    errors: Vec<DuplicatedMethodDefinitionError>,
+    instance_methods: FxHashMap<TypeName, Methods<M>>,
+    singleton_methods: FxHashMap<TypeName, Methods<M>>,
+    interface_methods: FxHashMap<TypeName, Methods<M>>,
+    errors: Vec<DuplicatedMethodDefinitionError<M>>,
 }
 
-impl<'env> MethodBuilder<'env> {
+impl<'env, M: BucketMember> MethodBuilder<'env, M> {
     pub fn new(env: &'env Environment, types: &'env TypeTable) -> Self {
         MethodBuilder {
             env,
@@ -89,19 +365,19 @@ impl<'env> MethodBuilder<'env> {
         self.env
     }
 
-    pub fn instance_methods(&self) -> &FxHashMap<TypeName, Methods> {
+    pub fn instance_methods(&self) -> &FxHashMap<TypeName, Methods<M>> {
         &self.instance_methods
     }
 
-    pub fn singleton_methods(&self) -> &FxHashMap<TypeName, Methods> {
+    pub fn singleton_methods(&self) -> &FxHashMap<TypeName, Methods<M>> {
         &self.singleton_methods
     }
 
-    pub fn interface_methods(&self) -> &FxHashMap<TypeName, Methods> {
+    pub fn interface_methods(&self) -> &FxHashMap<TypeName, Methods<M>> {
         &self.interface_methods
     }
 
-    pub fn errors(&self) -> &[DuplicatedMethodDefinitionError] {
+    pub fn errors(&self) -> &[DuplicatedMethodDefinitionError<M>] {
         &self.errors
     }
 
@@ -111,7 +387,7 @@ impl<'env> MethodBuilder<'env> {
     /// primary decl's names. Alias members are pushed via
     /// [`MethodBuilder::build_alias`] so the bucket-iter path can
     /// resolve them in a single pass.
-    pub fn build_instance(&mut self, type_name: &TypeName) -> &Methods {
+    pub fn build_instance(&mut self, type_name: &TypeName) -> &Methods<M> {
         if !self.instance_methods.contains_key(type_name) {
             let methods = self.build_class_or_module(type_name, BuildSide::Instance);
             self.errors.extend(methods.validate());
@@ -120,7 +396,7 @@ impl<'env> MethodBuilder<'env> {
         self.instance_methods.get(type_name).unwrap()
     }
 
-    pub fn build_singleton(&mut self, type_name: &TypeName) -> &Methods {
+    pub fn build_singleton(&mut self, type_name: &TypeName) -> &Methods<M> {
         if !self.singleton_methods.contains_key(type_name) {
             let methods = self.build_class_or_module(type_name, BuildSide::Singleton);
             self.errors.extend(methods.validate());
@@ -134,7 +410,7 @@ impl<'env> MethodBuilder<'env> {
     /// (no AST-level subst). Method and alias members both flow through
     /// the same `Methods` bucket; alias resolution happens at flush time
     /// via [`Sorter::each_strongly_connected_component`].
-    pub fn build_interface(&mut self, type_name: &TypeName) -> &Methods {
+    pub fn build_interface(&mut self, type_name: &TypeName) -> &Methods<M> {
         if !self.interface_methods.contains_key(type_name) {
             let methods = self.build_interface_inner(type_name);
             self.errors.extend(methods.validate());
@@ -143,7 +419,7 @@ impl<'env> MethodBuilder<'env> {
         self.interface_methods.get(type_name).unwrap()
     }
 
-    fn build_interface_inner(&self, type_name: &TypeName) -> Methods {
+    fn build_interface_inner(&self, type_name: &TypeName) -> Methods<M> {
         let entry = self
             .env
             .interface_decls()
@@ -170,22 +446,21 @@ impl<'env> MethodBuilder<'env> {
                     // `build_interface`'s contract.
                     let name_str = names.resolve(md.name);
                     let visibility =
-                        special_instance_visibility(&name_str).unwrap_or(Visibility::Public);
-                    let md_arc: Arc<MethodDefinition> = Arc::new(md.clone());
-                    MethodBuilder::build_method(
+                        special_instance_visibility(name_str).unwrap_or(Visibility::Public);
+                    Self::build_method(
                         &mut methods,
                         md.name,
-                        MemberRef::Method(md_arc),
+                        M::from_source(MemberSource::Method { md, subst: None }, names),
                         visibility,
                         md.overloading,
                         entry.file,
                     );
                 }
                 Member::Alias(alias) => {
-                    MethodBuilder::build_alias(
+                    Self::build_alias(
                         &mut methods,
                         alias.new_name,
-                        MemberRef::Alias(Arc::new(alias.clone())),
+                        M::from_source(MemberSource::Alias(alias), names),
                         entry.file,
                     );
                 }
@@ -220,7 +495,7 @@ impl<'env> MethodBuilder<'env> {
         })
     }
 
-    fn build_class_or_module(&self, type_name: &TypeName, kind: BuildSide) -> Methods {
+    fn build_class_or_module(&self, type_name: &TypeName, kind: BuildSide) -> Methods<M> {
         let entry =
             self.env.class_decls().get(type_name).expect(
                 "MethodBuilder::build_{instance,singleton} called with a type_name not in env",
@@ -314,9 +589,9 @@ impl<'env> MethodBuilder<'env> {
     /// `overloads`; canonical members are appended to `originals`, with
     /// the effective `accessibility` recorded alongside.
     pub fn build_method(
-        methods: &mut Methods,
+        methods: &mut Methods<M>,
         name: Symbol,
-        member: MemberRef,
+        member: M,
         accessibility: Visibility,
         overloading: bool,
         origin: DeclOrigin,
@@ -340,10 +615,10 @@ impl<'env> MethodBuilder<'env> {
     /// writer-name bucket (`#{name}=`). `writer_name` is pre-interned by
     /// the caller because `Symbol` construction needs a `NameTable`.
     pub fn build_attribute(
-        methods: &mut Methods,
+        methods: &mut Methods<M>,
         reader_name: Symbol,
         writer_name: Option<Symbol>,
-        member: MemberRef,
+        member: M,
         accessibility: Visibility,
         origin: DeclOrigin,
     ) {
@@ -364,10 +639,10 @@ impl<'env> MethodBuilder<'env> {
     /// per-name body is identical to `build_attribute`. Both wrappers
     /// stay separate to preserve the rbs-side shared vocabulary.
     pub fn build_ruby_attribute(
-        methods: &mut Methods,
+        methods: &mut Methods<M>,
         reader_name: Symbol,
         writer_name: Option<Symbol>,
-        member: MemberRef,
+        member: M,
         accessibility: Visibility,
         origin: DeclOrigin,
     ) {
@@ -384,7 +659,7 @@ impl<'env> MethodBuilder<'env> {
     /// Mirrors rbs `build_alias`. An alias contributes the alias member
     /// itself to `originals` (no visibility — `accessibility()` on an
     /// alias bucket panics, matching rbs's raise).
-    pub fn build_alias(methods: &mut Methods, name: Symbol, member: MemberRef, origin: DeclOrigin) {
+    pub fn build_alias(methods: &mut Methods<M>, name: Symbol, member: M, origin: DeclOrigin) {
         let type_ = methods.type_;
         let defn = methods
             .methods
@@ -395,28 +670,17 @@ impl<'env> MethodBuilder<'env> {
     }
 
     fn push_attribute_buckets(
-        methods: &mut Methods,
+        methods: &mut Methods<M>,
         reader_name: Symbol,
         writer_name: Option<Symbol>,
-        member: MemberRef,
+        member: M,
         accessibility: Visibility,
         origin: DeclOrigin,
     ) {
         let type_ = methods.type_;
-        let is_reader = matches!(
-            member,
-            MemberRef::AttrReader(_)
-                | MemberRef::AttrAccessor(_)
-                | MemberRef::RubyAttrReader(_)
-                | MemberRef::RubyAttrAccessor(_)
-        );
-        let is_writer = matches!(
-            member,
-            MemberRef::AttrWriter(_)
-                | MemberRef::AttrAccessor(_)
-                | MemberRef::RubyAttrWriter(_)
-                | MemberRef::RubyAttrAccessor(_)
-        );
+        let role = member.attribute_role();
+        let is_reader = role.is_some_and(AttributeRole::contributes_reader);
+        let is_writer = role.is_some_and(AttributeRole::contributes_writer);
         if is_reader {
             let defn = methods
                 .methods
@@ -445,9 +709,9 @@ impl<'env> MethodBuilder<'env> {
 /// `build_singleton`'s `case decl when AST::Declarations::Base` branch.
 /// Each method / attribute is type-rewritten through `subst` before
 /// being pushed so the bucket holds primary-scope members directly.
-fn push_signature_members<M: AsMember>(
-    methods: &mut Methods,
-    members: &[M],
+fn push_signature_members<W: AsMember, M: BucketMember>(
+    methods: &mut Methods<M>,
+    members: &[W],
     subst: &AstSubst,
     kind: BuildSide,
     names: &NameTable,
@@ -476,27 +740,21 @@ fn push_signature_members<M: AsMember>(
                             Visibility::Private
                         } else {
                             let name_str = names.resolve(md.name);
-                            special_instance_visibility(&name_str).unwrap_or(raw_visibility)
+                            special_instance_visibility(name_str).unwrap_or(raw_visibility)
                         }
                     }
                     BuildSide::Singleton => raw_visibility,
                 };
-                let rewritten = MethodDefinition {
-                    name: md.name,
-                    kind: md.kind,
-                    overloads: subst.apply_overloads(&md.overloads, names),
-                    annotations: md.annotations.clone(),
-                    overloading: md.overloading,
-                    visibility: md.visibility,
-                    location: md.location,
-                    source_file: md.source_file,
-                    comment: md.comment.clone(),
-                };
-                let md_arc: Arc<MethodDefinition> = Arc::new(rewritten);
                 MethodBuilder::build_method(
                     methods,
                     md.name,
-                    MemberRef::Method(md_arc),
+                    M::from_source(
+                        MemberSource::Method {
+                            md,
+                            subst: Some(subst),
+                        },
+                        names,
+                    ),
                     visibility,
                     md.overloading,
                     origin,
@@ -507,22 +765,11 @@ fn push_signature_members<M: AsMember>(
                     continue;
                 }
                 let vis = attribute_visibility(r.kind, r.visibility, current_visibility);
-                let rewritten = AstAttrReader {
-                    name: r.name,
-                    ty: subst.apply_type(&r.ty),
-                    kind: r.kind,
-                    ivar_name: r.ivar_name.clone(),
-                    annotations: r.annotations.clone(),
-                    location: r.location,
-                    source_file: r.source_file,
-                    comment: r.comment.clone(),
-                    visibility: r.visibility,
-                };
                 MethodBuilder::build_attribute(
                     methods,
                     r.name,
                     None,
-                    MemberRef::AttrReader(Arc::new(rewritten)),
+                    M::from_source(MemberSource::AttrReader { r, subst }, names),
                     vis,
                     origin,
                 );
@@ -534,22 +781,11 @@ fn push_signature_members<M: AsMember>(
                 let vis = attribute_visibility(a.kind, a.visibility, current_visibility);
                 let writer_str = format!("{}=", names.resolve(a.name));
                 let writer_name = names.intern_symbol(&writer_str);
-                let rewritten = AstAttrAccessor {
-                    name: a.name,
-                    ty: subst.apply_type(&a.ty),
-                    kind: a.kind,
-                    ivar_name: a.ivar_name.clone(),
-                    annotations: a.annotations.clone(),
-                    location: a.location,
-                    source_file: a.source_file,
-                    comment: a.comment.clone(),
-                    visibility: a.visibility,
-                };
                 MethodBuilder::build_attribute(
                     methods,
                     a.name,
                     Some(writer_name),
-                    MemberRef::AttrAccessor(Arc::new(rewritten)),
+                    M::from_source(MemberSource::AttrAccessor { a, subst }, names),
                     vis,
                     origin,
                 );
@@ -561,22 +797,11 @@ fn push_signature_members<M: AsMember>(
                 let vis = attribute_visibility(w.kind, w.visibility, current_visibility);
                 let writer_str = format!("{}=", names.resolve(w.name));
                 let writer_name = names.intern_symbol(&writer_str);
-                let rewritten = AstAttrWriter {
-                    name: w.name,
-                    ty: subst.apply_type(&w.ty),
-                    kind: w.kind,
-                    ivar_name: w.ivar_name.clone(),
-                    annotations: w.annotations.clone(),
-                    location: w.location,
-                    source_file: w.source_file,
-                    comment: w.comment.clone(),
-                    visibility: w.visibility,
-                };
                 MethodBuilder::build_attribute(
                     methods,
                     w.name,
                     Some(writer_name),
-                    MemberRef::AttrWriter(Arc::new(rewritten)),
+                    M::from_source(MemberSource::AttrWriter { w, subst }, names),
                     vis,
                     origin,
                 );
@@ -588,7 +813,7 @@ fn push_signature_members<M: AsMember>(
                 MethodBuilder::build_alias(
                     methods,
                     alias.new_name,
-                    MemberRef::Alias(Arc::new((*alias).clone())),
+                    M::from_source(MemberSource::Alias(alias), names),
                     origin,
                 );
             }
@@ -600,10 +825,12 @@ fn push_signature_members<M: AsMember>(
 /// Push a Ruby decl's members into the bucket. Ruby decls carry no
 /// class-level type-param subst (the AST has no rbs-style
 /// `Substitution.build` driver on the inline path today), so no
-/// rewrite is applied — `MemberRef::RubyDef` references the original
-/// AST `Arc` directly.
-fn push_ruby_members(
-    methods: &mut Methods,
+/// rewrite is applied — `MemberRef::RubyDef` wraps a clone of the
+/// member in a fresh `Arc` (the decl stores members by value, so there
+/// is no `Arc` to share; measured at ~80ns/member on gitlab, see
+/// `todo/done/2026-10/2026-10-07_rejected_mid_method_builder_members_without_ast_clone.md`).
+fn push_ruby_members<M: BucketMember>(
+    methods: &mut Methods<M>,
     members: &[RubyMember],
     kind: BuildSide,
     names: &NameTable,
@@ -634,28 +861,31 @@ fn push_ruby_members(
                 MethodBuilder::build_method(
                     methods,
                     bucket_name,
-                    MemberRef::RubyDef(Arc::new(def.clone())),
+                    M::from_source(MemberSource::RubyDef(def), names),
                     bucket_visibility,
                     is_overloading,
                     origin,
                 );
             }
+            // One payload per declaration, cloned per listed name (for
+            // `MemberRef` that is an `Arc` bump, matching rbs where every
+            // name's bucket holds the same member object).
             RubyMember::AttrReader(r) if kind == inline_attr_kind => {
-                let arc = Arc::new(r.clone());
+                let member = M::from_source(MemberSource::RubyAttrReader(r), names);
                 for name in r.attribute.names() {
                     let reader_name = names.intern_symbol(name);
                     MethodBuilder::build_ruby_attribute(
                         methods,
                         reader_name,
                         None,
-                        MemberRef::RubyAttrReader(Arc::clone(&arc)),
+                        member.clone(),
                         Visibility::from_ast_or_default(r.attribute.visibility),
                         origin,
                     );
                 }
             }
             RubyMember::AttrWriter(w) if kind == inline_attr_kind => {
-                let arc = Arc::new(w.clone());
+                let member = M::from_source(MemberSource::RubyAttrWriter(w), names);
                 for name in w.attribute.names() {
                     let writer_str = format!("{name}=");
                     let writer_name = names.intern_symbol(&writer_str);
@@ -663,14 +893,14 @@ fn push_ruby_members(
                         methods,
                         names.intern_symbol(name),
                         Some(writer_name),
-                        MemberRef::RubyAttrWriter(Arc::clone(&arc)),
+                        member.clone(),
                         Visibility::from_ast_or_default(w.attribute.visibility),
                         origin,
                     );
                 }
             }
             RubyMember::AttrAccessor(a) if kind == inline_attr_kind => {
-                let arc = Arc::new(a.clone());
+                let member = M::from_source(MemberSource::RubyAttrAccessor(a), names);
                 for name in a.attribute.names() {
                     let reader_name = names.intern_symbol(name);
                     let writer_str = format!("{name}=");
@@ -679,7 +909,7 @@ fn push_ruby_members(
                         methods,
                         reader_name,
                         Some(writer_name),
-                        MemberRef::RubyAttrAccessor(Arc::clone(&arc)),
+                        member.clone(),
                         Visibility::from_ast_or_default(a.attribute.visibility),
                         origin,
                     );
@@ -723,12 +953,12 @@ fn alias_kind_matches_receiver(alias_kind: AliasKind, receiver: BuildSide) -> bo
 /// (`methods::Definition`) per method name. `validate` rejects buckets
 /// with more than one canonical original, mirroring rbs's `validate!`.
 #[derive(Debug, Clone)]
-pub struct Methods {
+pub struct Methods<M: BucketMember = MemberRef> {
     pub type_: Ty,
-    pub methods: FxHashMap<Symbol, methods::Definition>,
+    pub methods: FxHashMap<Symbol, methods::Definition<M>>,
 }
 
-impl Methods {
+impl<M: BucketMember> Methods<M> {
     pub fn new(type_: Ty) -> Self {
         Methods {
             type_,
@@ -740,7 +970,7 @@ impl Methods {
     /// more than one canonical `original` (rbs raises on the first; crema
     /// collects so the dup diagnostic surface stays consistent with the
     /// existing `MethodDups` collection model).
-    pub fn validate(&self) -> Vec<DuplicatedMethodDefinitionError> {
+    pub fn validate(&self) -> Vec<DuplicatedMethodDefinitionError<M>> {
         let mut errs = Vec::new();
         for defn in self.methods.values() {
             if defn.originals.len() > 1 {
@@ -762,7 +992,7 @@ impl Methods {
 /// at every call site — the port = shared-vocabulary principle
 /// (MEMORY `feedback_rbs_naming_as_shared_language`).
 pub mod methods {
-    use super::{MemberRef, Symbol, Ty, Visibility};
+    use super::{BucketMember, MemberRef, Symbol, Ty, Visibility};
 
     /// Mirrors `RBS::DefinitionBuilder::MethodBuilder::Methods::Definition`.
     ///
@@ -775,10 +1005,10 @@ pub mod methods {
     /// directly so the bucket-build logic maps 1:1 to
     /// `method_builder.rb`.
     #[derive(Debug, Clone)]
-    pub struct Definition {
+    pub struct Definition<M: BucketMember = MemberRef> {
         pub name: Symbol,
         pub type_: Ty,
-        pub originals: Vec<MemberRef>,
+        pub originals: Vec<M>,
         /// Parallel to `originals` (same index, same push site — see
         /// `MethodBuilder::build_method` / `build_alias` /
         /// `push_attribute_buckets`): the `DeclOrigin` of the reopen decl
@@ -787,11 +1017,11 @@ pub mod methods {
         /// as "real file" vs. "infusion synthesis" without guessing from
         /// a `None` location (`mid_dup_method_infusion_provenance`).
         pub origins: Vec<crate::environment::DeclOrigin>,
-        pub overloads: Vec<MemberRef>,
+        pub overloads: Vec<M>,
         pub accessibilities: Vec<Visibility>,
     }
 
-    impl Definition {
+    impl<M: BucketMember> Definition<M> {
         pub fn empty(name: Symbol, type_: Ty) -> Self {
             Definition {
                 name,
@@ -804,7 +1034,7 @@ pub mod methods {
         }
 
         /// Mirrors rbs `original` (`originals.first`).
-        pub fn original(&self) -> Option<&MemberRef> {
+        pub fn original(&self) -> Option<&M> {
             self.originals.first()
         }
 
@@ -822,7 +1052,15 @@ pub mod methods {
         /// resolution (clone the target Method) rather than the
         /// per-overload `lower_member_to_method` path.
         pub fn is_alias(&self) -> bool {
-            matches!(self.originals.first(), Some(MemberRef::Alias(_)))
+            self.alias_old_name().is_some()
+        }
+
+        /// `old_name` of the canonical original when it is an alias
+        /// member — the Sorter edge. `None` for method / attr buckets.
+        pub fn alias_old_name(&self) -> Option<Symbol> {
+            self.originals
+                .first()
+                .and_then(BucketMember::alias_old_name)
         }
     }
 }
@@ -835,16 +1073,16 @@ pub mod methods {
 /// the `f` callback so the caller can decide whether to skip them
 /// silently (current crema behaviour, see ADR-0010) or emit a
 /// diagnostic (`low_alias_cycle_diagnostic`).
-pub struct Sorter<'methods> {
-    methods: &'methods FxHashMap<Symbol, methods::Definition>,
+pub struct Sorter<'methods, M: BucketMember = MemberRef> {
+    methods: &'methods FxHashMap<Symbol, methods::Definition<M>>,
 }
 
-impl<'methods> Sorter<'methods> {
-    pub fn new(methods: &'methods FxHashMap<Symbol, methods::Definition>) -> Self {
+impl<'methods, M: BucketMember> Sorter<'methods, M> {
+    pub fn new(methods: &'methods FxHashMap<Symbol, methods::Definition<M>>) -> Self {
         Sorter { methods }
     }
 
-    pub fn methods(&self) -> &FxHashMap<Symbol, methods::Definition> {
+    pub fn methods(&self) -> &FxHashMap<Symbol, methods::Definition<M>> {
         self.methods
     }
 
@@ -864,13 +1102,24 @@ impl<'methods> Sorter<'methods> {
     /// or (d) we revisit a bucket on the current path (cycle).
     pub fn each_strongly_connected_component<F>(&self, mut f: F)
     where
-        F: FnMut(&[&methods::Definition]),
+        F: FnMut(&[&methods::Definition<M>]),
     {
         #[derive(Clone, Copy)]
         enum NodeState {
             Unvisited,
             OnPath(u32),
             Done,
+        }
+
+        // rbs `Methods#each`: the alias-first walk only runs when some
+        // bucket's original is an alias; otherwise it is a plain
+        // `methods.each_value`. Without alias edges every node is its
+        // own SCC, so emit directly and skip the state map.
+        if !self.methods.values().any(|d| d.is_alias()) {
+            for defn in self.methods.values() {
+                f(&[defn]);
+            }
+            return;
         }
 
         // FxHashMap iteration order is non-deterministic for the root
@@ -903,10 +1152,10 @@ impl<'methods> Sorter<'methods> {
                         state.insert(cur, NodeState::OnPath(path.len() as u32));
                         path.push(cur);
                         let defn = self.methods.get(&cur).expect("cur in methods");
-                        if let Some(MemberRef::Alias(alias)) = defn.originals.first()
-                            && self.methods.contains_key(&alias.old_name)
+                        if let Some(old_name) = defn.alias_old_name()
+                            && self.methods.contains_key(&old_name)
                         {
-                            cur = alias.old_name;
+                            cur = old_name;
                             continue;
                         }
                         // Non-alias or alias pointing outside the
@@ -919,7 +1168,7 @@ impl<'methods> Sorter<'methods> {
                         // Cycle: path[idx..] forms the SCC.
                         let idx = idx as usize;
                         let cycle_names: Vec<Symbol> = path[idx..].to_vec();
-                        let cycle_defs: Vec<&methods::Definition> = cycle_names
+                        let cycle_defs: Vec<&methods::Definition<M>> = cycle_names
                             .iter()
                             .map(|n| self.methods.get(n).expect("cycle node in methods"))
                             .collect();
@@ -948,10 +1197,10 @@ impl<'methods> Sorter<'methods> {
 /// `original`. Consumers project this into the `MethodDups`
 /// diagnostic stream.
 #[derive(Debug, Clone)]
-pub struct DuplicatedMethodDefinitionError {
+pub struct DuplicatedMethodDefinitionError<M: BucketMember = MemberRef> {
     pub type_: Ty,
     pub method_name: Symbol,
-    pub members: Vec<MemberRef>,
+    pub members: Vec<M>,
     /// Parallel to `members` — see [`methods::Definition::origins`].
     pub origins: Vec<crate::environment::DeclOrigin>,
 }
@@ -965,7 +1214,7 @@ mod tests {
 
     #[test]
     fn methods_new_is_empty() {
-        let m = Methods::new(Ty::UNTYPED);
+        let m = Methods::<MemberRef>::new(Ty::UNTYPED);
         assert_eq!(m.type_, Ty::UNTYPED);
         assert!(m.methods.is_empty());
     }
@@ -974,7 +1223,7 @@ mod tests {
     fn methods_definition_empty_starts_empty() {
         let names = NameTable::new();
         let sym = names.intern_symbol("foo");
-        let defn = methods::Definition::empty(sym, Ty::UNTYPED);
+        let defn = methods::Definition::<MemberRef>::empty(sym, Ty::UNTYPED);
         assert_eq!(defn.name, sym);
         assert_eq!(defn.type_, Ty::UNTYPED);
         assert!(defn.originals.is_empty());
@@ -985,7 +1234,7 @@ mod tests {
     #[test]
     fn methods_definition_original_is_none_when_empty() {
         let names = NameTable::new();
-        let defn = methods::Definition::empty(names.intern_symbol("bar"), Ty::UNTYPED);
+        let defn = methods::Definition::<MemberRef>::empty(names.intern_symbol("bar"), Ty::UNTYPED);
         assert!(defn.original().is_none());
     }
 
@@ -1176,5 +1425,188 @@ mod tests {
         assert_eq!(cycles[0].len(), 2);
         let cycle_set: FxHashSet<Symbol> = cycles[0].iter().copied().collect();
         assert_eq!(cycle_set, [a, b].into_iter().collect());
+    }
+
+    /// Every bucket the definition payload (`MemberRef`) builds, the
+    /// diagnostics payload (`MemberSite`) must build identically in
+    /// everything the dup / alias-cycle collectors read: bucket names,
+    /// originals / overloads counts, accessibilities, origins, and per
+    /// member `source_file` / `location` / `alias_old_name` /
+    /// `attribute_role`. Covers sig methods (incl. `...` overloading and
+    /// a generic reopen so `subst` is non-trivial), sig attrs of all
+    /// three roles, sig aliases (incl. a cycle), interface members, and
+    /// inline `def` / `attr_*` with multiple names.
+    #[test]
+    fn member_site_buckets_match_member_ref_buckets() {
+        use crate::environment::draft::EnvironmentDraft;
+        use crate::inline_parser::load_inline_annotations;
+
+        let rbs = b"\
+class Foo[T]
+  def bar: (T) -> void
+  def baz: () -> Integer
+  attr_reader r: Integer
+  attr_writer w: String
+  attr_accessor a: Float
+  private attr_reader pr: Integer
+  alias x bar
+  alias y z
+  alias z y
+  def self.s: () -> void
+  alias self.sa self.s
+  def initialize: () -> void
+end
+class Foo[U]
+  def bar: ...
+  def baz: () -> String
+  attr_reader r: U
+end
+interface _I
+  def m: () -> void
+  def m: () -> Integer
+  alias n m
+end
+";
+        let rb = "\
+class Inline
+  #: () -> Integer
+  def d; 1; end
+  def untyped; end
+  attr_reader ir, ir2 #: Integer
+  attr_writer iw #: String
+  attr_accessor ia #: Float
+end
+";
+        let mut draft = EnvironmentDraft::new();
+        draft.load_rbs_source(rbs).unwrap();
+        let rb_path = std::path::PathBuf::from("/virtual/inline.rb");
+        let parse_result = ruby_prism::parse(rb.as_bytes());
+        let diags =
+            load_inline_annotations(rb.as_bytes(), &parse_result, Some(&rb_path), &mut draft);
+        assert!(diags.is_empty(), "inline parse diagnostics: {diags:?}");
+        let env = draft.build().unwrap_or_else(|(e, _)| panic!("{e:?}"));
+        let types = TypeTable::new();
+
+        let mut full = MethodBuilder::<MemberRef>::new(&env, &types);
+        let mut light = MethodBuilder::<MemberSite>::new(&env, &types);
+        let mut owners: Vec<TypeName> = env.class_decls().into_iter().map(|(n, _)| *n).collect();
+        owners.sort_by_key(|n| env.names().display_type_name(*n));
+        assert_eq!(owners.len(), 2, "Foo + Inline");
+        for name in &owners {
+            full.build_instance(name);
+            full.build_singleton(name);
+            light.build_instance(name);
+            light.build_singleton(name);
+        }
+        let interfaces: Vec<TypeName> =
+            env.interface_decls().into_iter().map(|(n, _)| *n).collect();
+        assert_eq!(interfaces.len(), 1);
+        for name in &interfaces {
+            full.build_interface(name);
+            light.build_interface(name);
+        }
+
+        fn site_of<M: BucketMember>(m: &M) -> MemberSite {
+            MemberSite {
+                source_file: m.source_file(),
+                location: m.location(),
+                alias_old_name: m.alias_old_name(),
+                attribute_role: m.attribute_role(),
+            }
+        }
+        fn assert_same_bucket_map(
+            full: &FxHashMap<TypeName, Methods<MemberRef>>,
+            light: &FxHashMap<TypeName, Methods<MemberSite>>,
+            names: &NameTable,
+            label: &str,
+        ) {
+            assert_eq!(full.len(), light.len(), "{label}: owner count");
+            for (owner, f) in full {
+                let l = light.get(owner).expect("light has every owner");
+                assert_eq!(f.type_, l.type_, "{label}: bucket type");
+                assert_eq!(
+                    f.methods.len(),
+                    l.methods.len(),
+                    "{label}: bucket count for {}",
+                    names.display_type_name(*owner)
+                );
+                for (sym, fd) in &f.methods {
+                    let ld = l.methods.get(sym).unwrap_or_else(|| {
+                        panic!("{label}: light lacks bucket {}", names.resolve(*sym))
+                    });
+                    let ctx = format!(
+                        "{label}: {}#{}",
+                        names.display_type_name(*owner),
+                        names.resolve(*sym)
+                    );
+                    assert_eq!(fd.name, ld.name, "{ctx}: name");
+                    assert_eq!(
+                        fd.accessibilities, ld.accessibilities,
+                        "{ctx}: accessibilities"
+                    );
+                    assert_eq!(fd.origins, ld.origins, "{ctx}: origins");
+                    let fo: Vec<MemberSite> = fd.originals.iter().map(site_of).collect();
+                    let lo: Vec<MemberSite> = ld.originals.iter().map(site_of).collect();
+                    assert_eq!(fo, lo, "{ctx}: originals");
+                    let fv: Vec<MemberSite> = fd.overloads.iter().map(site_of).collect();
+                    let lv: Vec<MemberSite> = ld.overloads.iter().map(site_of).collect();
+                    assert_eq!(fv, lv, "{ctx}: overloads");
+                }
+            }
+        }
+        let names = env.names();
+        assert_same_bucket_map(
+            full.instance_methods(),
+            light.instance_methods(),
+            names,
+            "instance",
+        );
+        assert_same_bucket_map(
+            full.singleton_methods(),
+            light.singleton_methods(),
+            names,
+            "singleton",
+        );
+        assert_same_bucket_map(
+            full.interface_methods(),
+            light.interface_methods(),
+            names,
+            "interface",
+        );
+
+        // The dup error surface (what `collect_method_dups` projects).
+        fn project<M: BucketMember>(
+            errs: &[DuplicatedMethodDefinitionError<M>],
+        ) -> Vec<(Symbol, usize)> {
+            errs.iter()
+                .map(|e| (e.method_name, e.members.len()))
+                .collect()
+        }
+        let mut fe: Vec<(Symbol, usize)> = project(full.errors());
+        let mut le: Vec<(Symbol, usize)> = project(light.errors());
+        fe.sort();
+        le.sort();
+        assert_eq!(fe, le, "dup errors");
+        // Sanity: the fixture actually exercises dups (baz reopen, attr r
+        // reopen, interface m) so an empty-vs-empty match cannot pass.
+        assert_eq!(fe.len(), 3, "fixture must produce 3 dup errors, got {fe:?}");
+
+        // Sorter parity: same SCC multiset on the same buckets.
+        for (owner, f) in full.instance_methods() {
+            let l = &light.instance_methods()[owner];
+            let mut fs: Vec<Vec<Symbol>> = Vec::new();
+            Sorter::new(&f.methods).each_strongly_connected_component(|scc| {
+                fs.push(scc.iter().map(|d| d.name).collect())
+            });
+            let mut ls: Vec<Vec<Symbol>> = Vec::new();
+            Sorter::new(&l.methods).each_strongly_connected_component(|scc| {
+                ls.push(scc.iter().map(|d| d.name).collect())
+            });
+            fs.iter_mut().for_each(|s| s.sort());
+            ls.iter_mut().for_each(|s| s.sort());
+            fs.sort();
+            ls.sort();
+            assert_eq!(fs, ls, "SCCs for {}", names.display_type_name(*owner));
+        }
     }
 }

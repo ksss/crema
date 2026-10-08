@@ -38,7 +38,7 @@ use std::sync::Arc;
 /// the parent's `members` and the flattened env entry share one resolved
 /// decl, mirroring rbs `Environment#resolve_ruby_decl` which stores the
 /// resolved object itself in the parent's members.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Declaration {
     Class(Arc<ClassDecl>),
     Module(Arc<ModuleDecl>),
@@ -57,7 +57,7 @@ pub enum Declaration {
 /// Mirrors `RBS::AST::Ruby::Declarations::ClassDecl`. `class_name` is the
 /// fully-qualified canonical name with `namespace.is_absolute() == true`,
 /// so callers do not need to re-derive it from an enclosing scope stack.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassDecl {
     pub class_name: TypeName,
     pub name_location: PrismByteRange,
@@ -90,7 +90,7 @@ pub struct ClassDecl {
 /// the byte range of the superclass name reference itself in the Ruby
 /// source (mirrors rbs's `type_name_location`) and feeds `file:line` on
 /// arity diagnostics.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SuperClass {
     pub type_name: TypeName,
     pub type_annotation: Option<TypeApplicationAnnotation>,
@@ -101,7 +101,7 @@ pub struct SuperClass {
 ///
 /// Mirrors `RBS::AST::Ruby::Declarations::ModuleDecl`. `module_name` is
 /// absolute (`namespace.is_absolute() == true`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModuleDecl {
     pub module_name: TypeName,
     pub name_location: PrismByteRange,
@@ -150,7 +150,7 @@ impl ModuleDecl {
 /// `leading_comment` mirrors `RBS::AST::Ruby::Declarations::ConstantDecl#leading_comment`;
 /// the inline collector currently leaves it as `None` until comment-block
 /// collection is wired through.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConstantDecl {
     pub constant_name: TypeName,
     pub name_location: PrismByteRange,
@@ -180,7 +180,7 @@ pub struct ConstantDecl {
 /// `RBS::AST::Ruby::Declarations::ClassModuleAliasDecl#leading_comment`;
 /// the inline collector currently leaves it as `None` until comment-block
 /// collection is wired through.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassModuleAliasDecl {
     pub new_name: TypeName,
     pub name_location: PrismByteRange,
@@ -231,7 +231,7 @@ impl ClassModuleAliasDecl {
 /// Kept deliberately coarse (no payload) because the resolver only needs
 /// to map the kind to a well-known type — richer AST reuse is not a
 /// goal of Phase 5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConstantValueKind {
     Integer,
     Float,

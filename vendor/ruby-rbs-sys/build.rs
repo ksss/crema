@@ -6,8 +6,12 @@ use std::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let vendor_rbs = manifest_dir.join("vendor/rbs");
+    // Cargo runs build scripts with the package root as the working directory.
+    // Relative paths keep the emitted `rerun-if-changed` list (including the headers
+    // bindgen reports) independent of where the package is checked out, so a target
+    // directory copied to another checkout (e.g. a git worktree) stays fresh instead
+    // of re-running this script and rebuilding the crate.
+    let vendor_rbs = Path::new("vendor/rbs");
     let include = vendor_rbs.join("include");
     let c_src = vendor_rbs.join("src");
 
@@ -20,6 +24,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn build(include_dir: &Path, src_dir: &Path) -> Result<(), Box<dyn Error>> {
+    // bindgen's `CargoCallbacks` emits `rerun-if-changed` for headers only, which disables
+    // cargo's default of watching every file in the package. Watch the C sources and headers
+    // explicitly so that editing them re-runs this script.
+    println!("cargo:rerun-if-changed={}", src_dir.display());
+    println!("cargo:rerun-if-changed={}", include_dir.display());
+
     let mut build = cc::Build::new();
 
     build.include(include_dir);

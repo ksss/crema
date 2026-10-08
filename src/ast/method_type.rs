@@ -23,7 +23,7 @@ use crate::location::MethodTypeLocation;
 /// The `function` field corresponds to rbs's `RBS::MethodType#type`; the
 /// resolved layer renames it to `type_` (Rust keyword escape) while this
 /// layer renames it semantically.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MethodType {
     pub type_params: Vec<TypeParam>,
     pub function: Function,

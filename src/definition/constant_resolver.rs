@@ -28,13 +28,12 @@
 //! including class — rbs `constant_resolver.rb` L151-156).
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::{OnceCell, RefCell};
 use std::sync::{Arc, OnceLock};
 
 use crate::environment::Environment;
 use crate::environment::frozen::NormalizeModuleNameResult;
 use crate::name::{NameTable, Symbol};
-use crate::snapshot::append_map::AppendMap;
+use crate::once_map::OnceMap;
 use crate::type_name::TypeName;
 use crate::type_param::TypeParamScope;
 use crate::types::Ty;
@@ -246,14 +245,12 @@ struct UpdatedBase {
 
 /// Per-name lazy cache for `constant_of_constant` `.ty` values.
 ///
-/// Mirrors [`crate::definition_builder::TypeParamsCache`]'s shape (an
-/// `AppendMap`-backed wrapper with a manual `Debug` impl and a single
+/// Mirrors [`crate::definition_builder::TypeParamsCache`]'s shape (a
+/// `OnceMap`-backed wrapper with a manual `Debug` impl and a single
 /// `get_or_compute` accessor) so the two sibling per-name caches
-/// present the same surface. The pattern keeps `ConstantTable`'s
-/// `#[derive(Debug)]` valid and hides the `Ok::<_, Infallible>` /
-/// `.expect("infallible compute")` boilerplate at the boundary.
+/// present the same surface.
 struct ConstantTyCache {
-    cache: AppendMap<TypeName, Ty>,
+    cache: OnceMap<TypeName, Ty>,
 }
 
 impl std::fmt::Debug for ConstantTyCache {
@@ -267,7 +264,7 @@ impl std::fmt::Debug for ConstantTyCache {
 impl ConstantTyCache {
     fn new() -> Self {
         Self {
-            cache: AppendMap::default(),
+            cache: OnceMap::default(),
         }
     }
 
@@ -277,26 +274,19 @@ impl ConstantTyCache {
     /// signals a broken invariant (the frozen `Environment` mutated
     /// under us) and panics rather than silently synthesizing a value.
     ///
-    /// Lowers through `builder.lowering()` — the `Arc<LoweringMaps>` the
-    /// builder already holds — rather than `LoweringEnv::from_environment`,
-    /// which re-walks every declaration (`build_lowering_maps`, O(env)
-    /// with a String round-trip per name). Paying that walk once per
-    /// constant made it the dominant cost of a cold check on large
-    /// environments (gitlab: 87% of main-thread CPU).
+    /// Lowers through `builder.lowering()`, a borrow-only view over the
+    /// frozen environment (nothing is walked or cloned per constant).
     fn get_or_compute(&self, name: TypeName, builder: &AncestorBuilder) -> Ty {
-        *self
-            .cache
-            .get_or_try_insert_with(name, || {
-                let decl = builder.env().constant_decls().get(&name).expect(
-                    "ConstantEntry::Constant name was recorded from \
+        if let Some(ty) = self.cache.get(&name) {
+            return *ty;
+        }
+        let decl = builder.env().constant_decls().get(&name).expect(
+            "ConstantEntry::Constant name was recorded from \
                      env.constant_decls().keys(); decl must still be present",
-                );
-                let lowering = builder.lowering();
-                Ok::<_, std::convert::Infallible>(
-                    lowering.build_type(&decl.decl.ty, &TypeParamScope::default()),
-                )
-            })
-            .expect("infallible compute")
+        );
+        let lowering = builder.lowering();
+        let ty = lowering.build_type(&decl.decl.ty, &TypeParamScope::default());
+        *self.cache.insert_first(name, ty)
     }
 }
 
@@ -923,10 +913,12 @@ type ConstantsMap = FxHashMap<Symbol, ConstantEntry>;
 ///   `resolve_child(module, name)` / `children(module)` hit reuses the
 ///   merged ancestor-folded children map for that class/module.
 ///
-/// Both caches use `RefCell` for interior mutability so the public API
-/// stays on `&self` — matching rbs's `@cache = {}` and letting
-/// `DefinitionBuilder` keep the resolver as a plain field. Returns are
-/// `Arc<ConstantsMap>` so repeat hits do not clone the entire map.
+/// Both caches are insert-only `OnceMap`s, so the public API stays on
+/// `&self` — matching rbs's `@context_constants_cache = {}` /
+/// `@child_constants_cache = {}` — and threads can share the resolver
+/// (ADR-0034 Decision 3). Returns are `Arc<ConstantsMap>` so
+/// repeat hits do not clone the entire map; when two threads compute the
+/// same key, both get the `Arc` that was stored first.
 #[derive(Debug)]
 pub struct ConstantResolver {
     /// Shared with [`super::DefinitionBuilder`]; held so `&self`
@@ -939,8 +931,8 @@ pub struct ConstantResolver {
     /// `constants_itself`) check `ancestor.name == object` and reuse
     /// this rather than reparsing `"::Object"` per call.
     object: TypeName,
-    context_constants_cache: RefCell<FxHashMap<ConstantContext, Arc<ConstantsMap>>>,
-    child_constants_cache: RefCell<FxHashMap<TypeName, Arc<ConstantsMap>>>,
+    context_constants_cache: OnceMap<ConstantContext, Arc<ConstantsMap>>,
+    child_constants_cache: OnceMap<TypeName, Arc<ConstantsMap>>,
     /// `::Object`'s children merged with `toplevel` — the
     /// context-independent prefix every `constants_from_ancestors`
     /// merge starts from (rbs L182-184). Built once per resolver
@@ -949,7 +941,7 @@ pub struct ConstantResolver {
     /// that was 900 inserts (with growth rehashes) for each of 5,715
     /// contexts. Not a cache lane rbs has; the per-context maps it
     /// produces are identical to rbs's.
-    ancestors_seed: OnceCell<Arc<ConstantsMap>>,
+    ancestors_seed: OnceLock<Arc<ConstantsMap>>,
 }
 
 impl ConstantResolver {
@@ -984,9 +976,9 @@ impl ConstantResolver {
             builder,
             table,
             object,
-            context_constants_cache: RefCell::new(FxHashMap::default()),
-            child_constants_cache: RefCell::new(FxHashMap::default()),
-            ancestors_seed: OnceCell::new(),
+            context_constants_cache: OnceMap::default(),
+            child_constants_cache: OnceMap::default(),
+            ancestors_seed: OnceLock::new(),
         }
     }
 
@@ -1005,14 +997,14 @@ impl ConstantResolver {
     /// context computes the snapshot from `load_context_constants` and
     /// stores it; subsequent calls return the cached `Arc`.
     pub fn constants(&self, context: &ConstantContext) -> Arc<ConstantsMap> {
-        if let Some(cached) = self.context_constants_cache.borrow().get(context) {
+        if let Some(cached) = self.context_constants_cache.get(context) {
             return Arc::clone(cached);
         }
         let computed = Arc::new(self.load_context_constants(context));
-        self.context_constants_cache
-            .borrow_mut()
-            .insert(context.clone(), Arc::clone(&computed));
-        computed
+        Arc::clone(
+            self.context_constants_cache
+                .insert_first(context.clone(), computed),
+        )
     }
 
     /// rbs `resolve_child(module_name, name)` (L108-110). Looks up
@@ -1051,14 +1043,14 @@ impl ConstantResolver {
     /// through `normalize_module_name`, matching rbs L113).
     pub fn children(&self, module_name: &TypeName) -> Arc<ConstantsMap> {
         let normalized = self.builder.env().normalize_module_name(module_name);
-        if let Some(cached) = self.child_constants_cache.borrow().get(&normalized) {
+        if let Some(cached) = self.child_constants_cache.get(&normalized) {
             return Arc::clone(cached);
         }
         let computed = Arc::new(self.load_child_constants(&normalized));
-        self.child_constants_cache
-            .borrow_mut()
-            .insert(normalized, Arc::clone(&computed));
-        computed
+        Arc::clone(
+            self.child_constants_cache
+                .insert_first(normalized, computed),
+        )
     }
 
     /// rbs `load_context_constants(context)` (L122-136). Three-step

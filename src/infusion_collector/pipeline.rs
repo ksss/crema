@@ -36,6 +36,7 @@ use crate::inline_parser::{
 };
 use crate::name::{Name, NameTable};
 use crate::rbs_raw::Parser as RbsParser;
+use crate::source_ref::SourceRef;
 use crate::type_name::TypeName;
 
 /// Walk `parse_result` and build declarations whose members are
@@ -56,6 +57,7 @@ pub fn collect(
         parse_result,
         activesupport_options(),
         inflector::default_en(),
+        true,
     );
     collector.visit(&root);
     (collector.top_level, collector.diagnostics)
@@ -95,13 +97,14 @@ pub fn load_all<'a>(sources: &[SourceUnit<'a>], draft: &mut EnvironmentDraft) ->
     )
 }
 
+/// Collects in inline mode; `load_all_with_schema` takes the mode.
 pub fn load_all_with_options<'a>(
     sources: &[SourceUnit<'a>],
     draft: &mut EnvironmentDraft,
     options: InfusionOptions,
     inflector: &Inflector,
 ) -> Vec<Diagnostic> {
-    load_all_with_schema(sources, draft, options, inflector, None)
+    load_all_with_schema(sources, draft, options, inflector, true, None)
 }
 
 /// `load_all_with_options` plus the pre-parsed ActiveRecord schema
@@ -109,11 +112,13 @@ pub fn load_all_with_options<'a>(
 /// here — after concern expansion, so the column-accessor suppression sees
 /// every enum the model ends up with, and before AR synthesis, so the
 /// synthesized decls still observe the schema classes in the draft.
+/// `inline_mode` is passed through to [`collect_source`].
 pub fn load_all_with_schema<'a>(
     sources: &[SourceUnit<'a>],
     draft: &mut EnvironmentDraft,
     options: InfusionOptions,
     inflector: &Inflector,
+    inline_mode: bool,
     schema: Option<activerecord::PreparsedSchema>,
 ) -> Vec<Diagnostic> {
     let collected = sources
@@ -135,6 +140,7 @@ pub fn load_all_with_schema<'a>(
                 unit.parse_result,
                 options,
                 inflector,
+                inline_mode,
             ))
         })
         .collect();
@@ -149,6 +155,12 @@ pub fn load_all_with_schema<'a>(
 /// caller will give this result in the `Vec` passed to
 /// [`load_collected`]; concern expansion resolves the concern's file
 /// through it.
+///
+/// `inline_mode` is the CLI's `--inline`. In sig mode the members a
+/// `class_methods do` block synthesizes are collected as if their
+/// `#:` / `# @rbs` annotations were absent (ADR-0027: method and
+/// attribute annotations are the inline class), so the file's comments
+/// are not read at all.
 #[allow(clippy::too_many_arguments)]
 pub fn collect_source<'a>(
     names: &NameTable,
@@ -159,6 +171,7 @@ pub fn collect_source<'a>(
     parse_result: &ruby_prism::ParseResult<'_>,
     options: InfusionOptions,
     inflector: &Inflector,
+    inline_mode: bool,
 ) -> CollectedSource<'a> {
     let mut collector = Collector::new(
         names,
@@ -169,10 +182,18 @@ pub fn collect_source<'a>(
         parse_result,
         options,
         inflector,
+        inline_mode,
     );
-    collector.visit(&parse_result.node());
+    let root = parse_result.node();
+    collector.visit(&root);
+    let mut diagnostics = collector.diagnostics;
+    let table_name_assignments = if options.activerecord {
+        activerecord::collect_table_name_assignments(&root, file, source, &mut diagnostics)
+    } else {
+        Vec::new()
+    };
     CollectedSource {
-        source,
+        source: SourceRef::Bytes(source),
         file,
         top_level: collector.top_level,
         active_record_associations: collector.active_record_associations,
@@ -181,7 +202,21 @@ pub fn collect_source<'a>(
         paranoia_models: collector.paranoia_models,
         concerns: collector.concerns,
         concern_sites: collector.concern_sites,
-        diagnostics: collector.diagnostics,
+        table_name_assignments,
+        diagnostics,
+    }
+}
+
+impl<'a> CollectedSource<'a> {
+    /// Attach a decoded record to the current run: the file's walk index
+    /// (stamped on every concern, as `collect_source` did), its path and
+    /// its on-demand source.
+    pub fn rebind(&mut self, source_index: usize, source: SourceRef<'a>, file: Option<&'a Path>) {
+        self.source = source;
+        self.file = file;
+        for concern in &mut self.concerns {
+            concern.source_index = source_index;
+        }
     }
 }
 
@@ -410,7 +445,20 @@ pub fn load_collected<'a>(
                     .or_default()
                     .insert(mapping.attr_name.clone());
             }
-            activerecord::emit_schema(schema, draft, inflector, &enums_by_attr, &mut diagnostics);
+            let table_names = activerecord::table_name_overrides(
+                collected
+                    .iter()
+                    .flatten()
+                    .flat_map(|source| &source.table_name_assignments),
+            );
+            activerecord::emit_schema(
+                schema,
+                &table_names,
+                draft,
+                inflector,
+                &enums_by_attr,
+                &mut diagnostics,
+            );
         }
         let batch_files: FxHashSet<Name> = collected
             .iter()
@@ -491,8 +539,14 @@ fn activesupport_options() -> InfusionOptions {
 /// One file's collect-half output, handed from [`collect_source`] to
 /// [`load_collected`]. Owned throughout (no AST borrow), so it can cross
 /// the ingest worker → main boundary.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CollectedSource<'a> {
-    source: &'a [u8],
+    /// Not persisted: a cached file's bytes are read on demand
+    /// ([`CollectedSource::rebind`]).
+    #[serde(skip)]
+    source: SourceRef<'a>,
+    /// Not persisted: re-bound to the current run's path on decode.
+    #[serde(skip)]
     file: Option<&'a Path>,
     top_level: Vec<Declaration>,
     active_record_associations: Vec<ActiveRecordAssociation>,
@@ -501,6 +555,9 @@ pub struct CollectedSource<'a> {
     paranoia_models: Vec<TypeName>,
     concerns: Vec<ConcernDef>,
     concern_sites: Vec<ConcernSite>,
+    /// `self.table_name =` assignments as `(absolute model path, table)`
+    /// in source order; empty unless the activerecord provider is on.
+    table_name_assignments: Vec<(String, String)>,
     /// Collection-time diagnostics, drained by `load_collected` in
     /// file order before any insert-time diagnostic is pushed.
     diagnostics: Vec<Diagnostic>,
@@ -515,7 +572,9 @@ struct Collector<'a> {
     source: &'a [u8],
     file: Option<&'a Path>,
     line_index: LineIndex,
-    comments: CommentAssociation,
+    /// `None` in sig mode: the only reader is `ClassMethodsCollector`,
+    /// whose annotations sig mode does not read.
+    comments: Option<CommentAssociation>,
     class_stack: Vec<String>,
     scope_stack: Vec<ScopeFrame>,
     top_level: Vec<Declaration>,
@@ -539,7 +598,7 @@ struct ScopeFrame {
     class_methods: Option<ClassMethodsBody>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct InfusionBody {
     owner: TypeName,
     owner_kind: InfusionOwnerKind,
@@ -614,13 +673,13 @@ impl InfusionBody {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum InfusionOwnerKind {
     Class,
     Module,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum InfusionBodyOrigin {
     Real,
     SyntheticConcernIncluded,
@@ -634,7 +693,7 @@ enum InfusionBodyOrigin {
     SyntheticConcerningModule,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InfusionCall {
     pub(crate) name: String,
     pub(crate) symbol_args: Vec<InfusionSymbolArg>,
@@ -654,7 +713,7 @@ pub(crate) struct InfusionCall {
 /// of Ruby `Proc#parameters` kinds (`req`/`opt`/`rest`/`post`(= trailing)/
 /// `keyreq`/`key`/`keyrest`/`block`). Only structure is carried; every
 /// param is typed `untyped` at synthesis (orthoses `parameters_to_type`).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InfusionScopeParams {
     pub(crate) requireds: Vec<String>,
     pub(crate) optionals: Vec<String>,
@@ -666,7 +725,7 @@ pub(crate) struct InfusionScopeParams {
     pub(crate) block: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InfusionSymbolArg {
     pub(crate) name: String,
     pub(crate) location: PrismByteRange,
@@ -676,7 +735,7 @@ pub(crate) struct InfusionSymbolArg {
 /// `None` for non-literal values (constant reference, method call) —
 /// consumers fall back to `untyped` for the value-typed surface only
 /// (todo enum_typed_signature: labels still type the string/symbol side).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InfusionEnumValue {
     pub(crate) name: String,
     pub(crate) location: PrismByteRange,
@@ -685,26 +744,30 @@ pub(crate) struct InfusionEnumValue {
 
 /// A statically-known `enum` value literal. Integers are carried as
 /// decimal strings, matching `ast::types::Literal::Integer(String)`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum EnumLiteral {
     Int(String),
     Str(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InfusionKeywordBool {
     pub(crate) name: String,
     pub(crate) value: Option<bool>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InfusionKeywordString {
     pub(crate) name: String,
     pub(crate) value: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ConcernDef {
     name: TypeName,
+    /// The walk index of the file this concern was collected from — a
+    /// property of the run, not of the file, so a cached record's value
+    /// is overwritten on decode ([`CollectedSource::rebind`]).
     source_index: usize,
     dependencies: Vec<ConcernDependency>,
     class_methods_module: Option<ClassMethodsModuleRef>,
@@ -713,11 +776,12 @@ struct ConcernDef {
     class_methods: Option<ClassMethodsBody>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ConcernDependency {
     module_name_candidates: Vec<TypeName>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ConcernSite {
     target: TypeName,
     target_kind: InfusionOwnerKind,
@@ -725,7 +789,7 @@ struct ConcernSite {
     module_names: Vec<TypeName>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum ConcernSiteKind {
     Include,
     Prepend,
@@ -758,14 +822,14 @@ struct SyntheticBody {
     body: InfusionBody,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ClassMethodsBody {
     module_name: TypeName,
     name_location: PrismByteRange,
     members: Vec<Member>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct ClassMethodsModuleRef {
     module_name: TypeName,
     location: PrismByteRange,
@@ -789,7 +853,8 @@ struct ClassMethodsCollector<'a> {
     source: &'a [u8],
     file: Option<&'a Path>,
     line_index: &'a LineIndex,
-    comments: &'a CommentAssociation,
+    /// `None` in sig mode: members are collected as if unannotated.
+    comments: Option<&'a CommentAssociation>,
     members: Vec<Member>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -1008,7 +1073,7 @@ impl<'a> ClassMethodsCollector<'a> {
         source: &'a [u8],
         file: Option<&'a Path>,
         line_index: &'a LineIndex,
-        comments: &'a CommentAssociation,
+        comments: Option<&'a CommentAssociation>,
     ) -> Self {
         Self {
             names,
@@ -1064,9 +1129,16 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
             Some(_) => return,
             None => MethodKind::Instance,
         };
-        let def_start_line = self.line_index.line(node.location().start_offset());
-        let leading_block = collect_consecutive_leading(self.comments, def_start_line);
-        let trailing_block = collect_trailing_block(self.source, self.comments, def_start_line);
+        let (leading_block, trailing_block) = match self.comments {
+            Some(comments) => {
+                let def_start_line = self.line_index.line(node.location().start_offset());
+                (
+                    collect_consecutive_leading(comments, def_start_line),
+                    collect_trailing_block(self.source, comments, def_start_line),
+                )
+            }
+            None => (None, None),
+        };
         let (method_type, unused_leading, trailing_resolution) = MethodTypeAnnotation::build(
             leading_block.as_ref(),
             trailing_block.as_ref(),
@@ -1132,24 +1204,25 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
         if name_nodes.is_empty() {
             return;
         }
-        let end_line = self
-            .line_index
-            .line(node.location().end_offset().saturating_sub(1));
-        let (type_text, annotation_range) =
-            match self.comments.trailing_annotation(self.source, end_line) {
-                Some(TrailingAnnotation::NodeTypeAssertion { range, type_text }) => {
-                    (Some(type_text.to_string()), Some(range))
+        let trailing = self.comments.and_then(|comments| {
+            let end_line = self
+                .line_index
+                .line(node.location().end_offset().saturating_sub(1));
+            comments.trailing_annotation(self.source, end_line)
+        });
+        let (type_text, annotation_range) = match trailing {
+            Some(TrailingAnnotation::NodeTypeAssertion { range, type_text }) => {
+                (Some(type_text.to_string()), Some(range))
+            }
+            Some(TrailingAnnotation::TypeApplication { range, body }) => {
+                if let Err(err) = RbsParser::parse_inline_trailing(body.as_bytes()) {
+                    let diag = build_annotation_syntax_error(self.source, self.file, range, err);
+                    self.diagnostics.push(diag);
                 }
-                Some(TrailingAnnotation::TypeApplication { range, body }) => {
-                    if let Err(err) = RbsParser::parse_inline_trailing(body.as_bytes()) {
-                        let diag =
-                            build_annotation_syntax_error(self.source, self.file, range, err);
-                        self.diagnostics.push(diag);
-                    }
-                    (None, None)
-                }
-                _ => (None, None),
-            };
+                (None, None)
+            }
+            _ => (None, None),
+        };
         let attribute = AttributeMember {
             visibility: None,
             location: prism_location_range(node.location()),
@@ -1207,9 +1280,11 @@ impl<'a> Collector<'a> {
         parse_result: &ruby_prism::ParseResult<'_>,
         options: InfusionOptions,
         inflector: &'a Inflector,
+        inline_mode: bool,
     ) -> Self {
         let line_index = LineIndex::from_source(source);
-        let comments = CommentAssociation::from_source(source, &line_index, parse_result);
+        let comments =
+            inline_mode.then(|| CommentAssociation::from_source(source, &line_index, parse_result));
         Collector {
             names,
             options,
@@ -1702,7 +1777,7 @@ impl<'a> Collector<'a> {
             self.source,
             self.file,
             &self.line_index,
-            &self.comments,
+            self.comments.as_ref(),
         );
         collector.visit(&block_body);
         let members = collector.members;
@@ -2061,7 +2136,9 @@ fn push_def_with_origin(
 /// value that isn't the literal `true` (e.g. a dynamic expression) is
 /// treated as `false` — an accepted approximation, same default-on-
 /// unrecognized-shape stance as the rest of this file's keyword parsing.
-fn concerning_topic_and_prepend(node: &CallNode<'_>) -> Option<(String, PrismByteRange, bool)> {
+pub(crate) fn concerning_topic_and_prepend(
+    node: &CallNode<'_>,
+) -> Option<(String, PrismByteRange, bool)> {
     let arguments = node.arguments()?;
     let mut iter = arguments.arguments().iter();
     let topic_arg = iter.next()?;
@@ -2645,6 +2722,7 @@ end
             &parse_result,
             activesupport_options(),
             inflector::default_en(),
+            true,
         );
         collector.visit(&parse_result.node());
 
@@ -2953,6 +3031,7 @@ end
             &parse_result,
             rails_options(),
             inflector::default_en(),
+            true,
         )
     }
 
@@ -2998,7 +3077,7 @@ end
                 .top_level
                 .iter()
                 .filter_map(|decl| match decl {
-                    Declaration::Class(class) => Some(main.resolve(class.class_name)),
+                    Declaration::Class(class) => Some(main.display_type_name(class.class_name)),
                     _ => None,
                 })
                 .collect();
@@ -3013,8 +3092,8 @@ end
                         .expect("Trackable.class_methods must be collected");
                     format!(
                         "{} {}",
-                        main.resolve(concern.name),
-                        main.resolve(class_methods.module_name)
+                        main.display_type_name(concern.name),
+                        main.display_type_name(class_methods.module_name)
                     )
                 })
                 .collect();
@@ -3026,7 +3105,7 @@ end
             let associations: Vec<String> = collected
                 .active_record_associations
                 .iter()
-                .map(|assoc| format!("{} {}", main.resolve(assoc.owner), assoc.name))
+                .map(|assoc| format!("{} {}", main.display_type_name(assoc.owner), assoc.name))
                 .collect();
             assert_eq!(
                 associations,

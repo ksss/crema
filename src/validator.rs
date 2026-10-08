@@ -19,17 +19,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ast::ruby::PrismByteRange;
-use crate::ast::types::Type as AstType;
 use crate::definition::ancestor_builder::{Ancestor, AncestorBuilder};
 use crate::definition::{MixinRef, VariableDuplicationKind};
 use crate::definition_builder::{
     BakedAncestorCycle, BakedArityViolation, DefinitionBuilder, PerNameCache, TypeParamsCache,
+    collect_direct_alias_deps,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::environment::DeclOrigin;
+use crate::environment::draft::PathIndexKey;
 use crate::environment::frozen::{
     ClassDeclaration, ClassOrModule, Environment, ModuleDeclaration, NormalizeModuleNameResult,
 };
+use crate::environment::{DeclOrigin, ScanScope};
 use crate::location::{RubyLocation, SourceLocation};
 use crate::name::NameTable;
 use crate::snapshot::backend::GSnapshotBackend;
@@ -84,24 +85,41 @@ pub fn full_validate(
     env: &DefinitionBuilder,
     sources: &SourceCache<'_>,
 ) -> (ValidationState, Vec<Diagnostic>) {
+    full_validate_scoped(env, sources, &ScanScope::Whole)
+}
+
+/// [`full_validate`] with every owner-driven sub-check restricted to
+/// `scope` (ADR-0036 Decision 4-2; see [`ScanScope`] for why the
+/// diagnostics that survive the CLI file filter are unchanged). The
+/// `validate_method_dups` / `validate_alias_cycles` /
+/// `validate_variable_dups` projections need no `scope` of their own:
+/// they read the `PerNameCache`s `DefinitionBuilder::from_environment_scoped`
+/// already narrowed. The returned [`ValidationState`] is partial under
+/// [`ScanScope::Files`] — only a `Whole` state is a valid seed for
+/// [`validate_update`].
+pub fn full_validate_scoped(
+    env: &DefinitionBuilder,
+    sources: &SourceCache<'_>,
+    scope: &ScanScope,
+) -> (ValidationState, Vec<Diagnostic>) {
     let ctx = AncestryEnv::from_builder(env);
     let environment = env.env();
 
     let (arity, mut diagnostics) = match environment.g_backend() {
-        Some(g) => full_applied_type_args_a(&ctx, g),
-        None => full_applied_type_args(&ctx),
+        Some(g) => full_applied_type_args_a(&ctx, g, scope),
+        None => full_applied_type_args(&ctx, scope),
     };
     diagnostics.extend(validate_method_dups(env, sources));
     diagnostics.extend(validate_alias_cycles(env, sources));
-    let (type_aliases, type_alias_diags) = full_type_alias_cycles(env);
+    let (type_aliases, type_alias_diags) = full_type_alias_cycles(env, scope);
     diagnostics.extend(type_alias_diags);
     let (ancestors, ancestor_diags) = match environment.g_backend() {
-        Some(g) => full_ancestor_cycles_a(&ctx, g),
-        None => full_ancestor_cycles(&ctx),
+        Some(g) => full_ancestor_cycles_a(&ctx, g, scope),
+        None => full_ancestor_cycles(&ctx, scope),
     };
     diagnostics.extend(ancestor_diags);
     diagnostics.extend(validate_variable_dups(env, sources));
-    diagnostics.extend(validate_alias_targets(env, sources));
+    diagnostics.extend(validate_alias_targets(env, sources, scope));
 
     (
         ValidationState {
@@ -155,7 +173,7 @@ pub fn validate_update(
     };
     diagnostics.extend(ancestor_diags);
     diagnostics.extend(validate_variable_dups(env, sources));
-    diagnostics.extend(validate_alias_targets(env, sources));
+    diagnostics.extend(validate_alias_targets(env, sources, &ScanScope::Whole));
 
     (
         ValidationState {
@@ -178,10 +196,17 @@ pub fn validate_update(
 /// Only the `UnknownTarget` arm is reported here — `Cycle` and the
 /// (not yet generated) kind-mismatch case are sibling todos and reuse
 /// distinct diagnostic shapes.
-fn validate_alias_targets(env: &DefinitionBuilder, _sources: &SourceCache<'_>) -> Vec<Diagnostic> {
+fn validate_alias_targets(
+    env: &DefinitionBuilder,
+    _sources: &SourceCache<'_>,
+    scope: &ScanScope,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let environment = env.env();
     for (alias_key, result) in &environment.normalized_module_names {
+        if !scope.admits(PathIndexKey::ClassAlias(*alias_key)) {
+            continue;
+        }
         let NormalizeModuleNameResult::UnknownTarget { target, .. } = result else {
             continue;
         };
@@ -192,12 +217,164 @@ fn validate_alias_targets(env: &DefinitionBuilder, _sources: &SourceCache<'_>) -
         out.push(Diagnostic {
             scope: None,
             kind: DiagnosticKind::UnknownTypeName {
-                name: env.names().resolve(target),
+                name: env.names().display_type_name(*target),
             },
             location,
         });
     }
     out
+}
+
+/// Emit `UnknownTypeName` for every declaration in `user_files` whose
+/// name has an undeclared enclosing namespace — `class Grape::API::Instance`
+/// with no `Grape::API` anywhere in the environment. Mirrors rbs's
+/// `DefinitionBuilder#ensure_namespace!` (`lib/rbs/definition_builder.rb`
+/// L25): the namespace is walked from the deepest prefix outward and the
+/// first undeclared one is reported, so each declaration yields at most one
+/// diagnostic. Presence follows rbs's `Environment#type_name?` (class,
+/// module, class/module alias, interface, type alias); a constant-only name
+/// does not count as a namespace. Steep surfaces the same error as
+/// `UnknownTypeName` (`Cannot find type \`::Grape::API\``).
+///
+/// Only declarations parsed from `user_files` (the project's sig files and
+/// inline `.rb` files, as interned path names) are walked. Library sigs (core / stdlib / gems /
+/// collection) are validated upstream and are deliberately not re-checked
+/// on every run. The caller supplies the file list because the
+/// environment does not record which files are the user's: with a G
+/// snapshot attached library decls sit in their own layer, but under
+/// `--no-g-snapshot` they share one map with the user's, and keying the
+/// walk on files keeps both runs' output identical by construction.
+/// Namespace presence itself is judged over the whole environment, so a
+/// namespace a library declares (`class Array::Mine`) is accepted.
+///
+/// A name reached through `path_index` is walked only when the file
+/// itself declared it: owner-tagged synthesized decls (infusion) are
+/// indexed under their owner `.rb` file but were not written by the user.
+/// Each name is reported once even when declared in several user files;
+/// the location is the primary declaration's, as in rbs.
+pub fn validate_decl_namespaces(
+    env: &DefinitionBuilder,
+    user_files: impl IntoIterator<Item = crate::name::Name>,
+) -> Vec<Diagnostic> {
+    let environment = env.env();
+    let names = env.names();
+    let ctx = AncestryEnv::from_builder(env);
+
+    let mut seen: FxHashSet<PathIndexKey> = FxHashSet::default();
+    let mut out = Vec::new();
+    for file in user_files {
+        let Some(keys) = environment.path_index_for(file) else {
+            continue;
+        };
+        let origin = DeclOrigin::Path(file);
+        // `keys` is a hash set, so the walk order varies — harmless: the
+        // reported location is the primary decl's whichever user file
+        // reaches a name first, and main sorts env diagnostics.
+        for key in keys {
+            // Skip a name already walked from an earlier file before the
+            // `declared_here` scan: an outer `module Gitlab` reopened in
+            // thousands of files has thousands of `context_decls`, so
+            // rescanning it per file is quadratic.
+            if seen.contains(&key) {
+                continue;
+            }
+            let (name, location) = match key {
+                PathIndexKey::ClassOrModule(name) => {
+                    let declared_here = match environment.class_decls().get(&name) {
+                        Some(ClassOrModule::Class(entry)) => {
+                            entry.context_decls().iter().any(|(o, _, _)| *o == origin)
+                        }
+                        Some(ClassOrModule::Module(entry)) => {
+                            entry.context_decls().iter().any(|(o, _, _)| *o == origin)
+                        }
+                        None => false,
+                    };
+                    if !declared_here {
+                        continue;
+                    }
+                    (name, primary_decl_location(&ctx, &name))
+                }
+                PathIndexKey::Interface(name) => {
+                    match environment.interface_decls().get(&name) {
+                        Some(entry) if entry.file() == Some(file) => {}
+                        _ => continue,
+                    }
+                    (name, primary_decl_location(&ctx, &name))
+                }
+                PathIndexKey::TypeAlias(name) => {
+                    let Some(entry) = environment.type_alias_decls().get(&name) else {
+                        continue;
+                    };
+                    if entry.file != origin {
+                        continue;
+                    }
+                    let range = entry.decl.location.as_ref().map(|l| l.range);
+                    (name, file_range_location(names, file, range))
+                }
+                PathIndexKey::Constant(name) => {
+                    let Some(entry) = environment.constant_decls().get(&name) else {
+                        continue;
+                    };
+                    if entry.file != origin {
+                        continue;
+                    }
+                    let range = entry.decl.location.as_ref().map(|l| l.range);
+                    (name, file_range_location(names, file, range))
+                }
+                // rbs `ensure_namespace!` does not run on class aliases
+                // (their rhs is `validate_alias_targets`' concern) or globals.
+                PathIndexKey::ClassAlias(_) | PathIndexKey::Global(_) => continue,
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(missing) = first_missing_namespace(environment, names, name) else {
+                continue;
+            };
+            out.push(Diagnostic {
+                scope: None,
+                kind: DiagnosticKind::UnknownTypeName {
+                    name: names.display_type_name(missing),
+                },
+                location: resolve_or_default(location.as_ref()),
+            });
+        }
+    }
+    out
+}
+
+/// rbs `ensure_namespace!`'s walk: the enclosing namespaces of `name` from
+/// the deepest outward, returning the first one `Environment#type_name?`
+/// rejects. The root namespace is always present.
+fn first_missing_namespace(
+    environment: &Environment,
+    names: &NameTable,
+    name: TypeName,
+) -> Option<TypeName> {
+    let mut current = names.type_name_parent(name)?;
+    while !names.type_name_is_root(current) {
+        let present = environment.class_decls().contains_key(&current)
+            || environment.class_alias_decls().contains_key(&current)
+            || environment.interface_decls().contains_key(&current)
+            || environment.type_alias_decls().contains_key(&current);
+        if !present {
+            return Some(current);
+        }
+        current = names.type_name_parent(current)?;
+    }
+    None
+}
+
+/// Byte-only `SourceLocation` for an `.rbs` declaration range in `file`.
+fn file_range_location(
+    names: &NameTable,
+    file: crate::name::Name,
+    range: Option<crate::location::LocationRange>,
+) -> Option<SourceLocation> {
+    range.map(|range| SourceLocation {
+        file: PathBuf::from(names.resolve(file)),
+        range,
+    })
 }
 
 /// Emit `RecursiveAncestor` diagnostics for cyclic ancestor graphs
@@ -206,9 +383,10 @@ fn validate_alias_targets(env: &DefinitionBuilder, _sources: &SourceCache<'_>) -
 /// raises during `instance_ancestors` build for any class whose
 /// `building_ancestors` stack revisits a name.
 ///
-/// crema's build layer (`build_instance_ancestors`) absorbs cycles
-/// silently via a `visited` set to avoid stack overflow, so the
-/// diagnostic surface lives here in the validator instead. The walk is
+/// crema's build layer (`build_instance_ancestors`) does not raise: it
+/// cuts the chain where the cycle closes and keeps such chains out of
+/// its cache, so the diagnostic surface lives here in the validator
+/// instead. The walk is
 /// independent from build (it never touches `instance_ancestors_cache`):
 /// class / module nodes consult `one_instance_ancestors` and follow
 /// the same four edge kinds rbs's cycle check considers, with
@@ -247,12 +425,26 @@ fn validate_alias_targets(env: &DefinitionBuilder, _sources: &SourceCache<'_>) -
 /// The diagnostic stream is deterministic regardless of `FxHashMap`
 /// iteration order because [`strongly_connected_cycles`] sorts its
 /// own output.
-pub(crate) fn full_ancestor_cycles(ctx: &AncestryEnv) -> (AncestorCycleState, Vec<Diagnostic>) {
+///
+/// `scope` picks the seeds; the search still expands through every
+/// ancestor edge from them, so a cycle a seed participates in is found
+/// whole even when its other members (and the anchor whose location the
+/// diagnostic carries) sit in other files.
+pub(crate) fn full_ancestor_cycles(
+    ctx: &AncestryEnv,
+    scope: &ScanScope,
+) -> (AncestorCycleState, Vec<Diagnostic>) {
     let environment = ctx.env;
     let roots: Vec<TypeName> = environment
         .class_decls()
         .keys()
-        .chain(environment.interface_decls().keys())
+        .filter(|n| scope.admits(PathIndexKey::ClassOrModule(**n)))
+        .chain(
+            environment
+                .interface_decls()
+                .keys()
+                .filter(|n| scope.admits(PathIndexKey::Interface(**n))),
+        )
         .cloned()
         .collect();
     let state: AncestorCycleState = ancestor_scc_cycles(ctx, roots, |_| true);
@@ -401,12 +593,19 @@ pub(crate) fn incremental_ancestor_cycles(
 pub(crate) fn full_ancestor_cycles_a(
     ctx: &AncestryEnv,
     g: &GSnapshotBackend,
+    scope: &ScanScope,
 ) -> (AncestorCycleState, Vec<Diagnostic>) {
     let environment = ctx.env;
     let seeds: Vec<TypeName> = environment
         .class_decls()
         .a_keys()
-        .chain(environment.interface_decls().a_keys())
+        .filter(|n| scope.admits(PathIndexKey::ClassOrModule(**n)))
+        .chain(
+            environment
+                .interface_decls()
+                .a_keys()
+                .filter(|n| scope.admits(PathIndexKey::Interface(**n))),
+        )
         .cloned()
         .collect();
     let in_a = |n: &TypeName| {
@@ -728,16 +927,16 @@ fn component_to_baked(
     let names = ctx.names();
     let anchor = *component
         .iter()
-        .min_by_key(|n| names.resolve(**n))
+        .min_by_key(|n| names.display_type_name(**n))
         .expect("component non-empty: SCC caller filters to cyclic components");
     let chain: Vec<String> = component_closed_walk(graph, component, anchor, names)
         .into_iter()
-        .map(|n| names.resolve(n))
+        .map(|n| names.display_type_name(n))
         .collect();
 
     BakedAncestorCycle {
         participants: component.to_vec(),
-        type_name: names.resolve(anchor),
+        type_name: names.display_type_name(anchor),
         chain,
         primary_source: primary_decl_location(ctx, &anchor),
     }
@@ -762,7 +961,7 @@ fn component_closed_walk(
     names: &NameTable,
 ) -> Vec<TypeName> {
     let mut targets: Vec<TypeName> = component.iter().copied().filter(|n| *n != anchor).collect();
-    targets.sort_by_key(|n| names.resolve(n));
+    targets.sort_by_key(|n| names.display_type_name(*n));
 
     let mut walk = vec![anchor];
     let mut current = anchor;
@@ -800,7 +999,7 @@ fn append_path_in_component(
 
     while let Some(node) = queue.pop_front() {
         let mut successors = graph.get(&node).cloned().unwrap_or_default();
-        successors.sort_by_key(|n| names.resolve(n));
+        successors.sort_by_key(|n| names.display_type_name(*n));
         successors.dedup();
         for next in successors {
             if !component_set.contains(&next) || !seen.insert(next) {
@@ -911,11 +1110,11 @@ fn strongly_connected_cycles(
     }
 
     for component in &mut tarjan.components {
-        component.sort_by_key(|n| names.resolve(n));
+        component.sort_by_key(|n| names.display_type_name(*n));
     }
     tarjan
         .components
-        .sort_by_key(|component| names.resolve(component[0]));
+        .sort_by_key(|component| names.display_type_name(component[0]));
     tarjan.components
 }
 
@@ -1035,17 +1234,36 @@ fn validate_alias_cycles(env: &DefinitionBuilder, _sources: &SourceCache<'_>) ->
 /// [`BakedTypeAliasCycle`]'s doc), so this single function covers both
 /// backends and [`full_validate`] / [`validate_update`] call it
 /// unconditionally.
+///
+/// Under [`ScanScope::Files`] only the scope's aliases are roots, and the
+/// graph is the successor-reachable closure from them (as in
+/// [`incremental_type_alias_cycles`]) so a cycle through aliases in other
+/// files is still found whole.
 pub(crate) fn full_type_alias_cycles(
     env: &DefinitionBuilder,
+    scope: &ScanScope,
 ) -> (TypeAliasCycleState, Vec<Diagnostic>) {
     let environment = env.env();
     let names = env.names();
 
-    let roots: Vec<TypeName> = environment.type_alias_decls().keys().cloned().collect();
-    let mut graph: FxHashMap<TypeName, Vec<TypeName>> = FxHashMap::default();
-    for root in &roots {
-        graph.insert(*root, type_alias_successors(env, root));
-    }
+    let graph: FxHashMap<TypeName, Vec<TypeName>> = match scope {
+        ScanScope::Whole => {
+            let mut graph: FxHashMap<TypeName, Vec<TypeName>> = FxHashMap::default();
+            for root in environment.type_alias_decls().keys() {
+                graph.insert(*root, type_alias_successors(env, root));
+            }
+            graph
+        }
+        ScanScope::Files(_) => {
+            let roots: Vec<TypeName> = environment
+                .type_alias_decls()
+                .keys()
+                .filter(|n| scope.admits(PathIndexKey::TypeAlias(**n)))
+                .cloned()
+                .collect();
+            reachable_subgraph(roots, |name| type_alias_successors(env, name))
+        }
+    };
 
     let state: TypeAliasCycleState = strongly_connected_cycles(&graph, names)
         .iter()
@@ -1088,14 +1306,17 @@ pub(crate) type TypeAliasCycleState = Vec<Arc<BakedTypeAliasCycle>>;
 
 fn build_type_alias_cycle(env: &DefinitionBuilder, component: &[TypeName]) -> BakedTypeAliasCycle {
     let names = env.names();
-    let mut alias_names: Vec<String> = component.iter().map(|n| names.resolve(n)).collect();
+    let mut alias_names: Vec<String> = component
+        .iter()
+        .map(|n| names.display_type_name(*n))
+        .collect();
     alias_names.sort();
 
     let anchor_name = *component
         .iter()
-        .min_by_key(|n| names.resolve(**n))
+        .min_by_key(|n| names.display_type_name(**n))
         .expect("component non-empty: SCC caller filters to cyclic components");
-    let anchor = names.resolve(anchor_name);
+    let anchor = names.display_type_name(anchor_name);
 
     let primary_source = env
         .env()
@@ -1183,34 +1404,6 @@ fn type_alias_successors(env: &DefinitionBuilder, name: &TypeName) -> Vec<TypeNa
         .collect()
 }
 
-/// Mirrors rbs `TypeAliasDependency#direct_dependency`
-/// (`lib/rbs/type_alias_dependency.rb` L65-78): walk through `Union`,
-/// `Intersection`, `Optional`; record `Alias` names; treat every other
-/// type constructor as opaque. The walker therefore distinguishes
-/// circular (`type a = a?`) from regular (`type a = Array[a]`) the same
-/// way rbs does.
-fn collect_direct_alias_deps(body: &AstType, out: &mut Vec<TypeName>) {
-    match body {
-        AstType::Union(t) => {
-            for ty in &t.types {
-                collect_direct_alias_deps(ty, out);
-            }
-        }
-        AstType::Intersection(t) => {
-            for ty in &t.types {
-                collect_direct_alias_deps(ty, out);
-            }
-        }
-        AstType::Optional(t) => {
-            collect_direct_alias_deps(&t.ty, out);
-        }
-        AstType::Alias(t) => {
-            out.push(t.name);
-        }
-        _ => {}
-    }
-}
-
 /// Emit `DuplicatedMethodDefinition` diagnostics for duplicate method definitions
 /// collected during class-cache population. Mirrors the
 /// `RBS::DuplicatedMethodDefinitionError` raise in `method_builder.rb#validate!`.
@@ -1239,8 +1432,8 @@ fn validate_variable_dups(env: &DefinitionBuilder, sources: &SourceCache<'_>) ->
                 Some(loc) => resolve_ruby_location(env, sources, loc),
                 None => resolve_or_default(dup.location.as_ref()),
             };
-            let type_name = env.names().resolve(dup.type_name);
-            let variable_name = env.names().resolve(dup.variable_name);
+            let type_name = env.names().display_type_name(dup.type_name);
+            let variable_name = env.names().resolve(dup.variable_name).to_string();
             let kind = match dup.kind {
                 VariableDuplicationKind::Instance => DiagnosticKind::InstanceVariableDuplication {
                     type_name,
@@ -1298,13 +1491,22 @@ pub(crate) type ArityState = PerNameCache<BakedArityViolation>;
 /// [`full_applied_type_args_a`] is the G-backend-attached counterpart,
 /// wired in by [`full_validate`] / [`validate_update`] via
 /// `Environment::g_backend`.
-pub(crate) fn full_applied_type_args(ctx: &AncestryEnv) -> (ArityState, Vec<Diagnostic>) {
+pub(crate) fn full_applied_type_args(
+    ctx: &AncestryEnv,
+    scope: &ScanScope,
+) -> (ArityState, Vec<Diagnostic>) {
     let environment = ctx.env;
     let mut state = ArityState::new();
     for class_n in environment.class_decls().keys() {
+        if !scope.admits(PathIndexKey::ClassOrModule(*class_n)) {
+            continue;
+        }
         state.push(*class_n, class_host_arity(ctx, class_n));
     }
     for iface_n in environment.interface_decls().keys() {
+        if !scope.admits(PathIndexKey::Interface(*iface_n)) {
+            continue;
+        }
         state.push(*iface_n, interface_host_arity(ctx, iface_n));
     }
     let diagnostics = state
@@ -1355,13 +1557,20 @@ pub(crate) fn incremental_applied_type_args(
 pub(crate) fn full_applied_type_args_a(
     ctx: &AncestryEnv,
     g: &GSnapshotBackend,
+    scope: &ScanScope,
 ) -> (ArityState, Vec<Diagnostic>) {
     let environment = ctx.env;
     let mut state = ArityState::new();
     for class_n in environment.class_decls().a_keys() {
+        if !scope.admits(PathIndexKey::ClassOrModule(*class_n)) {
+            continue;
+        }
         state.push(*class_n, class_host_arity(ctx, class_n));
     }
     for iface_n in environment.interface_decls().a_keys() {
+        if !scope.admits(PathIndexKey::Interface(*iface_n)) {
+            continue;
+        }
         state.push(*iface_n, interface_host_arity(ctx, iface_n));
     }
     let diagnostics = applied_type_args_diagnostics_with_g_splice(&state, g, environment);
@@ -1521,8 +1730,8 @@ fn check_one(
 
     Some(BakedArityViolation {
         kind,
-        target: ctx.names().resolve(mixin.name),
-        class: ctx.names().resolve(host_n),
+        target: ctx.names().display_type_name(mixin.name),
+        class: ctx.names().display_type_name(*host_n),
         expected,
         got,
         location: mixin.location.clone(),

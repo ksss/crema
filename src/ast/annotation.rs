@@ -11,7 +11,7 @@ use crate::name::Symbol;
 /// `location` is `Option` to allow synthetic annotations from
 /// non-source paths, following the convention in
 /// [`crate::ast::declarations`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Annotation {
     pub string: Symbol,
     pub location: Option<LocationRange>,

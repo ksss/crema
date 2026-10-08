@@ -2,10 +2,11 @@
 //!
 //! Port of rbs's `Resolver::TypeNameResolver` against the ADR-0017
 //! `TypeName` (`Namespace` + `Name` + `Kind`) representation.
-//! Distinct from [`crate::resolver::type_name_resolver`], which works on
-//! flattened `Name` (full-path interned strings) for the legacy
-//! `DefinitionBuilder`. This module is consumed only by
-//! [`crate::environment::draft::EnvironmentDraft::build`].
+//! Consumed by [`crate::environment::draft::EnvironmentDraft::build`] (Pass
+//! 2, every reference-position name in the frozen AST) and by type
+//! lowering (`definition_builder::type_builder::lower_type_name`), which
+//! builds one over `Environment::all_names` / `aliases` for the names
+//! that are parsed fresh at check time (inline assertions).
 //!
 //! # Two-set structure
 //!
@@ -202,7 +203,7 @@ impl<'a> TypeNameResolver<'a> {
     /// stringify-then-reparse round trip the `&str` API would impose
     /// on callers that already hold a `TypeName` (`SuperClass.type_name`,
     /// `ClassModuleAliasDecl.infered_old_name`). The semantics match
-    /// `try_resolve(&names.resolve(tn), tn.kind, context)` —
+    /// `try_resolve(&names.display_type_name(tn), tn.kind, context)` —
     /// `names.type_name_is_absolute(tn)` provides the `is_absolute` signal
     /// rbs's resolver consults — but the segments stay as interned
     /// `Symbol`s the whole way through.
@@ -537,13 +538,13 @@ fn collect_declaration_names(
         Declaration::ClassAlias(a) => {
             aliases.insert(
                 a.new_name,
-                (names.resolve(a.old_name), context_to_arc(context)),
+                (names.display_type_name(a.old_name), context_to_arc(context)),
             );
         }
         Declaration::ModuleAlias(a) => {
             aliases.insert(
                 a.new_name,
-                (names.resolve(a.old_name), context_to_arc(context)),
+                (names.display_type_name(a.old_name), context_to_arc(context)),
             );
         }
     }
@@ -641,7 +642,7 @@ fn resolve_type_name_slot(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> TypeName {
-    let raw = names.resolve(slot);
+    let raw = names.display_type_name(*slot);
     absolute_type_name(resolver, &raw, context, names)
 }
 
@@ -775,7 +776,7 @@ fn resolve_super(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> Super {
-    let raw = names.resolve(m.name);
+    let raw = names.display_type_name(m.name);
     Super {
         name: absolute_type_name(resolver, &raw, context, names),
         args: resolve_type_list(&m.args, context, resolver, names),
@@ -790,7 +791,7 @@ fn resolve_self_type(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> SelfType {
-    let raw = names.resolve(m.name);
+    let raw = names.display_type_name(m.name);
     SelfType {
         name: absolute_type_name(resolver, &raw, context, names),
         args: resolve_type_list(&m.args, context, resolver, names),
@@ -805,7 +806,7 @@ fn resolve_include(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> IncludeMember {
-    let raw = names.resolve(inc.name);
+    let raw = names.display_type_name(inc.name);
     IncludeMember {
         name: absolute_type_name(resolver, &raw, context, names),
         args: resolve_type_list(&inc.args, context, resolver, names),
@@ -822,7 +823,7 @@ fn resolve_extend(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> ExtendMember {
-    let raw = names.resolve(ext.name);
+    let raw = names.display_type_name(ext.name);
     ExtendMember {
         name: absolute_type_name(resolver, &raw, context, names),
         args: resolve_type_list(&ext.args, context, resolver, names),
@@ -839,7 +840,7 @@ fn resolve_prepend(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> PrependMember {
-    let raw = names.resolve(pre.name);
+    let raw = names.display_type_name(pre.name);
     PrependMember {
         name: absolute_type_name(resolver, &raw, context, names),
         args: resolve_type_list(&pre.args, context, resolver, names),
@@ -990,7 +991,7 @@ pub(crate) fn resolve_class_alias_decl(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> ClassAlias {
-    let old_raw = names.resolve(a.old_name);
+    let old_raw = names.display_type_name(a.old_name);
     ClassAlias {
         new_name: a.new_name,
         old_name: absolute_type_name(resolver, &old_raw, context, names),
@@ -1007,7 +1008,7 @@ pub(crate) fn resolve_module_alias_decl(
     resolver: &TypeNameResolver,
     names: &NameTable,
 ) -> ModuleAlias {
-    let old_raw = names.resolve(a.old_name);
+    let old_raw = names.display_type_name(a.old_name);
     ModuleAlias {
         new_name: a.new_name,
         old_name: absolute_type_name(resolver, &old_raw, context, names),
@@ -1436,7 +1437,7 @@ fn collect_ruby_member_names(
                 let old_tn = a
                     .old_name(names)
                     .expect("nested Ruby alias decl reached collect without RHS — inline collector should have dropped it");
-                let old_raw = names.resolve(old_tn);
+                let old_raw = names.display_type_name(old_tn);
                 aliases.insert(new_name, (old_raw, context_to_arc(context)));
             }
         },
@@ -1730,7 +1731,7 @@ pub(crate) fn resolve_ruby_alias_decl(
     names: &NameTable,
 ) -> RubyClassModuleAliasDecl {
     let resolve_text =
-        |text: &str| names.resolve(absolute_type_name(resolver, text, context, names));
+        |text: &str| names.display_type_name(absolute_type_name(resolver, text, context, names));
     let resolved_annotation = decl
         .annotation
         .map_type_name_text(decl.annotation.type_name_text().map(resolve_text));
@@ -1758,7 +1759,7 @@ fn resolve_ruby_mixin(
     // the spelling-derived kind.
     let resolved = absolute_type_name(resolver, &mixin.module_name, context, names);
     RubyMixinMember {
-        module_name: names.resolve(resolved),
+        module_name: names.display_type_name(resolved),
         location: mixin.location,
         name_location: mixin.name_location,
         annotation: mixin.annotation.clone(),

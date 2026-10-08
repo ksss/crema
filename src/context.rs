@@ -223,7 +223,7 @@ impl Context {
     /// a bare constant write, defines into the cref).
     fn qualified_class_name(&self, name: &str, names: &NameTable) -> TypeName {
         let qualified = match self.cref_stack.last() {
-            Some(parent) => format!("{}::{}", names.resolve(parent), name),
+            Some(parent) => format!("{}::{}", names.display_type_name(*parent), name),
             None => format!("::{}", name),
         };
         names.parse_type_name(&qualified)
@@ -887,7 +887,7 @@ impl Context {
     /// existed). Lvar-side counterpart is [`Self::enter_narrow`].
     pub fn enter_pure_narrow(&mut self, key: PureKey, ty: Ty) -> PureNarrowToken {
         let prev = self.pure_call_env.get(&key);
-        self.pure_call_env.set(key.clone(), ty);
+        self.pure_call_env.set(key, ty);
         PureNarrowToken {
             key,
             narrowed_ty: ty,

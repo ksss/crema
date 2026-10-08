@@ -1,18 +1,27 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::{Cell, UnsafeCell};
+use std::cell::RefCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::name::{NameTable, Symbol};
 use crate::type_name::TypeName;
 use crate::type_param::TypeVarScope;
 
 /// An interned type, represented as an index into a `TypeTable`.
-/// Copy-cheap, comparison-cheap (u32 == u32). The Ord / PartialOrd
-/// derives expose the raw intern id ordering — semantically meaningless
-/// but enough for callers that need a deterministic Vec<Ty> order (e.g.
-/// CondEnv::join_branch deduping members for interning).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Copy-cheap, comparison-cheap (u32 == u32).
+///
+/// The id is handed out in intern order, which depends on which file was
+/// checked first and on thread interleaving, so `Ty` deliberately has no
+/// `Ord`: anything that orders types (union / intersection members) must
+/// use [`cmp_by_content`] instead.
+///
+/// ```compile_fail
+/// let mut v: Vec<crema::types::Ty> = Vec::new();
+/// v.sort();
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Ty(u32);
 
 impl Ty {
@@ -41,7 +50,7 @@ impl Ty {
                 if args.is_empty() && builtins.is_bool_class(*name) {
                     return "bool".to_string();
                 }
-                let name_str = names.resolve(name);
+                let name_str = names.display_type_name(*name);
                 if args.is_empty() {
                     name_str
                 } else {
@@ -51,7 +60,7 @@ impl Ty {
                 }
             }
             Type::ClassSingleton { name } => {
-                let name_str = names.resolve(name);
+                let name_str = names.display_type_name(*name);
                 format!("singleton({})", name_str)
             }
             Type::Union(members) => {
@@ -71,13 +80,10 @@ impl Ty {
                     parts.push(s);
                 }
                 // Canonicalize by rendered string so the same union set
-                // renders identically across intern orders (the a-snapshot
-                // warm/cold divergence root cause). `union_of` sorts by
-                // Ty(u32) which is insertion-order dependent — cold fresh
-                // build and warm snapshot decode intern types in different
-                // orders, so the same union collapses to different member
-                // sequences at the construction layer. The display sort
-                // absorbs that.
+                // renders identically however it was built. `union_of`
+                // orders members by content, but a union interned directly
+                // (`intern(Type::Union(..))`, e.g. from a signature) keeps
+                // its construction order.
                 parts.sort();
                 parts.join(" | ")
             }
@@ -103,26 +109,16 @@ impl Ty {
                 Literal::Symbol(s) => format!(":{}", s),
                 Literal::Bool(b) => b.to_string(),
             },
-            Type::TypeVariable { raw, .. } => names.resolve(*raw),
-            Type::Interface { name, args } => {
-                let name_str = names.resolve(name);
+            Type::TypeVariable { raw, .. } => names.resolve(*raw).to_string(),
+            // Alias names render like other type names, `::`-qualified.
+            Type::Interface { name, args } | Type::Alias { name, args } => {
+                let name_str = names.display_type_name(*name);
                 if args.is_empty() {
                     name_str
                 } else {
                     let args_str: Vec<String> =
                         args.iter().map(|a| a.display(types, names)).collect();
                     format!("{}[{}]", name_str, args_str.join(", "))
-                }
-            }
-            Type::Alias { name, args } => {
-                let name_str = names.resolve(name);
-                let short = name_str.strip_prefix("::").unwrap_or(&name_str);
-                if args.is_empty() {
-                    short.to_string()
-                } else {
-                    let args_str: Vec<String> =
-                        args.iter().map(|a| a.display(types, names)).collect();
-                    format!("{}[{}]", short, args_str.join(", "))
                 }
             }
             Type::Tuple(members) => {
@@ -238,7 +234,7 @@ impl fmt::Debug for Ty {
 
 /// Internal type representation for type checking.
 /// Stored inside a `TypeTable`; external code uses `Ty` handles.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum Type {
     /// A class instance type, e.g. `Integer`, `Array[String]`.
@@ -356,7 +352,7 @@ pub enum Type {
 /// `Symbol(s)` and `String(s)` are distinct keys even for the same inner
 /// string — the RBS parser rejects a record that mixes them, but as types
 /// they represent different runtime identities.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RecordKey {
     Symbol(String),
     String(String),
@@ -451,7 +447,7 @@ impl RecordKey {
 /// enumerates the cases rbs stores as a plain Ruby value in
 /// `RBS::Types::Literal#literal` (Symbol / String / Integer / TrueClass /
 /// FalseClass).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Literal {
     Integer(String),
     String(String),
@@ -482,7 +478,7 @@ impl Literal {
 /// carries `type`, `name`, and `location`. crema currently flattens parameters
 /// to bare `Ty` values and discards the parameter name; ADR-0014 reserves
 /// restoring a `Function::Param` shape as a later phase.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Function {
     pub required_positionals: Vec<Ty>,
     pub optional_positionals: Vec<Ty>,
@@ -609,7 +605,7 @@ impl Function {
 
 /// Position kind during overload positional merge. Mirrors Steep's
 /// `PositionalParams::{Required, Optional, Rest}` head shapes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum PosKind {
     Required,
     Optional,
@@ -620,7 +616,7 @@ enum PosKind {
 /// `Rest` axis (the `**rest` slot is a separate field on `Function`), so
 /// keeping this distinct from `PosKind` lets the merge `match` stay
 /// exhaustive without `unreachable!` arms.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum KeywordPresence {
     Required,
     Optional,
@@ -857,7 +853,7 @@ fn merge_keywords(
 
 /// Untyped function type `(?) -> T` — accepts any arguments without checking.
 /// Mirrors `RBS::Types::UntypedFunction`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UntypedFunction {
     pub return_type: Ty,
 }
@@ -865,7 +861,7 @@ pub struct UntypedFunction {
 /// Union of typed and untyped function types. crema-only fold:
 /// rbs encodes `RBS::Types::Function | RBS::Types::UntypedFunction` as a
 /// duck-typed union; this enum closes it into a Rust sum type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FunctionType {
     Typed(Function),
     Untyped(UntypedFunction),
@@ -901,7 +897,7 @@ impl FunctionType {
 /// here to escape the Rust keyword.
 ///
 /// `self_type` is the `[self: T]` binding declared on the block argument.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub required: bool,
     pub type_: FunctionType,
@@ -944,6 +940,11 @@ impl Block {
             FunctionType::Untyped(_) => None,
         }
     }
+
+    /// Returns `true` if the block type is an `UntypedFunction` (`{ (?) -> T }`).
+    pub fn is_untyped_function(&self) -> bool {
+        matches!(self.type_, FunctionType::Untyped(_))
+    }
 }
 
 /// A method overload type. Mirrors `RBS::MethodType` (which holds
@@ -957,7 +958,7 @@ impl Block {
 /// Each entry carries an optional upper/lower bound. Method-level variance is
 /// forbidden by RBS syntax (see rbs docs/syntax.md §822) so `variance` is
 /// always `Invariant` here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodType {
     pub type_params: Vec<crate::type_param::TypeParam>,
     pub type_: FunctionType,
@@ -1153,7 +1154,7 @@ fn unify_blocks(a: Option<&Block>, b: Option<&Block>, types: &TypeTable) -> Opti
 /// RBS (`syntax.md` `_visibility_`) recognises only `public` and `private`.
 /// `protected` is deliberately not represented: adding it would exceed the
 /// RBS grammar crema is meant to mirror.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Visibility {
     #[default]
     Public,
@@ -1181,112 +1182,81 @@ impl Visibility {
 
 const TYPE_STORE_CHUNK: usize = 1024;
 
-/// Append-only storage for interned types.
+/// Fixed length of the chunk directory: 8,388,608 types in all, over a
+/// hundred times what a check of gitlab interns (~70k).
+const TYPE_STORE_MAX_CHUNKS: usize = 8192;
+
+const TYPE_INDEX_SHARDS: usize = 64;
+
+/// `TYPE_STORE_CHUNK` write-once slots.
+type TypeChunk = Box<[OnceLock<Type>]>;
+
+/// One shard of the shared intern index: hash to every id with that hash.
+type TypeIndexShard = Mutex<FxHashMap<u64, Vec<Ty>>>;
+
+/// Append-only storage for interned types, readable from any thread
+/// without a lock.
 ///
-/// Each chunk is a fixed-capacity `Vec<Type>` allocated in its own `Box`. The
-/// invariants that make `&Type` references stable across subsequent `push`
-/// calls are:
+/// The directory has a fixed length, so it never reallocates; each chunk is
+/// a boxed slice of `TYPE_STORE_CHUNK` slots that is allocated once and
+/// never resized; each slot is written once. A `&Type` handed out by `get`
+/// therefore stays valid for the lifetime of the store, across any number
+/// of later `push` calls on any thread.
 ///
-/// - The outer `Vec<Box<Vec<Type>>>` may reallocate when a new chunk is added,
-///   but `Box` does not move the heap data it owns when its slot in the outer
-///   vec is relocated. Existing chunk contents stay at the same heap address.
-/// - Each inner `Vec<Type>` is allocated with `Vec::with_capacity(CHUNK)` and
-///   never pushed past `CHUNK` items, so it never reallocates and the slot
-///   memory inside it never moves either.
-///
-/// Combined: once a `Type` is pushed and a `&Type` is handed out, subsequent
-/// `push` calls cannot invalidate that reference. This is the foundation
-/// `TypeTable::resolve` relies on for borrowed reads.
-///
-/// `push` and `get` both take `&self` to avoid materialising a `&mut
-/// ChunkedTypeStore` at the call site — that mutable borrow would alias the
-/// `&Type` references already lent out, which is what makes a naive
-/// `&mut self` design unsound under stacked borrows.
-#[allow(clippy::vec_box)]
+/// Publication: a slot is written (`OnceLock::set`) before its id leaves
+/// `push`, and every `OnceLock::get` that sees it synchronizes with that
+/// write. An id whose slot this store has not written (reserved by a
+/// concurrent `push`, or past the end, e.g. from a larger table) makes `get`
+/// panic instead of reading anything.
 struct ChunkedTypeStore {
-    chunks: UnsafeCell<Vec<Box<Vec<Type>>>>,
-    len: Cell<u32>,
+    chunks: Box<[OnceLock<TypeChunk>]>,
+    len: AtomicU32,
 }
 
 impl ChunkedTypeStore {
     fn new() -> Self {
         Self {
-            chunks: UnsafeCell::new(Vec::new()),
-            len: Cell::new(0),
+            chunks: (0..TYPE_STORE_MAX_CHUNKS)
+                .map(|_| OnceLock::new())
+                .collect(),
+            len: AtomicU32::new(0),
         }
     }
 
     fn len(&self) -> u32 {
-        self.len.get()
+        self.len.load(Ordering::Relaxed)
     }
 
-    /// Append a `Type` and return its `u32` index.
-    ///
-    /// # Safety / soundness rationale
-    ///
-    /// The `&mut Vec<Box<Vec<Type>>>` materialised inside this function is
-    /// confined to a single statement and the contents it touches (the outer
-    /// vec's tail, or the last chunk's tail via `Box::deref_mut`) do not
-    /// overlap with any `&Type` previously returned by [`Self::get`]:
-    ///
-    /// - Outer-vec growth (adding a new chunk box) writes to a slot in the
-    ///   outer vec, not to any existing chunk's heap data.
-    /// - Inner-vec growth (pushing into the last chunk box) only touches the
-    ///   inner vec's `len` field and the freshly-claimed slot — both at the
-    ///   tail. Previously-pushed slots are untouched.
-    ///
-    /// So while the mutable borrow conceptually covers the entire `Vec<Box<...>>`,
-    /// the bytes it actually mutates are disjoint from the slot bytes any
-    /// outstanding `&Type` is reading. This is the same pattern `elsa`'s
-    /// `FrozenVec<Box<T>>` relies on for `&self` push.
+    /// Append a `Type` and return its `u32` index. Ids are handed out in
+    /// call order, so a single thread sees consecutive ids.
     fn push(&self, ty: Type) -> u32 {
-        let id = self.len.get();
-        debug_assert!(id < u32::MAX, "TypeTable exceeded u32::MAX entries");
-
-        // SAFETY: this is the only `&mut` materialised against `self.chunks`;
-        // it is released at the end of this statement. The mutation writes
-        // only to the outer vec's tail or the last chunk's tail, which are
-        // disjoint from any `&Type` previously handed out by `get` (see the
-        // soundness rationale above).
-        let chunks = unsafe { &mut *self.chunks.get() };
-        if chunks
-            .last()
-            .is_none_or(|chunk| chunk.len() == TYPE_STORE_CHUNK)
-        {
-            chunks.push(Box::new(Vec::with_capacity(TYPE_STORE_CHUNK)));
+        let id = self.len.fetch_add(1, Ordering::Relaxed);
+        let idx = id as usize;
+        assert!(
+            idx < TYPE_STORE_MAX_CHUNKS * TYPE_STORE_CHUNK,
+            "TypeTable exceeded {} types",
+            TYPE_STORE_MAX_CHUNKS * TYPE_STORE_CHUNK
+        );
+        let chunk = self.chunks[idx / TYPE_STORE_CHUNK]
+            .get_or_init(|| (0..TYPE_STORE_CHUNK).map(|_| OnceLock::new()).collect());
+        if chunk[idx % TYPE_STORE_CHUNK].set(ty).is_err() {
+            unreachable!("type store slot {id} written twice");
         }
-        let chunk = chunks.last_mut().expect("chunk exists after allocation");
-        debug_assert!(chunk.len() < TYPE_STORE_CHUNK);
-        chunk.push(ty);
-
-        self.len.set(id + 1);
         id
     }
 
-    /// Borrow the `Type` at index `idx`. The returned reference is valid for
-    /// the lifetime of `&self`, including across subsequent `push` calls,
-    /// because pushes do not move existing slot memory (see struct doc).
     fn get(&self, idx: u32) -> &Type {
-        debug_assert!(idx < self.len.get());
         let idx = idx as usize;
-        let chunk_idx = idx / TYPE_STORE_CHUNK;
-        let slot_idx = idx % TYPE_STORE_CHUNK;
-        // SAFETY: only shared borrows of `self.chunks` are materialised here.
-        // `push` is the only mutator and it takes `&self` plus this single
-        // statement's `&mut` is released before any `&Type` escapes — so the
-        // mutable side and the shared side cannot be live at the same time
-        // for a given thread. `TypeTable` is `!Sync` by construction
-        // (`UnsafeCell` is not `Sync`), so we do not need to reason across
-        // threads.
-        let chunks = unsafe { &*self.chunks.get() };
-        &chunks[chunk_idx][slot_idx]
+        self.chunks
+            .get(idx / TYPE_STORE_CHUNK)
+            .and_then(OnceLock::get)
+            .and_then(|chunk| chunk[idx % TYPE_STORE_CHUNK].get())
+            .unwrap_or_else(|| panic!("Ty({idx}) does not belong to this TypeTable"))
     }
 
     #[cfg(test)]
     fn chunk_count(&self) -> usize {
-        // SAFETY: shared borrow only; see `get` for the rationale.
-        let chunks = unsafe { &*self.chunks.get() };
-        chunks.len()
+        self.chunks.iter().filter(|c| c.get().is_some()).count()
     }
 }
 
@@ -1296,26 +1266,36 @@ fn hash_type(ty: &Type) -> u64 {
     hasher.finish()
 }
 
-/// A type interner that maps structural `Type` values to `Ty` handles.
+/// Source of `TypeTable::id`. Never reused within a process, so a
+/// thread-local entry left behind by a dropped table cannot match a new one.
+static NEXT_TYPE_TABLE_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Per-thread front for [`TypeTable::intern`]: `(table id, hash)` to the
+    /// id this thread last saw for that hash. A hit takes no lock; it is
+    /// still compared structurally against the store, which rejects hash
+    /// collisions.
+    static TYPE_INTERN_FRONT: RefCell<FxHashMap<(u64, u64), Ty>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// A type interner that maps structural `Type` values to `Ty` handles,
+/// shared between threads (ADR-0034).
 ///
-/// `intern` is the only mutation path. It appends new entries without moving
-/// existing storage slots, so `resolve` can lend references to stored types
-/// even across subsequent `intern` calls — including the
+/// `intern` is the only mutation path. It appends without moving existing
+/// slots, so `resolve` can lend references to stored types even across
+/// subsequent `intern` calls on any thread — including the
 /// `match types.resolve(t) { ... types.intern(...) ... }` pattern that recurs
 /// throughout the type checker.
 ///
-/// # Soundness sketch
-///
-/// `chunks` and `index` are held in **separate** `UnsafeCell`s. `resolve`
-/// only touches `chunks`; `intern` mutates `index` and then (separately)
-/// `chunks`. The two mutable borrows never overlap with each other and they
-/// live in different allocations from any `&Type` previously handed out by
-/// `resolve`, so the references `resolve` lends remain valid across `intern`
-/// calls. Internal mutability for `chunks` is encapsulated inside
-/// [`ChunkedTypeStore`] (see its doc for the chunk-stability argument).
+/// Lookup is two-level: the thread's own front first (no lock; it takes
+/// almost every call), then the shard of the shared index that owns the
+/// hash. The shard lock covers both the search and the append, so two
+/// threads interning the same type at once still get one `Ty`.
 pub struct TypeTable {
+    id: u64,
     chunks: ChunkedTypeStore,
-    index: UnsafeCell<FxHashMap<u64, Vec<Ty>>>,
+    shards: Box<[TypeIndexShard]>,
 }
 
 impl fmt::Debug for TypeTable {
@@ -1327,8 +1307,11 @@ impl fmt::Debug for TypeTable {
 impl TypeTable {
     pub fn new() -> Self {
         let table = TypeTable {
+            id: NEXT_TYPE_TABLE_ID.fetch_add(1, Ordering::Relaxed),
             chunks: ChunkedTypeStore::new(),
-            index: UnsafeCell::new(FxHashMap::default()),
+            shards: (0..TYPE_INDEX_SHARDS)
+                .map(|_| Mutex::new(FxHashMap::default()))
+                .collect(),
         };
         // Pre-intern well-known types. Order must match Ty constants.
         table.intern(Type::Void); // Ty(0) = Ty::VOID
@@ -1355,48 +1338,36 @@ impl TypeTable {
     }
 
     fn intern_with_hash_internal(&self, ty: Type, hash: u64) -> Ty {
-        // Phase A: look up the hash bucket. We snapshot the bucket's Ty list
-        // and immediately release the borrow on `index` — this lets us touch
-        // `chunks` next without keeping a live `&mut`/`&` into `index`.
-        let candidates: Vec<Ty> = {
-            // SAFETY: shared borrow of `index`, released at the end of this
-            // block. No other code in this function holds an `index` borrow
-            // concurrently. The borrow does not escape this block.
-            let index = unsafe { &*self.index.get() };
-            match index.get(&hash) {
-                Some(bucket) => bucket.clone(),
-                None => Vec::new(),
+        let key = (self.id, hash);
+        if let Some(t) = TYPE_INTERN_FRONT.with(|front| front.borrow().get(&key).copied())
+            && self.chunks.get(t.0) == &ty
+        {
+            return t;
+        }
+        let found = {
+            let mut shard = self.shards[(hash >> 58) as usize % TYPE_INDEX_SHARDS]
+                .lock()
+                .expect("type index shard poisoned");
+            let bucket = shard.entry(hash).or_default();
+            match bucket.iter().copied().find(|t| self.chunks.get(t.0) == &ty) {
+                Some(t) => t,
+                None => {
+                    // The slot is written before the id enters the bucket,
+                    // so no other thread can learn the id before its type.
+                    let id = Ty(self.chunks.push(ty));
+                    bucket.push(id);
+                    id
+                }
             }
         };
-
-        // Phase B: probe candidates via `chunks` (shared borrows only).
-        for existing in &candidates {
-            if self.chunks.get(existing.0) == &ty {
-                return *existing;
-            }
-        }
-
-        // Phase C: append the new type to `chunks`. `ChunkedTypeStore::push`
-        // takes `&self`; its internal `&mut` is confined to the call and does
-        // not alias any `&Type` we have lent out (see ChunkedTypeStore doc).
-        let id = Ty(self.chunks.push(ty));
-
-        // Phase D: record the new id in `index`. The mutable borrow is
-        // confined to this block and does not overlap with `chunks` borrows.
-        // SAFETY: `index` and `chunks` live in disjoint allocations, so this
-        // `&mut` cannot alias any `&Type` returned by `resolve`. No other
-        // code in this function holds an `index` borrow concurrently —
-        // Phase A's borrow was already released.
-        unsafe {
-            (*self.index.get()).entry(hash).or_default().push(id);
-        }
-        id
+        TYPE_INTERN_FRONT.with(|front| front.borrow_mut().insert(key, found));
+        found
     }
 
     /// Resolve a `Ty` handle back to its structural `Type`.
     ///
     /// The returned `&Type` is valid for the lifetime of `&self`, including
-    /// across subsequent `intern` calls. This is what makes the
+    /// across subsequent `intern` calls on any thread. This is what makes the
     /// `match types.resolve(t) { ... types.intern(...) ... }` idiom safe.
     pub fn resolve(&self, ty: Ty) -> &Type {
         self.chunks.get(ty.0)
@@ -1593,6 +1564,35 @@ pub fn contains_type_variable(ty: Ty, types: &TypeTable) -> bool {
     }
 }
 
+/// Length of the shortest path from `ty` down to a `Type::TypeVariable`,
+/// counting the variable itself (`U` → 1, `Array[U]` → 2), or `None` when
+/// `ty` has none. Port of Steep's `Subtyping::Check#hole_path` size, which
+/// orders the members of a sup-side union; crema treats every type var as
+/// a hole, since unify binds whatever var it meets.
+pub fn hole_path_len(ty: Ty, types: &TypeTable) -> Option<usize> {
+    let shortest = |children: &mut dyn Iterator<Item = Ty>| {
+        children
+            .filter_map(|c| hole_path_len(c, types))
+            .min()
+            .map(|n| n + 1)
+    };
+    match types.resolve(ty) {
+        Type::TypeVariable { .. } => Some(1),
+        Type::ClassInstance { args, .. }
+        | Type::Interface { args, .. }
+        | Type::Alias { args, .. } => shortest(&mut args.iter().copied()),
+        Type::Union(members) | Type::Intersection(members) | Type::Tuple(members) => {
+            shortest(&mut members.iter().copied())
+        }
+        Type::Optional(inner) => shortest(&mut std::iter::once(*inner)),
+        Type::Record { fields } => shortest(&mut fields.iter().map(|(_, t, _)| *t)),
+        // Proc members are rare in a param union; fall back to "has a var
+        // somewhere" at the shallowest depth a child can sit.
+        Type::Proc { .. } => contains_type_variable(ty, types).then_some(2),
+        _ => None,
+    }
+}
+
 fn function_type_contains_type_variable(ft: &FunctionType, types: &TypeTable) -> bool {
     let walk = |t: Ty| contains_type_variable(t, types);
     match ft {
@@ -1632,11 +1632,18 @@ fn collect_truthy_members(ty: Ty, types: &TypeTable, out: &mut Vec<Ty>) {
     }
 }
 
-/// Partition a type into its truthy side for flow-sensitive narrowing.
+/// Partition a type into its truthy side for multiple assignment.
 ///
 /// Returns `Some(t)` where `t` is `ty` with `nil` and `false` literal
 /// components removed; `None` if the truthy set is empty (the branch is
 /// statically unreachable).
+///
+/// This is the masgn split — Steep's `type_masgn` runs
+/// `partition_flatten_types` with a nil/false predicate, so `bool` /
+/// `untyped` count as truthy only and aliases are not unfolded here
+/// (the caller expands the top-level alias first). Conditional logic
+/// (`&&` / `||`, predicate narrowing) uses [`partition_union_with`]
+/// instead.
 ///
 /// Recurses through nested `Optional`/`Union` layers, so a member that is
 /// itself `Optional` (e.g. `Integer? | String`, the shape a union of two
@@ -1688,8 +1695,8 @@ fn collect_falsy_members(ty: Ty, types: &TypeTable, has_nil: &mut bool, out: &mu
 /// components of `ty`; `None` if `ty` has no falsy member (the branch is
 /// statically unreachable).
 ///
-/// Used by `&&` to type the left's falsy passthrough: `a && b` keeps
-/// `a`'s falsy partition when `a` was falsy, otherwise yields `b`.
+/// Used by masgn to decide whether the rhs is optional; see
+/// [`partition_truthy`] for why conditional logic does not use it.
 /// Recurses through nested `Optional`/`Union` layers for the same reason
 /// as [`partition_truthy`] — see its doc comment.
 pub fn partition_falsy(ty: Ty, types: &TypeTable) -> Option<Ty> {
@@ -1709,6 +1716,87 @@ pub fn partition_falsy(ty: Ty, types: &TypeTable) -> Option<Ty> {
     }
 }
 
+/// Split a type into its `(truthy, falsy)` sides for conditional logic.
+/// Port of Steep's `Factory#partition_union` (`ast/types/factory.rb`),
+/// which backs `&&` / `||` value types and predicate narrowing.
+///
+/// Unlike [`partition_truthy`] / [`partition_falsy`] (the masgn split,
+/// mirroring Steep's `partition_flatten_types` with a nil/false
+/// predicate), a type whose truthiness is unknown — `untyped`, `bool`,
+/// `top` — lands on *both* sides unchanged, and aliases are unfolded
+/// through `expand_alias` at every level so a nilable alias body
+/// (`type oi = Integer?`) still contributes its `nil`. An alias that
+/// does not unfold, or that re-appears inside its own body (`type t =
+/// Integer | t` — rbs's validator rejects it, crema ingests it
+/// unvalidated), is kept whole on both sides instead of recursing.
+///
+/// `Void` and `Bottom` deliberately keep the masgn split's behavior
+/// (truthy only) instead of Steep's `[nil, nil]`: an empty partition
+/// makes the `&&` / `||` caller fold the expression to `Bottom`, which
+/// would cut off every statement after a `void`-typed operand.
+///
+/// `expand_alias` is a parameter (not a `ConsultationView`) so this stays
+/// usable from `TypeTable`-only unit tests; checker callers go through
+/// `narrowing::partition_union`.
+pub fn partition_union_with(
+    ty: Ty,
+    types: &TypeTable,
+    expand_alias: &dyn Fn(Ty) -> Ty,
+) -> (Option<Ty>, Option<Ty>) {
+    struct Sides<'a> {
+        types: &'a TypeTable,
+        expand_alias: &'a dyn Fn(Ty) -> Ty,
+        // Aliases being unfolded on the current path. `expand_alias` gives
+        // up on an alias-to-alias cycle after a fixed number of hops and
+        // may return another alias of the cycle, so re-entry is still
+        // possible (union-level cycles are closed by `expand_type_alias`).
+        unfolding: Vec<Ty>,
+        truthy: Vec<Ty>,
+        falsy: Vec<Ty>,
+    }
+    fn collect(ty: Ty, s: &mut Sides) {
+        match s.types.resolve(ty) {
+            Type::Alias { .. } => {
+                let unfolded = (s.expand_alias)(ty);
+                if unfolded == ty || s.unfolding.contains(&ty) {
+                    s.truthy.push(ty);
+                    s.falsy.push(ty);
+                } else {
+                    s.unfolding.push(ty);
+                    collect(unfolded, s);
+                    s.unfolding.pop();
+                }
+            }
+            Type::Optional(inner) => {
+                s.falsy.push(Ty::NIL);
+                collect(*inner, s);
+            }
+            Type::Nil => s.falsy.push(Ty::NIL),
+            Type::Literal(Literal::Bool(false)) => s.falsy.push(ty),
+            Type::Union(members) => {
+                for &m in members.iter() {
+                    collect(m, s);
+                }
+            }
+            Type::Untyped | Type::Bool | Type::Top => {
+                s.truthy.push(ty);
+                s.falsy.push(ty);
+            }
+            _ => s.truthy.push(ty),
+        }
+    }
+    let mut sides = Sides {
+        types,
+        expand_alias,
+        unfolding: Vec::new(),
+        truthy: Vec::new(),
+        falsy: Vec::new(),
+    };
+    collect(ty, &mut sides);
+    let build = |side: Vec<Ty>| (!side.is_empty()).then(|| union_of_many(&side, types));
+    (build(sides.truthy), build(sides.falsy))
+}
+
 /// Build a normalized union of two types.
 ///
 /// Pipeline (mirrors `Steep::AST::Types::Union.build` in
@@ -1719,8 +1807,9 @@ pub fn partition_falsy(ty: Ty, types: &TypeTable) -> Option<Ty> {
 /// 3. absorb `Top` — `Top | T = Top`
 /// 4. drop `Bottom` (union identity element)
 /// 5. dedupe by intern id
-/// 6. sort by intern id so `union_of(a, b)` and `union_of(b, a)` collapse
-///    to the same `Ty` at the intern table
+/// 6. sort by [`cmp_by_content`] so `union_of(a, b)` and `union_of(b, a)`
+///    collapse to the same `Ty` at the intern table, and the member order
+///    does not depend on intern order
 /// 7. collapse: 0 → `Bottom`, 1 → the member, n → `Type::Union`
 ///
 /// Two deliberate divergences from Steep:
@@ -1731,17 +1820,22 @@ pub fn partition_falsy(ty: Ty, types: &TypeTable) -> Option<Ty> {
 ///   degrades to `untyped`. This keeps the gradual-typing fallback
 ///   target stable across refactors and across operand reordering.
 /// - **Member sort**. Steep / rbs preserve insertion order (visible in
-///   `to_s`); crema sorts by intern id so commutativity holds at the
+///   `to_s`); crema sorts by type content so commutativity holds at the
 ///   intern table. Diagnostic display order will not match Steep's, but
 ///   `union_of(a, b)` and `union_of(b, a)` reuse the same intern slot.
+///   Sorting by intern id would also be commutative, but the id depends
+///   on which file was checked first, and consumers that pick the first
+///   member (`first_missing` on a union receiver) or the last member
+///   (intersection method lookup) would then report different members
+///   across runs. Which member comes first is not specified — only that
+///   it depends on content alone.
 ///   The `Type::Union` / `Type::Intersection` display then re-sorts
-///   members by rendered string so the same union renders identically
-///   across intern orders (cold fresh build vs warm a-snapshot decode
-///   produce different intern sequences). This canonicalization applies
-///   to every `Type::Union` display path — including source-declared
-///   unions constructed via `intern(Type::Union(..))` in
-///   `type_builder` / `substitution` / `type_param` that would otherwise
-///   preserve the RBS-source member order. The trade-off is intentional:
+///   members by rendered string, because unions interned directly with
+///   `intern(Type::Union(..))` keep their construction order. This
+///   canonicalization applies to every `Type::Union` display path —
+///   including source-declared unions constructed in `type_builder` /
+///   `substitution` / `type_param` that would otherwise preserve the
+///   RBS-source member order. The trade-off is intentional:
 ///   a single canonical rendering per union set is more valuable for AI
 ///   consumers than mirroring the surface-syntax member order across
 ///   both source-declared and inferred unions.
@@ -1798,7 +1892,7 @@ pub fn intersection_of(a: Ty, b: Ty, types: &TypeTable) -> Ty {
     members.retain(|&t| t != Ty::TOP);
     let mut seen: FxHashSet<Ty> = FxHashSet::default();
     members.retain(|t| seen.insert(*t));
-    members.sort();
+    members.sort_by(|&x, &y| cmp_by_content(x, y, types));
     match members.len() {
         0 => Ty::TOP,
         1 => members[0],
@@ -1829,11 +1923,14 @@ fn normalize_union_members(mut members: Vec<Ty>, types: &TypeTable) -> Ty {
     members.retain(|&t| t != Ty::BOTTOM);
     let mut seen: FxHashSet<Ty> = FxHashSet::default();
     members.retain(|t| seen.insert(*t));
-    members.sort();
+    members.sort_by(|&x, &y| cmp_by_content(x, y, types));
     match members.len() {
         0 => Ty::BOTTOM,
         1 => members[0],
         _ => types.intern(Type::Union(members)),
     }
 }
+
+mod content_order;
+pub use content_order::cmp_by_content;
 

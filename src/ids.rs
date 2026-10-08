@@ -127,8 +127,18 @@ impl<T> std::fmt::Debug for Id<T> {
 // any process, the property the G-snapshot decode path already relies on
 // (`Symbol::from_raw_id`). Manual impls for the same reason the derives
 // above are manual: no bounds on `T`.
-impl<T> serde::Serialize for Id<T> {
+// The ingest cache additionally needs to know which symbols / type
+// names a payload references (their strings travel with the record);
+// its codec scope is told about every id serialized while it is active
+// and is a no-op otherwise.
+impl<T: 'static> serde::Serialize for Id<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let tag = std::any::TypeId::of::<T>();
+        if tag == std::any::TypeId::of::<SymbolTag>() {
+            crate::ingest_cache::encoding_symbol(self.raw.get());
+        } else if tag == std::any::TypeId::of::<TypeNameTag>() {
+            crate::ingest_cache::encoding_type_name(self.raw.get());
+        }
         serializer.serialize_u64(self.raw.get())
     }
 }

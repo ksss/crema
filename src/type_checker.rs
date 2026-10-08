@@ -11,6 +11,7 @@ mod visitor;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ruby_prism::Visit;
 
@@ -21,9 +22,13 @@ use crate::definition_builder::{ConsultationLog, ConsultationView, DefinitionBui
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::inline_parser::CommentAssociation;
 use crate::name::NameTable;
-use crate::pure_call_env::PureKey;
+use crate::pure_call_env::{PureKey, PureKeyTable};
 use crate::type_name::TypeName;
 use crate::types::{FunctionType, MethodType, Ty};
+
+/// Hidden lvar name an anonymous `**` parameter is bound under. Not a legal
+/// Ruby identifier, so it cannot collide with a user variable.
+const ANON_KWREST_LVAR: &str = "**";
 
 /// Mirrors Steep's `SPECIAL_LVAR_NAMES = Set[:_, :__any__, :__skip__]`
 /// (`lib/steep/type_construction.rb:40`). Writes to these names produce
@@ -115,14 +120,14 @@ struct SplatTail {
 #[derive(Debug, Clone)]
 struct MethodTarget {
     method_name: String,
-    method_def: Method,
+    method_def: Arc<Method>,
 }
 
 /// One resolved component of a `Type::Union` receiver. Carries everything
 /// the return-type path needs to re-run inference for that member.
 #[derive(Debug, Clone)]
 pub(super) struct UnionComponent {
-    method_def: Method,
+    method_def: Arc<Method>,
     bindings: FxHashMap<crate::type_param::TypeVarKey, Ty>,
     /// The union member type, used to build the `self`/`instance`/`class`
     /// substitution for this component's return type.
@@ -133,18 +138,10 @@ pub(super) struct UnionComponent {
 enum CallTarget {
     Method {
         method_name: String,
-        /// Class of the receiver this call dispatches against. The
-        /// CallNode path sets this to the resolved receiver class; the
-        /// SuperNode synthetic-target path (calls.rs:check_super_node)
-        /// sets it to the caller's own self class — sufficient for the
-        /// only current consumer (`verbose_log_call_resolved`), but read
-        /// with care from new consumers because the super case doesn't
-        /// carry the super-target's defining class.
-        receiver_class: TypeName,
-        method_def: Method,
+        method_def: Arc<Method>,
         /// Pre-built `{type_param -> concrete_ty}` bindings from walking the
         /// ancestor chain. Needed because the method may have been declared on
-        /// a parent class whose type params differ from `receiver_class`, as
+        /// a parent class whose type params differ from the receiver's, as
         /// in `class Child < Parent[String]`.
         bindings: FxHashMap<crate::type_param::TypeVarKey, Ty>,
     },
@@ -200,27 +197,6 @@ impl CallTarget {
     }
 }
 
-/// Options for `check_source()`.
-///
-/// New options can be added without changing call sites that use `Default`.
-#[derive(Debug, Clone)]
-pub struct CheckOptions {
-    /// Print type checker decisions to stderr.
-    pub verbose: bool,
-    /// Honor inline declaration annotations. Expression assertions are
-    /// consumed independently of this flag.
-    pub inline: bool,
-}
-
-impl Default for CheckOptions {
-    fn default() -> Self {
-        CheckOptions {
-            verbose: false,
-            inline: true,
-        }
-    }
-}
-
 /// Walks a Prism AST and emits type diagnostics.
 pub struct TypeChecker<'env> {
     env: ConsultationView<'env>,
@@ -232,7 +208,6 @@ pub struct TypeChecker<'env> {
     /// the source on every Prism node.
     line_index: LineIndex,
     diagnostics: RefCell<Vec<Diagnostic>>,
-    options: CheckOptions,
     /// Inline comment index for trailing `#: T` lookup. Built once per source
     /// in `check_source` and shared for the whole walk.
     comments: CommentAssociation,
@@ -257,6 +232,25 @@ pub struct TypeChecker<'env> {
     /// `synthetic_method_context_targets` — otherwise every target's walk
     /// would re-check the def for every *other* target (N×(N−1)).
     concern_block_target_walk: bool,
+    /// The innermost `concerning :Topic do` block the walk is inside,
+    /// as `(lexical owner, <owner>::<Topic>)`. The checker keeps the
+    /// class stack at the lexical owner there (a `def` directly under
+    /// `concerning` is checked in the owner's instance context), but the
+    /// infusion pipeline files the block's `included do` / `prepended do`
+    /// under the synthesized module, so `walk_concern_block_body` reads
+    /// the module name from here. The owner is kept so a `class` nested
+    /// inside the block (which pushes a different current class) falls
+    /// back to the ordinary lookup. Set by `check_call_in_frame` around
+    /// the block walk of a `concerning` call.
+    concerning_module: Option<(TypeName, TypeName)>,
+    /// Expected return type of the innermost block / lambda a `next`
+    /// would exit (Steep `BreakContext#next_type`): the hint a `next`
+    /// value is typed under. Set around a block body walk
+    /// (`walk_block`) and a hinted lambda body; cleared inside loops
+    /// (`while` / `until` / `for`, Steep `next_type: nil`) and inside
+    /// blocks / lambdas with no expected return type, so an outer
+    /// block's type never reaches a `next` that exits something else.
+    next_hint: Option<Ty>,
 
     /// Sibling of `suppress_method_body_last_assertion` for the
     /// parens-routed dup. Named after the prototypical trigger (an
@@ -286,14 +280,24 @@ pub struct TypeChecker<'env> {
     /// `&mut self`). Lifetime is scoped by `with_overlay`; no persistence.
     overlay_stack: std::cell::RefCell<Vec<FxHashMap<crate::name::Name, Ty>>>,
     pure_overlay_stack: std::cell::RefCell<Vec<FxHashMap<PureKey, Ty>>>,
-    /// `[self: T]` of hinted lambda literals during the read-only walk
-    /// (see `with_lambda_self`); innermost last.
-    lambda_self_stack: std::cell::RefCell<Vec<Ty>>,
+    /// `[self: T]` of hinted lambda literals and of blocks whose body is
+    /// inferred read-only (see `with_readonly_self`); innermost last.
+    readonly_self_stack: std::cell::RefCell<Vec<Ty>>,
+    /// `lexical_self_type` results for this file, keyed by the enclosing
+    /// class (`None` at top-level) and whether `self` is the singleton
+    /// (class body / `def self.m`). Lives as long as the checker, i.e. one
+    /// file against one env, so the first computation per key still leaves
+    /// its declaration probes in this file's `ConsultationLog`.
+    lexical_self_memo: std::cell::RefCell<FxHashMap<(Option<TypeName>, bool), Ty>>,
     /// Interner for session-local names: local variable names, block/keyword
     /// parameter names added during type checking. Kept separate from
     /// `env.names()` so the frozen environment's `NameTable` can eventually
     /// become a `RodeoReader`.
     checker_names: NameTable,
+    /// Hash-consing table for this file's pure-call keys (see
+    /// [`PureKeyTable`]); every key in `ctx`'s pure-call cache, the pure
+    /// overlays and the cond envs was interned here.
+    pure_keys: PureKeyTable,
     /// Recursion guard for `unify_into_bindings`. Most arms only recurse
     /// into the already-finite structure of the same `Ty` (bounded by the
     /// type expression's own size), but two paths reach for a *fresh* `Ty`
@@ -312,8 +316,7 @@ pub struct TypeChecker<'env> {
     unify_depth_cap_hit: std::cell::Cell<bool>,
     /// `Some` only under `check_source_extract`: the site sink for
     /// `crema extract`. `None` (every `crema check` run) makes the
-    /// record hooks a single branch, mirroring `options.verbose`'s cost
-    /// profile on the hot path.
+    /// record hooks a single branch on the hot path.
     extract: Option<crate::extract::ExtractSitesCollector>,
     /// Extract-mode per-call state flags, keyed by the call node's
     /// byte span and consumed at the walk-entry record points. The
@@ -351,13 +354,39 @@ pub struct TypeChecker<'env> {
     /// better null). Receiver and block-tail deposits bypass this gate:
     /// their deposit sites are already exact.
     extract_carry_armed: std::cell::Cell<bool>,
+    /// The calls the check is in the middle of, innermost last: each
+    /// frame holds the receiver type the walk computed (see
+    /// `checked_receiver_type`) and the argument values the walk typed
+    /// (see `infer_argument`).
+    call_frames: RefCell<Vec<CallFrame>>,
+}
+
+/// A call `check_call` is in the middle of. Pushed before the call's
+/// arguments are walked, popped after the call's own diagnostics and —
+/// on the value paths — its return type have been produced, so a body
+/// checked again with another self (concern `included` blocks) never
+/// sees a value from the previous pass.
+struct CallFrame {
+    span: (usize, usize),
+    receiver_ty: Ty,
+    /// Call arguments the frame's walk typed, in walk order. Keyed by
+    /// the argument's span *and* the hint it was typed under: the
+    /// collectors read a value back only when they would have inferred
+    /// the same node under the same hint.
+    arguments: Vec<ArgumentValue>,
+}
+
+struct ArgumentValue {
+    span: (u32, u32),
+    hint: Option<Ty>,
+    ty: Ty,
 }
 
 /// Pending `state` classification for one extract-mode call site; the
 /// JSON vocabulary lives in [`crate::extract::method_call_state`].
 /// Absence of a flag means `typed` for resolved sites and "not
-/// recorded" for no-target sites (the silent boundary: bot receivers,
-/// classifier-gated NoMethod).
+/// recorded" for no-target sites (the silent boundary: narrowed-to-bot
+/// local receivers, classifier-gated NoMethod).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExtractCallState {
     Error,
@@ -372,7 +401,6 @@ impl<'env> TypeChecker<'env> {
         source: Vec<u8>,
         line_index: LineIndex,
         comments: CommentAssociation,
-        options: CheckOptions,
     ) -> Self {
         TypeChecker {
             env,
@@ -384,19 +412,23 @@ impl<'env> TypeChecker<'env> {
             comments,
             suppress_method_body_last_assertion: false,
             concern_block_target_walk: false,
+            concerning_module: None,
+            next_hint: None,
 
             suppress_parens_routed_last_assertion: false,
-            options,
             overlay_stack: RefCell::new(Vec::new()),
             pure_overlay_stack: RefCell::new(Vec::new()),
-            lambda_self_stack: RefCell::new(Vec::new()),
+            readonly_self_stack: RefCell::new(Vec::new()),
+            lexical_self_memo: RefCell::new(FxHashMap::default()),
             checker_names: NameTable::new(),
+            pure_keys: PureKeyTable::new(),
             unify_depth: std::cell::Cell::new(0),
             unify_depth_cap_hit: std::cell::Cell::new(false),
             extract: None,
             extract_call_states: RefCell::new(FxHashMap::default()),
             extract_carried_types: RefCell::new(FxHashMap::default()),
             extract_carry_armed: std::cell::Cell::new(false),
+            call_frames: RefCell::new(Vec::new()),
         }
     }
 
@@ -722,7 +754,7 @@ impl<'env> TypeChecker<'env> {
     /// this span: `Untyped` (receiver untyped, resolution never
     /// attempted) or `NoMethodError` (receiver resolved, the NoMethod
     /// diagnostic actually fired). No flag means the site stayed
-    /// silent (bot receiver, classifier-gated NoMethod) and is not
+    /// silent (narrowed-to-bot local, classifier-gated NoMethod) and is not
     /// recorded — the v1 silent boundary is preserved.
     fn record_extract_call_no_target<'pr>(
         &self,
@@ -852,7 +884,7 @@ impl<'env> TypeChecker<'env> {
                     lvar_tokens.push(self.ctx.enter_narrow(*name, ty));
                 }
                 Scrutinee::Pure(key) => {
-                    pure_tokens.push(self.ctx.enter_pure_narrow(key.clone(), ty));
+                    pure_tokens.push(self.ctx.enter_pure_narrow(*key, ty));
                 }
             }
         }
@@ -891,7 +923,7 @@ impl<'env> TypeChecker<'env> {
         for (scrutinee, ty) in narrowing.iter_lvars_then_pures() {
             match scrutinee {
                 Scrutinee::Lvar(name) => self.ctx.set_local_variable(*name, ty),
-                Scrutinee::Pure(key) => self.ctx.pure_call_env_mut().set(key.clone(), ty),
+                Scrutinee::Pure(key) => self.ctx.pure_call_env_mut().set(*key, ty),
             }
         }
         let r = f(self);
@@ -963,7 +995,7 @@ impl<'env> TypeChecker<'env> {
         let class = self
             .ctx
             .current_class_typename()
-            .map(|name| self.env.names().resolve(name));
+            .map(|name| self.env.names().display_type_name(*name));
         match (class, self.ctx.method_name()) {
             (Some(class), Some(method)) => {
                 let sep = if self.ctx.is_singleton_method() {
@@ -1010,6 +1042,10 @@ impl<'env> TypeChecker<'env> {
     /// interning local variable / block / keyword parameter names.
     pub(super) fn checker_names(&self) -> &NameTable {
         &self.checker_names
+    }
+
+    pub(super) fn pure_keys(&self) -> &PureKeyTable {
+        &self.pure_keys
     }
 
     /// Format a type as a human-readable string.
@@ -1175,13 +1211,6 @@ impl<'env> TypeChecker<'env> {
     pub(super) fn display_method_type(&self, method_type: &MethodType) -> String {
         display_method_type(method_type, self.env.types(), self.env.names())
     }
-
-    /// Write a verbose log line to stderr when verbose mode is enabled.
-    pub(super) fn verbose_log(&self, msg: impl std::fmt::Display) {
-        if self.options.verbose {
-            eprintln!("[verbose] {}", msg);
-        }
-    }
 }
 
 /// Free-function core of [`TypeChecker::display_method_type`], split
@@ -1263,22 +1292,21 @@ pub fn check_source(
     file: PathBuf,
     source: &[u8],
     parse_result: &ruby_prism::ParseResult<'_>,
-    options: CheckOptions,
 ) -> Vec<Diagnostic> {
-    check_source_with_log(env, file, source, parse_result, options, None)
+    check_source_with_log(env, file, source, parse_result, None)
 }
 
 /// Like [`check_source`], but routes checker reads through `log` when
 /// given — the per-file consultation collection entry point
 /// (ADR-0032 Decision 2, axis 3). `log: None` reproduces `check_source`
-/// exactly (same discard-only view), so this is the only entry point
-/// `cache_io`'s incremental recording needs to call.
+/// exactly (same discard-only view). `crema extract` records through
+/// [`check_source_extract`] instead; this entry point serves the
+/// recording tests.
 pub fn check_source_with_log(
     env: &DefinitionBuilder,
     file: PathBuf,
     source: &[u8],
     parse_result: &ruby_prism::ParseResult<'_>,
-    options: CheckOptions,
     log: Option<&ConsultationLog>,
 ) -> Vec<Diagnostic> {
     if parse_result.errors().next().is_some() {
@@ -1289,7 +1317,7 @@ pub fn check_source_with_log(
     let line_index = LineIndex::from_source(source);
     let comments = CommentAssociation::from_source(source, &line_index, parse_result);
     let view = ConsultationView::new(env, log);
-    let mut checker = TypeChecker::new(view, file, source.to_vec(), line_index, comments, options);
+    let mut checker = TypeChecker::new(view, file, source.to_vec(), line_index, comments);
     checker.visit(&root);
     checker.diagnostics()
 }
@@ -1306,7 +1334,6 @@ pub fn check_source_extract(
     file: PathBuf,
     source: &[u8],
     parse_result: &ruby_prism::ParseResult<'_>,
-    options: CheckOptions,
     log: Option<&ConsultationLog>,
 ) -> (
     Vec<crate::extract::MethodCallRecord>,
@@ -1322,7 +1349,7 @@ pub fn check_source_extract(
     let line_index = LineIndex::from_source(source);
     let comments = CommentAssociation::from_source(source, &line_index, parse_result);
     let view = ConsultationView::new(env, log);
-    let mut checker = TypeChecker::new(view, file, source.to_vec(), line_index, comments, options);
+    let mut checker = TypeChecker::new(view, file, source.to_vec(), line_index, comments);
     checker.extract = Some(crate::extract::ExtractSitesCollector::new());
     checker.visit(&root);
     checker

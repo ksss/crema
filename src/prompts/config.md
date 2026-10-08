@@ -6,7 +6,9 @@ Sniff the project yourself, compare the current file with these keys, and ask th
 
 `check` — `Array[String]`, default `none (required)`. Example: `check = ["app", "lib"]`
 
-Declares the directories and `.rb` files that make up the project's type-check scope — the same "project source" role `sig` plays for signatures. Directories are expanded recursively for `.rb` files; entries resolve relative to the directory containing `crema.toml` (cwd-relative when `--config <PATH>` is used instead). CLI positional arguments do not add files to this scope — they narrow it to a subset (a file argument must already be inside `check`; a directory argument is expanded and intersected with it). Without `--config`, crema discovers `crema.toml` via walk-up search from the current directory toward the repository boundary; `crema check` exits `2` with a copy-pasteable suggestion when no `crema.toml` is found or `check` is absent, while other subcommands (e.g. `crema doc diagnostic`) still run with sensible defaults when no config file is found.
+The directories and `.rb` files that make up the type-check scope. Directories are expanded recursively; entries resolve relative to the directory containing `crema.toml` (or the file passed with `--config <PATH>` — the same rule applies to every path inside it). CLI positional arguments only narrow this scope: a file argument must already be inside `check`, a directory argument is intersected with it.
+
+`crema.toml` is found by walk-up search from the current directory toward the repository boundary. `crema check` exits `2` with a copy-pasteable suggestion when the file or `check` is missing; other subcommands (e.g. `crema doc diagnostic`) run with defaults.
 
 Propose adding `check` for any project that doesn't have one yet.
 
@@ -14,7 +16,7 @@ Propose adding `check` for any project that doesn't have one yet.
 
 `sig` — `Array[String]`, default `[]`. Example: `sig = ["sig"]`
 
-RBS signature directories or files crema loads before checking Ruby code.
+RBS signature directories or files loaded before checking Ruby code.
 
 Propose it when the project keeps app-specific or generated `.rbs` files outside the command-line `--sig` flow.
 
@@ -22,15 +24,17 @@ Propose it when the project keeps app-specific or generated `.rbs` files outside
 
 `ignore` — `Array[String]`, default `[]`. Example: `ignore = ["db/schema.rb", "vendor"]`
 
-Glob patterns subtracted from the `.rb` files `check` walks, matched against paths relative to the directory holding `crema.toml`. An entry without glob metacharacters also matches as a plain path prefix, so `"vendor"` drops that whole directory. This is a set subtraction, not a diagnostic filter: an excluded file supplies no declarations at all, so its classes and its inline annotations are invisible to every other file. Files leave the scope quietly, but naming one as a positional argument to `crema check` exits `2` saying so rather than silently checking nothing.
+Glob patterns subtracted from the `.rb` files `check` walks, relative to the directory holding `crema.toml`. An entry without glob metacharacters also matches as a path prefix, so `"vendor"` drops the whole directory.
 
-Propose it when `check` has to name a directory that also holds generated or vendored `.rb` files the project does not want in scope.
+This is a scope subtraction, not a diagnostic filter: an excluded file supplies no declarations, so its classes and inline annotations are invisible to every other file. Naming an excluded file as a positional argument to `crema check` exits `2`.
+
+Propose it when `check` names a directory that also holds generated or vendored `.rb` files.
 
 ## sig_ignore
 
 `sig_ignore` — `Array[String]`, default `[]`. Example: `sig_ignore = ["sig/generated/**/*.rbs"]`
 
-The same subtraction on the signature side: patterns are removed from the final signature file set. It applies to every entry regardless of origin — `sig`, `--sig`, or `--add-sig` — and each dropped file is reported as a warning, so an explicit `--sig <file>` that a pattern swallows cannot be mistaken for a typo. The matching basis does inherit the asymmetry of those origins: `sig` entries are matched relative to the project root, `--sig` and `--add-sig` entries relative to the current directory.
+The same subtraction for signatures. Patterns apply to every entry from `sig`, `--sig` and `--add-sig`, and each dropped file is reported as a warning. `sig` entries match relative to the project root; `--sig` and `--add-sig` entries relative to the current directory.
 
 Propose it when the signature tree carries generated or stale `.rbs` files that should not load.
 
@@ -40,105 +44,139 @@ Propose it when the signature tree carries generated or stale `.rbs` files that 
 
 Bundled or gem-provided RBS libraries to load by name, including manifest dependencies.
 
-Propose it when checked code calls APIs from stdlib or gems and those RBS libraries should be available project-wide.
+Propose it when checked code calls stdlib or gem APIs whose RBS should be available project-wide.
 
 ## inline
 
 `inline` — `Boolean`, default `true`. Example: `inline = false`
 
-Controls whether `# @rbs` inline annotations in Ruby files participate in type checking.
+Whether `# @rbs` inline annotations in Ruby files participate in type checking.
 
-Propose `false` only when the project wants sig-only checking and accepts that inline annotation syntax errors will be hidden from normal checks.
+Propose `false` only for sig-only checking; inline annotation syntax errors are then hidden from normal checks.
 
 ## incremental
 
-`incremental` — `Boolean` or the string `"verify"`, default `false`. Example: `incremental = true`
+`incremental` — `any value`, ignored. Example: none — remove the key
 
-Opts into the incremental check cache: `crema check` records what each file read from the type environment under `.crema/cache/`, and the next run rechecks only the files a change can reach, replaying stored diagnostics for the rest. The output stays identical to a full check — the cache decides which files to skip, never what the checker sees — and anything that could change the environment (crema version, lockfile, `crema.toml`, sig paths), or a cache it cannot read, falls back to a full check. It never activates for `crema check -e`, and a run narrowed by path arguments reads the cache without writing it back.
-
-Whether `true` pays off is a question of repetition before size. Only the checking of Ruby files is skipped — signatures load and the environment is rebuilt every run — so the saving lands where one working tree is checked over and over (an edit-check loop, a watch loop, a pre-commit hook), while a one-shot CI run has no cache to begin with. On a small scope a full check already sits near that floor, so the win narrows, but it does not invert.
-
-`"verify"` does everything `true` does and additionally rechecks each replayed file behind the scenes, comparing it against the stored result. A mismatch means the cache recorded too little — the one failure that can break the guarantee above, and one that shows up as a *missing* error rather than a crash. It reports on stderr and fails the run with exit 1 even when the check is clean. Slower than a full check by construction, it is a watch to run deliberately, not a mode to leave on.
-
-Propose `incremental = true` for a project large enough that checking is the slow part and checked repeatedly from the same tree, and add `.crema/` to `.gitignore` alongside it. Propose `"verify"` only for a deliberate correctness watch.
+Has no effect. While the key is present, every run prints a warning on stderr; the next release rejects it as an unknown key. Propose deleting the line; `.crema/cache/incremental_v1.bin`, if present, is unused and can be deleted with it.
 
 ## did_you_mean
 
 `did_you_mean` — `Boolean`, default `false`. Example: `did_you_mean = true`
 
-Fills the `did_you_mean` field of `Ruby::UnknownConstant` with spelling suggestions drawn from the constants in scope. Off, the field is absent from the line, as it is whenever there are no suggestions. The suggestion is a spell-check of every constant visible at the failure site, repeated per diagnostic, so on a large tree with many unresolved constants it can cost as much as the type check itself.
+Fills the `did_you_mean` field of `Ruby::UnknownConstant` with spelling suggestions from the constants in scope; off, the field is absent. The spell-check runs per diagnostic, so on a large tree with many unresolved constants it can cost as much as the type check itself.
 
-Propose `true` only when unresolved-constant typos are a recurring failure mode and the extra time per check is acceptable.
+Propose `true` only when unresolved-constant typos recur and the extra time is acceptable.
 
 ## diagnostic
 
 `diagnostic` — `Table`, default `{ preset = "default" }`. Example: `diagnostic = { preset = "default" }`
 
-Configures diagnostic severities. `preset` selects a baked-in table: `default` keeps crema's built-in severities, `all_error` promotes normal configurable diagnostics to `error` (dev-only diagnostics stay ignored unless named explicitly), and `all_ignore` demotes every configurable diagnostic to `ignore`. Per-code overrides in the same table accept `error`, `warning`, `information`, `hint`, or `ignore`, and win over the preset for configurable codes; always-error diagnostics such as `Ruby::SyntaxError` cannot be overridden.
+`preset` selects a baked-in severity table:
 
-Propose `preset = "default"` unless the user explicitly wants a migration policy such as strict CI (`all_error`) or broad temporary suppression (`all_ignore`).
+- `default` — crema's built-in severities.
+- `all_error` — promotes normal configurable diagnostics to `error` (dev-only diagnostics stay ignored unless named explicitly).
+- `all_ignore` — demotes every configurable diagnostic to `ignore`.
+
+Per-code overrides in the same table (e.g. `"Ruby::NoMethod" = "warning"`) win over the preset. Accepted severities:
+
+- `error`
+- `warning`
+- `information`
+- `hint`
+- `ignore`
+
+Always-error diagnostics such as `Ruby::SyntaxError` cannot be overridden.
+
+Propose `preset = "default"` unless the user wants a migration policy such as strict CI (`all_error`) or broad temporary suppression (`all_ignore`).
+
+## baseline
+
+`baseline` — `Boolean` or a path string, default `false`. Example: `baseline = true`
+
+Grandfathers existing diagnostics, like `rubocop_todo.yml`. Accepted values:
+
+- `false` — disabled; `crema check` reports everything.
+- `true` — use `crema_baseline.jsonl` next to `crema.toml`.
+- a path string — use that file, relative to the `crema.toml` directory.
+
+`crema check --update-baseline` writes one row per current diagnostic: `file`, `code` and a `fingerprint` that survives line shifts and edits elsewhere in the file (the rows `crema check --tamp` prints). Every later `crema check` drops each diagnostic matching a row, so only new diagnostics are printed and decide the exit code. A row listed twice absorbs two diagnostics. Rows that matched nothing are counted in one stderr line suggesting `--update-baseline`; they never fail the run. `--no-baseline` reports everything for one run.
+
+Once the key is on, the file must exist (`crema check` exits `2` until `--update-baseline` creates it, even if empty), and `file` is relative to the `crema.toml` directory, so the same rows match whichever subdirectory crema runs from. Severity `ignore` in `diagnostic` removes a code before the baseline sees it, so those codes never enter the file.
+
+Propose `baseline = true` for an existing project adopting crema with more diagnostics than it will fix at once, and commit the file. Refresh it with `--update-baseline` after each cleanup rather than editing rows by hand.
 
 ## collection_config
 
 `collection_config` — `String`, default `none (auto-discovered)`. Example: `collection_config = "rbs_collection.yaml"`
 
-Points crema at an explicit `rbs_collection.yaml`; the lockfile path is derived from that config path. By default, crema uses automatic walk-up discovery for `rbs_collection.yaml`.
+Explicit path to an `rbs_collection.yaml`; the lockfile path is derived from it. Without it, crema walks up from the project root (the `crema.toml` directory) to discover the file, stopping at `.git`, so every subdirectory of the project reads the same collection.
 
-Propose this key when the project uses rbs collection but the file automatic discovery would choose is not the intended one.
+Propose it when the project uses rbs collection and auto-discovery would pick the wrong file.
 
 ## infusion
 
 `infusion` — `Table`, default `absent`. Example: `infusion = { rails = { enabled = true } }`
 
-Synthesizes declarations for methods and constants that metaprogramming or static data files would produce at runtime, in memory, without writing any RBS. Each sub-table below is an independent opt-in and the whole feature is inert while `[infusion]` is absent. Unknown names anywhere under `[infusion]` are a parse error rather than a silent no-op, and a value crema cannot act on (an empty `decorator_suffix`, an empty inflection entry) is rejected at config load even when the provider it belongs to is disabled.
+Synthesizes, in memory and without writing RBS, the declarations that metaprogramming or static data files would produce at runtime. Each sub-table below is an independent opt-in; the feature is inert while `[infusion]` is absent. Unknown names under `[infusion]` are a parse error, and a value crema cannot act on (an empty `decorator_suffix`, an empty inflection entry) is rejected at config load even when its provider is disabled.
 
 ### [infusion.rails]
 
-- `enabled` — `Boolean`, default `false`. Turns on the ActiveSupport, ActiveModel, and ActiveRecord rule families together, plus the zeitwerk-style constant synthesis that runs after them. Also synthesizes each ActionMailer action (an instance `def` on an `ActionMailer::Base` descendant) as a class method returning `ActionMailer::MessageDelivery`, the way `FooMailer.hello(user).deliver_later` calls it. The unit of choice is the framework, not the individual DSL rule.
-- `inflections` — `Table`, default `absent`. Holds locale sub-tables; only `en` exists (see below).
+- `enabled` — `Boolean`, default `false`. Turns on the ActiveSupport, ActiveModel and ActiveRecord rule families together, plus zeitwerk-style constant synthesis. Also synthesizes each ActionMailer action (an instance `def` on an `ActionMailer::Base` descendant) as a class method returning `ActionMailer::MessageDelivery`. The unit of choice is the framework, not the individual rule.
+- `inflections` — `Table`, default `absent`. Locale sub-tables; only `en` exists.
 
 Propose this table when the project uses Rails.
 
 ### [infusion.rails.inflections.en]
 
-Mirrors the `inflect.` directives in `config/initializers/inflections.rb`, which crema does not parse itself — transcribe them by hand.
+Mirrors the `inflect.` directives in `config/initializers/inflections.rb`, which crema does not parse — transcribe them by hand.
 
-- `irregular` — `Array[[String, String]]`, default `[]`. Example: `irregular = [["person", "people"]]`. Each pair is `[singular, plural]` and overrides the default inflection for that word, the way `inflect.irregular` does. Neither string may be empty.
-- `acronym` — `Array[String]`, default `[]`. Example: `acronym = ["API", "HTTP"]`. Mirrors `inflect.acronym`, reshaping the camelize result for table names containing these words. Entries may not be empty strings.
+- `irregular` — `Array[[String, String]]`, default `[]`. Example: `irregular = [["person", "people"]]`. `[singular, plural]` pairs, like `inflect.irregular`. Neither string may be empty.
+- `acronym` — `Array[String]`, default `[]`. Example: `acronym = ["API", "HTTP"]`. Like `inflect.acronym`. Entries may not be empty.
 
-`plural` / `singular` regex pairs and `uncountable` are not supported, and any locale key other than `en` is a parse error. The table is accepted and validated even when `infusion.rails.enabled` is `false`; it simply has nothing to apply to until the ActiveRecord pipeline runs.
+`plural` / `singular` regex pairs and `uncountable` are not supported; any locale key other than `en` is a parse error. The table is validated even when `infusion.rails.enabled` is `false`, but has nothing to apply to until the ActiveRecord pipeline runs.
 
 Propose it when that initializer declares `inflect.irregular` or `inflect.acronym`.
 
 ### [infusion.config]
 
-Synthesizes a constant whose methods mirror the keys of one or more YAML files, so `Settings.database.host` type-checks against the real file.
+Synthesizes a constant whose methods mirror the keys of YAML files, so `Settings.database.host` type-checks against the real file.
 
-- `files` — `Array[String]`, default `[]`, but at least one entry is required once the table exists. Example: `files = ["config/settings.yml", "config/settings/production.yml"]`. Files merge in order with later entries winning. Each must be pure YAML — ERB or any other preprocessing fails to parse — with a mapping at the root. Duplicate keys inside one file resolve last-wins like Psych and report a warning diagnostic rather than failing.
-- `const_name` — `String`, default `"Settings"`. Example: `const_name = "Config"`. Must be a single constant name: it starts with an ASCII uppercase letter, continues with letters, digits, or `_`, and may not contain `::`.
-- `except_keys` — `Array[String]`, default `[]`. Example: `except_keys = ["defaults"]`. Drops every key of that name at any nesting depth, not just at the root. Use it for keys that are YAML anchors or scaffolding rather than settings.
+- `files` — `Array[String]`, default `[]`, at least one entry required once the table exists. Example: `files = ["config/settings.yml", "config/settings/production.yml"]`. Files merge in order, later entries winning. Each must be pure YAML (ERB fails to parse) with a mapping at the root. Duplicate keys in one file resolve last-wins like Psych and report a warning.
+- `const_name` — `String`, default `"Settings"`. Example: `const_name = "Config"`. A single constant name: an ASCII uppercase letter, then letters, digits or `_`; no `::`.
+- `except_keys` — `Array[String]`, default `[]`. Example: `except_keys = ["defaults"]`. Drops every key of that name at any depth. Use it for YAML anchors or scaffolding.
 
-Every remaining key becomes a method, so each one must read as a Ruby method name (leading letter or `_`, then letters, digits, `_`, with a trailing `?` or `!` allowed); nested mappings become interfaces. A key that cannot be a method name is a hard error, which is the intended signal that the file needs `except_keys` or a rename.
+Every remaining key becomes a method, so it must read as a Ruby method name (leading letter or `_`, then letters, digits, `_`, optional trailing `?` or `!`); nested mappings become interfaces. A key that cannot be a method name is a hard error, the signal that the file needs `except_keys` or a rename.
 
 Propose it when the project reads settings from a pure-YAML file.
 
 ### [infusion.active_decorator]
 
-Covers the [active_decorator](https://github.com/amatsuda/active_decorator) gem, whose decorator modules are written as if the decorated model's methods were their own.
+Covers the [active_decorator](https://github.com/amatsuda/active_decorator) gem, whose decorator modules are written as if the model's methods were their own.
 
-- `enabled` — `Boolean`, default `false`. When true, a module declared under `app/decorators` whose name ends with `decorator_suffix` gains the same-named model as its self type, so `UserDecorator` resolves `User`'s methods.
-- `decorator_suffix` — `String`, default `"Decorator"`. Example: `decorator_suffix = "Presenter"`. Mirrors the gem's own `ActiveDecorator.config.decorator_suffix`. An empty string is rejected: every module name ends with it, so each module would be handed itself as its model.
+- `enabled` — `Boolean`, default `false`. A module under `app/decorators` whose name ends with `decorator_suffix` gains the same-named model as its self type, so `UserDecorator` resolves `User`'s methods.
+- `decorator_suffix` — `String`, default `"Decorator"`. Example: `decorator_suffix = "Presenter"`. Mirrors `ActiveDecorator.config.decorator_suffix`. An empty string is rejected.
 
-The search directory is fixed at `app/decorators` and is not configurable — that is what keeps identically named modules from gem code out of scope. A decorator whose model is not declared anywhere is skipped silently, and an explicitly written self type is never overwritten.
+The directory is fixed at `app/decorators`. A decorator whose model is not declared is skipped silently, and an explicitly written self type is never overwritten.
 
-Propose it when the Gemfile depends on active_decorator or the project has an `app/decorators` directory, and set `decorator_suffix` to match the initializer when one changes it.
+Propose it when the Gemfile depends on active_decorator or the project has `app/decorators`; match `decorator_suffix` to the initializer.
 
 ### [infusion.paranoia]
 
-Covers the [paranoia](https://github.com/rubysherpas/paranoia) gem, whose `acts_as_paranoid` class-body call adds soft-delete methods (`restore!`, `paranoia_destroyed?`, `with_deleted`, `only_deleted`, ...) at runtime.
+Covers the [paranoia](https://github.com/rubysherpas/paranoia) gem, whose `acts_as_paranoid` adds soft-delete methods (`restore!`, `paranoia_destroyed?`, `with_deleted`, `only_deleted`, ...).
 
-- `enabled` — `Boolean`, default `false`. When true, every ActiveRecord model whose class body calls `acts_as_paranoid` gains `include Paranoia::InstanceMethods[Model]` and `extend Paranoia::ClassMethods[Model, Model::ActiveRecord_Relation]`, and its synthesized relation and collection-proxy classes gain the same `ClassMethods` include — the mixins the gem's RBS documentation says to write by hand.
+- `enabled` — `Boolean`, default `false`. Every ActiveRecord model calling `acts_as_paranoid` gains `include Paranoia::InstanceMethods[Model]` and `extend Paranoia::ClassMethods[Model, Model::ActiveRecord_Relation]`; its synthesized relation and collection-proxy classes gain the same `ClassMethods` include.
 
-Requires `[infusion.rails] enabled = true`; enabling paranoia alone is a config error, because the synthesized mixins reference the relation classes only the Rails preset declares. The `Paranoia` module types themselves are not synthesized — they come from the rbs collection (the `paranoia` gem's entry), and when they are absent the mixins quietly resolve to nothing. `acts_as_paranoid` options (`column:` and friends) do not change any signature and are not interpreted.
+Requires `[infusion.rails] enabled = true`; enabling paranoia alone is a config error. The `Paranoia` module types come from the rbs collection (the `paranoia` gem's entry); when absent, the mixins quietly resolve to nothing. `acts_as_paranoid` options such as `column:` are not interpreted.
 
 Propose it when the Gemfile depends on paranoia and models call `acts_as_paranoid`.
+
+### [infusion.sidekiq]
+
+Covers the [sidekiq](https://github.com/sidekiq/sidekiq) gem, whose `include Sidekiq::Job` wires the class-level API (`perform_async`, `sidekiq_options`, ...) onto the includer.
+
+- `enabled` — `Boolean`, default `false`. Every class whose body calls `include Sidekiq::Job` gains `include ::Sidekiq::Job::Options`, `extend ::Sidekiq::Job::Options::ClassMethods` and `extend ::Sidekiq::Job::ClassMethods`. `include Sidekiq::Worker` is covered when the collection declares `Worker` as an alias of `Job`.
+
+Independent of `[infusion.rails]`. Only classes are synthesized; a module that includes `Sidekiq::Job` is skipped, because the `extend` would land on that module's singleton, not on its includers. The `Sidekiq::Job` types come from the rbs collection (the `sidekiq` gem's entry); when absent, the original `Ruby::NoMethod` diagnostics stay.
+
+Propose it when the Gemfile depends on sidekiq and job classes include `Sidekiq::Job` (or `Sidekiq::Worker`).

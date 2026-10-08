@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::diagnostic::{DiagnosticKind, Severity};
 
 
-const CONFIG_FILE: &str = "crema.toml";
+pub const CONFIG_FILE: &str = "crema.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -62,20 +62,12 @@ pub struct Config {
     /// large trees, so it is off unless a project asks for it
     /// (ADR-0032, amended 2026-09-06).
     pub did_you_mean: Option<bool>,
-    /// Opt into the incremental check cache (ADR-0032 Decision 1,
-    /// default false). When true, `crema check` persists per-file
-    /// consulted-key sets, content hashes, the per-name fingerprint
-    /// table, and structured diagnostics under `.crema/cache/`, and
-    /// skips re-checking files no changed name can reach. Cache presence
-    /// never changes the JSONL output (bit-identical to a full check) —
-    /// it is purely an internal cost optimization. Config-file only by
-    /// design: no CLI flag (Decision 1 names crema.toml as the switch).
-    ///
-    /// `"verify"` (ADR-0032 Decision 6) additionally shadow-rechecks
-    /// every replay-classified file and reports any divergence from the
-    /// stored entry on stderr with exit 1 — the `-Z
-    /// incremental-verify-ich` sibling for watching real edit patterns.
-    pub incremental: Option<IncrementalSetting>,
+    /// Retired key (ADR-0036 Decision 2): the incremental check cache
+    /// is gone. Accepted for one release with any value so existing
+    /// crema.toml files keep loading, and answered with a deprecation
+    /// warning (never a silent no-op); the release after that drops the
+    /// field and `deny_unknown_fields` rejects it.
+    pub incremental: Option<toml::Value>,
     /// Raw `[diagnostic]` table. `preset = "..."` plus per-code
     /// overrides (`"Ruby::NoMethod" = "warning"` etc.). Validated and
     /// resolved into `DiagnosticConfig` by `resolve_with_cli`; see
@@ -99,6 +91,15 @@ pub struct Config {
     /// as ConfigError::Parse.
     #[serde(default)]
     pub infusion: Option<InfusionTable>,
+    /// Known-diagnostic baseline (rubocop_todo.yml analogue). `true`
+    /// reads/writes `crema_baseline.jsonl` next to `crema.toml`; a
+    /// string is an explicit path (relative entries absolutized
+    /// against the `crema.toml` directory during walk-up discovery,
+    /// like `sig`); `false` / absent disables the feature and leaves
+    /// `crema check` byte-identical to a build without it. Lowered to
+    /// `ResolvedConfig::baseline` by `resolve_with_cli`.
+    #[serde(default)]
+    pub baseline: Option<BaselineSetting>,
 }
 
 /// `[infusion]` table shape. Public config uses framework-level presets;
@@ -357,38 +358,22 @@ impl DiagnosticConfig {
     }
 }
 
-/// Raw `incremental` value as written in crema.toml: `true`/`false` or
-/// the mode string `"verify"`. Untagged so the boolean form stays
-/// backward compatible; the string is validated in `resolve` (unknown
-/// strings are a `ConfigError`, not a silent fallback).
+/// Raw `baseline` value as written in crema.toml: `true`/`false` or an
+/// explicit file path. Untagged so the boolean form and the path form
+/// share one key.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
-pub enum IncrementalSetting {
+pub enum BaselineSetting {
     Enabled(bool),
-    Named(String),
+    Path(PathBuf),
 }
 
-/// Resolved incremental mode. `Verify` implies everything `On` does,
-/// plus the shadow recheck of replay-classified files (ADR-0032
-/// Decision 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IncrementalMode {
-    Off,
-    On,
-    Verify,
-}
+/// Printed whenever crema.toml carries the retired `incremental` key,
+/// whatever its value (ADR-0036 Decision 2).
+pub const INCREMENTAL_RETIRED_WARNING: &str = "warning: crema.toml `incremental` no longer has any effect (incremental check was removed) and will be rejected in the next release; remove the key";
 
-impl IncrementalMode {
-    /// Whether the incremental cache machinery runs at all.
-    pub fn active(self) -> bool {
-        !matches!(self, IncrementalMode::Off)
-    }
-
-    /// Whether replay-classified files are shadow-rechecked.
-    pub fn verify(self) -> bool {
-        matches!(self, IncrementalMode::Verify)
-    }
-}
+/// File name `baseline = true` resolves to, next to `crema.toml`.
+pub const DEFAULT_BASELINE_FILE: &str = "crema_baseline.jsonl";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -417,8 +402,6 @@ pub enum ConfigError {
     /// An `ignore` or `sig_ignore` entry is not a syntactically valid
     /// glob pattern.
     InvalidGlob(String),
-    /// `incremental` carried a string other than `"verify"`.
-    InvalidIncremental(String),
     /// A path explicitly named by the user (`--config <PATH>`) does not
     /// exist. Distinguished from `Io` because `discover()` silently
     /// treats NotFound as "no config" (Ok(None)), whereas an explicit
@@ -450,11 +433,6 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "error: invalid crema.toml [infusion.paranoia]: {}", msg)
             }
             ConfigError::InvalidGlob(msg) => write!(f, "error: invalid crema.toml glob: {}", msg),
-            ConfigError::InvalidIncremental(value) => write!(
-                f,
-                "error: invalid crema.toml `incremental` value {:?}: expected true, false, or \"verify\"",
-                value
-            ),
             ConfigError::NotFound { path } => {
                 write!(f, "error: config file not found: {}", path.display())
             }
@@ -490,11 +468,10 @@ pub struct ResolvedConfig {
     /// Resolved `did_you_mean` (`Config::did_you_mean`, default false).
     /// Gates `join_did_you_mean` in `main.rs`'s check handler.
     pub did_you_mean: bool,
-    /// Resolved `incremental` mode (`Config::incremental`, default
-    /// false). Read by `main.rs`'s check handler to gate every cache
-    /// read/write — the default path must not touch `.crema/cache/`'s
-    /// incremental artifact at all.
-    pub incremental: IncrementalMode,
+    /// Resolved `baseline` file path (`Config::baseline`), `None` when
+    /// the feature is off. `main.rs`'s check handler must not touch
+    /// the file system for the baseline at all when this is `None`.
+    pub baseline: Option<PathBuf>,
     pub diagnostic: DiagnosticConfig,
     pub collection: CollectionMode,
     pub infusion: InfusionOptions,
@@ -525,7 +502,7 @@ impl Config {
 
     /// Walk up from `start_dir` looking for `crema.toml`. At each step:
     /// 1. If `<current>/crema.toml` exists, parse it, absolutize its
-    ///    relative `sig` entries against `<current>`, and return the
+    ///    relative path fields against `<current>`, and return the
     ///    config along with `<current>` (the directory it was found in).
     /// 2. Otherwise, if `<current>/.git` exists (file or directory),
     ///    treat `<current>` as the repository root and stop — return
@@ -548,32 +525,7 @@ impl Config {
                 Ok(content) => {
                     let mut cfg = Self::parse(&content)?;
                     let dir = current.to_path_buf();
-                    for path in cfg.sig.iter_mut() {
-                        if path.is_relative() {
-                            *path = dir.join(&path);
-                        }
-                    }
-                    if let Some(check) = cfg.check.as_mut() {
-                        for path in check.iter_mut() {
-                            if path.is_relative() {
-                                *path = dir.join(&path);
-                            }
-                        }
-                    }
-                    if let Some(p) = cfg.collection_config.as_mut()
-                        && p.is_relative()
-                    {
-                        *p = dir.join(&p);
-                    }
-                    if let Some(infusion) = cfg.infusion.as_mut()
-                        && let Some(config) = infusion.config.as_mut()
-                    {
-                        for path in config.files.iter_mut() {
-                            if path.is_relative() {
-                                *path = dir.join(&path);
-                            }
-                        }
-                    }
+                    cfg.absolutize_paths(&dir);
                     return Ok(Some((cfg, dir)));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -610,16 +562,75 @@ impl Config {
         }
     }
 
-    /// Load a config file from an explicit path (`--config <PATH>`).
+    /// Load a config file from an explicit path (`--config <PATH>`) and
+    /// return it with its (canonicalized) directory, exactly as if
+    /// [`Self::discover_walking_up`] had found the file there: relative
+    /// paths inside it resolve against that directory, not the cwd. A
+    /// relative `path` itself is a CLI argument and resolves from the cwd.
     /// Unlike `discover()`, NotFound is a hard error here because the
     /// user explicitly named this file.
-    pub fn load_from_file(path: &Path) -> Result<Config, ConfigError> {
-        match std::fs::read_to_string(path) {
-            Ok(content) => Self::parse(&content),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ConfigError::NotFound {
-                path: path.to_path_buf(),
-            }),
-            Err(e) => Err(ConfigError::Io(e)),
+    pub fn load_from_file(path: &Path) -> Result<(Config, PathBuf), ConfigError> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ConfigError::NotFound {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(e) => return Err(ConfigError::Io(e)),
+        };
+        let mut cfg = Self::parse(&content)?;
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let dir = parent.canonicalize().map_err(ConfigError::Io)?;
+        cfg.absolutize_paths(&dir);
+        Ok((cfg, dir))
+    }
+
+    /// Resolve every relative path field against `dir`, the directory
+    /// holding the config file. The one place both loading routes
+    /// (walk-up discovery and `--config`) share, so a new path field
+    /// cannot be absolutized on one route only.
+    fn absolutize_paths(&mut self, dir: &Path) {
+        for path in self.sig.iter_mut() {
+            if path.is_relative() {
+                *path = dir.join(&path);
+            }
+        }
+        if let Some(check) = self.check.as_mut() {
+            for path in check.iter_mut() {
+                if path.is_relative() {
+                    *path = dir.join(&path);
+                }
+            }
+        }
+        if let Some(p) = self.collection_config.as_mut()
+            && p.is_relative()
+        {
+            *p = dir.join(&p);
+        }
+        match self.baseline.as_mut() {
+            // `true` means "next to this config file", which is only
+            // known here — pin it now so a run from a subdirectory reads
+            // the same file.
+            Some(setting @ BaselineSetting::Enabled(true)) => {
+                *setting = BaselineSetting::Path(dir.join(DEFAULT_BASELINE_FILE));
+            }
+            Some(BaselineSetting::Path(p)) if p.is_relative() => {
+                *p = dir.join(&p);
+            }
+            _ => {}
+        }
+        if let Some(infusion) = self.infusion.as_mut()
+            && let Some(config) = infusion.config.as_mut()
+        {
+            for path in config.files.iter_mut() {
+                if path.is_relative() {
+                    *path = dir.join(&path);
+                }
+            }
         }
     }
 
@@ -661,8 +672,9 @@ impl Config {
     }
 
     /// Like `resolve_with_cli`, but also returns the list of
-    /// `[diagnostic]` warnings (currently: unknown code keys, and the
-    /// `--sig` + `--add-sig` co-usage warning). The caller decides how
+    /// config warnings (currently: unknown `[diagnostic]` code keys, the
+    /// `--sig` + `--add-sig` co-usage warning, and the retired
+    /// `incremental` key). The caller decides how
     /// to surface them (stderr in main, captured vec in tests).
     pub fn resolve_with_cli_collecting_warnings(
         file: Option<Config>,
@@ -680,6 +692,9 @@ impl Config {
             None => (DiagnosticConfig::default(), Vec::new()),
         };
         warnings.extend(sig_warnings);
+        if file.incremental.is_some() {
+            warnings.push(INCREMENTAL_RETIRED_WARNING.to_string());
+        }
         let collection = resolve_collection_mode(cli_collection, file.collection_config);
         let rails_ref = file.infusion.as_ref().and_then(|d| d.rails.as_ref());
         let rails_infusion = rails_ref.is_some_and(|r| r.enabled);
@@ -733,13 +748,12 @@ impl Config {
                 libraries: file.libraries,
                 inline: cli_inline.or(file.inline).unwrap_or(true),
                 did_you_mean: file.did_you_mean.unwrap_or(false),
-                incremental: match &file.incremental {
-                    None | Some(IncrementalSetting::Enabled(false)) => IncrementalMode::Off,
-                    Some(IncrementalSetting::Enabled(true)) => IncrementalMode::On,
-                    Some(IncrementalSetting::Named(s)) if s == "verify" => IncrementalMode::Verify,
-                    Some(IncrementalSetting::Named(s)) => {
-                        return Err(ConfigError::InvalidIncremental(s.clone()));
+                baseline: match file.baseline {
+                    None | Some(BaselineSetting::Enabled(false)) => None,
+                    Some(BaselineSetting::Enabled(true)) => {
+                        Some(PathBuf::from(DEFAULT_BASELINE_FILE))
                     }
+                    Some(BaselineSetting::Path(p)) => Some(p),
                 },
                 diagnostic,
                 collection,

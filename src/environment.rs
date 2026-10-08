@@ -198,7 +198,6 @@ impl MixinRef {
 
 pub mod draft;
 pub(crate) mod extras_state;
-pub mod fingerprint;
 pub mod frozen;
 pub mod invalidation;
 pub mod resolution;
@@ -208,3 +207,4 @@ pub mod use_map;
 /// `crate::environment::Environment` is the frozen ast-aggregation layer
 /// produced by `EnvironmentDraft::build` (ADR-0017).
 pub use frozen::Environment;
+pub use frozen::ScanScope;

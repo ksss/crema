@@ -136,12 +136,6 @@ struct InlineCollector<'a> {
     /// [`collect_visibility_call`] around the argument visit only, and
     /// consumed by `visit_def_node` / `collect_attr_call`.
     pending_explicit_visibility: Option<Visibility>,
-    /// `--inline=true` scan. Gates diagnostics that mirror rbs's
-    /// `RBS::InlineParser` restrictions (e.g. `TopLevelMethodDefinition`,
-    /// `rbs/lib/rbs/inline_parser.rb:236`) — those are inline-mode
-    /// restrictions upstream and must not surface when the collector is
-    /// only harvesting skeleton for the sig-mode pipeline.
-    inline_mode: bool,
 }
 
 /// Ruby-side visibility state of one open class / module body.
@@ -247,7 +241,6 @@ impl<'a> InlineCollector<'a> {
         file: Option<SourceFile<'a>>,
         comments: &'a CommentAssociation,
         names: &'a NameTable,
-        inline_mode: bool,
     ) -> Self {
         InlineCollector {
             source,
@@ -266,7 +259,6 @@ impl<'a> InlineCollector<'a> {
             singleton_class_depth: 0,
             visibility_frames: vec![],
             pending_explicit_visibility: None,
-            inline_mode,
         }
     }
 
@@ -990,7 +982,7 @@ impl<'a> InlineCollector<'a> {
             return Vec::new();
         };
 
-        let abs_path = self.names.resolve(class_name);
+        let abs_path = self.names.display_type_name(class_name);
         self.class_stack.push(abs_path);
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
@@ -1170,18 +1162,14 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         let mut byte_range: Option<PrismByteRange> = None;
         let raw_name = if let Some(super_node) = node.superclass() {
             let name = if let Some(data_struct) = data_struct_super.as_ref() {
-                Some(self.names.resolve(data_struct.super_class_name))
+                Some(self.names.display_type_name(data_struct.super_class_name))
             } else if let Some(constant) = super_node.as_constant_read_node() {
                 Some(String::from_utf8_lossy(constant.name().as_slice()).to_string())
             } else {
                 let static_path = super_node
                     .as_constant_path_node()
                     .and_then(|path| static_constant_path_string(&path));
-                // Inline-mode-only (rbs `RBS::InlineParser` parity): in
-                // sig mode the RBS declaration decides the superclass, so
-                // a dynamic Ruby-side expression (`ActiveType::Record[User]`)
-                // is not an error and drops silently.
-                if static_path.is_none() && self.inline_mode {
+                if static_path.is_none() {
                     self.diagnostics
                         .push(self.non_constant_super_class_diagnostic(&super_node));
                 }
@@ -1309,12 +1297,10 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         let kind = match (self.in_singleton_class(), node.receiver()) {
             (true, None) => MethodKind::Singleton,
             (true, Some(receiver)) if receiver.as_self_node().is_some() => {
-                if self.inline_mode {
-                    let loc = receiver.location();
-                    self.diagnostics.push(
-                        self.singleton_scope_diagnostic(loc, DiagnosticKind::NestedSingletonScope),
-                    );
-                }
+                let loc = receiver.location();
+                self.diagnostics.push(
+                    self.singleton_scope_diagnostic(loc, DiagnosticKind::NestedSingletonScope),
+                );
                 let def_start_line = self.line_index.line(node.location().start_offset());
                 let leading_comment = collect_consecutive_leading(self.comments, def_start_line);
                 self.mark_comment_block_associated(leading_comment.as_ref());
@@ -1327,23 +1313,18 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             (false, None) => MethodKind::Instance,
         };
 
-        // Top-level `def name` in inline mode is collected as a private
-        // `::Object` instance method (Ruby semantics; see
-        // `object_members`). Everything else at the top level is
-        // dropped: `def self.name` is a singleton method of `main` that
-        // RBS cannot represent, so inline mode reports
-        // `TopLevelMethodDefinition` (rbs `RBS::InlineParser` parity);
-        // sig mode drops silently and the type checker binds the def
-        // against the `::Object` sig in `lookup_method_target`.
+        // Top-level `def name` is collected as a private `::Object`
+        // instance method (Ruby semantics; see `object_members`).
+        // `def self.name` is a singleton method of `main` that RBS
+        // cannot represent: it is dropped and reported as
+        // `TopLevelMethodDefinition` (rbs `RBS::InlineParser` parity).
         let top_level = self.class_stack.is_empty();
-        if top_level && !(self.inline_mode && kind == MethodKind::Instance) {
+        if top_level && kind != MethodKind::Instance {
             let def_start_line = self.line_index.line(node.location().start_offset());
             let leading_comment = collect_consecutive_leading(self.comments, def_start_line);
             self.report_unused_comment_block(leading_comment.as_ref());
-            if self.inline_mode {
-                self.diagnostics
-                    .push(self.top_level_method_definition_diagnostic(node));
-            }
+            self.diagnostics
+                .push(self.top_level_method_definition_diagnostic(node));
             return;
         }
 
@@ -1470,32 +1451,28 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         }
         if self.in_singleton_class() {
             self.mark_enclosed_leading_lines(node.location());
-            if self.inline_mode {
-                self.diagnostics.push(self.singleton_scope_diagnostic(
+            self.diagnostics.push(
+                self.singleton_scope_diagnostic(
                     node.location(),
                     DiagnosticKind::NestedSingletonScope,
-                ));
-            }
+                ),
+            );
             return;
         }
         if node.expression().as_self_node().is_none() {
             self.mark_enclosed_leading_lines(node.location());
-            if self.inline_mode {
-                self.diagnostics.push(self.singleton_scope_diagnostic(
-                    node.expression().location(),
-                    DiagnosticKind::NonSelfSingletonScope,
-                ));
-            }
+            self.diagnostics.push(self.singleton_scope_diagnostic(
+                node.expression().location(),
+                DiagnosticKind::NonSelfSingletonScope,
+            ));
             return;
         }
         if self.class_stack.is_empty() {
             self.mark_enclosed_leading_lines(node.location());
-            if self.inline_mode {
-                self.diagnostics.push(self.singleton_scope_diagnostic(
-                    node.location(),
-                    DiagnosticKind::TopLevelSingletonScope,
-                ));
-            }
+            self.diagnostics.push(self.singleton_scope_diagnostic(
+                node.location(),
+                DiagnosticKind::TopLevelSingletonScope,
+            ));
             return;
         }
 
@@ -1516,12 +1493,10 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         // already diverges there for `def` (singleton method kind).
         if self.in_singleton_class() {
             self.mark_enclosed_leading_lines(node.location());
-            if self.inline_mode {
-                self.diagnostics.push(self.singleton_scope_diagnostic(
-                    node.location(),
-                    DiagnosticKind::SingletonScopeConstantDefinition,
-                ));
-            }
+            self.diagnostics.push(self.singleton_scope_diagnostic(
+                node.location(),
+                DiagnosticKind::SingletonScopeConstantDefinition,
+            ));
             return;
         }
         let const_name = String::from_utf8_lossy(node.name().as_slice()).to_string();
@@ -1935,60 +1910,16 @@ fn constant_path_to_string(node: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// This entry point is responsible for the Prism-side collection only —
 /// it walks the source into a tree of [`Declaration`]s and then hands
 /// each top-level declaration to [`EnvironmentDraft::insert_ruby_decl`].
+///
+/// Inline mode (`--inline=true`) only: sig mode reads no declarations
+/// from Ruby files, so it runs no collector at all and none of the
+/// collector's diagnostics (rbs `RBS::InlineParser` restrictions,
+/// unused / malformed declaration annotations) surface there.
 pub fn load_inline_annotations(
     source: &[u8],
     parse_result: &ruby_prism::ParseResult<'_>,
     file: Option<&Path>,
     draft: &mut EnvironmentDraft,
-) -> Vec<Diagnostic> {
-    load_inline_annotations_impl(source, parse_result, file, draft, true)
-}
-
-pub fn parse_inline_annotations(
-    source: &[u8],
-    parse_result: &ruby_prism::ParseResult<'_>,
-    file: Option<&Path>,
-    draft: &mut EnvironmentDraft,
-) -> Vec<Diagnostic> {
-    load_inline_annotations_impl(source, parse_result, file, draft, false)
-}
-
-/// Same diagnostics [`load_inline_annotations`] would emit for `source` —
-/// including inline-mode-only diagnostics like `TopLevelMethodDefinition`
-/// (see `load_inline_annotations_impl`'s `inline_mode` doc) — without
-/// inserting anything into a draft (`names` is read-only, for interning
-/// lookups during collection). ADR-0028 S8: a warm `crema check` run needs
-/// this to reproduce an *unchanged* file's diagnostics, whose declarations
-/// already live in the decoded A-snapshot state and must not be re-inserted.
-pub fn inline_diagnostics_only(
-    source: &[u8],
-    parse_result: &ruby_prism::ParseResult<'_>,
-    file: Option<&Path>,
-    names: &crate::name::NameTable,
-) -> Vec<Diagnostic> {
-    if parse_result.errors().next().is_some() {
-        return Vec::new();
-    }
-    let file = file.map(|path| SourceFile::intern(path, names));
-    collect_inline_declarations(source, parse_result, file, names, true).1
-}
-
-fn load_inline_annotations_impl(
-    source: &[u8],
-    parse_result: &ruby_prism::ParseResult<'_>,
-    file: Option<&Path>,
-    draft: &mut EnvironmentDraft,
-    // `true` for `load_inline_annotations` (inline mode = `--inline=true`),
-    // `false` for `parse_inline_annotations` (sig mode). This one flag
-    // carries two semantically-linked decisions: (1) whether to insert
-    // the collected declarations into the draft (inline mode owns them),
-    // and (2) whether to emit inline-mode-only restriction diagnostics
-    // such as `TopLevelMethodDefinition` (rbs `RBS::InlineParser`
-    // parity). Both live on the same axis in the CLI (`Config::inline`),
-    // so passing a single bool is intentional — the doc-comment pins
-    // that assumption so a future callsite that wants one behavior
-    // without the other has to split the flag rather than silently drift.
-    inline_mode: bool,
 ) -> Vec<Diagnostic> {
     // Files whose `parse_result` carries any Prism error are treated
     // as out-of-scope at the library boundary too: walking the
@@ -2005,18 +1936,11 @@ fn load_inline_annotations_impl(
         return Vec::new();
     }
     let source_file = file.map(|path| SourceFile::intern(path, draft.names()));
-    let (top_level, mut diagnostics) = collect_inline_declarations(
-        source,
-        parse_result,
-        source_file,
-        draft.names(),
-        inline_mode,
-    );
+    let (top_level, mut diagnostics) =
+        collect_inline_declarations(source, parse_result, source_file, draft.names());
 
-    if inline_mode {
-        for decl in &top_level {
-            draft.insert_ruby_decl(decl, source, file, &mut diagnostics);
-        }
+    for decl in &top_level {
+        draft.insert_ruby_decl(decl, source.into(), file, &mut diagnostics);
     }
     diagnostics
 }
@@ -2025,19 +1949,18 @@ fn load_inline_annotations_impl(
 /// declaration tree plus any collection-time diagnostics. Used by
 /// [`load_inline_annotations`] above and by tests that need to observe
 /// the pre-resolution form (e.g. that `SuperClass.type_name` is
-/// relative before `EnvironmentDraft::build` runs).
+/// relative before `EnvironmentDraft::build` runs). Inline mode only,
+/// like [`load_inline_annotations`].
 pub fn collect_inline_declarations(
     source: &[u8],
     parse_result: &ruby_prism::ParseResult<'_>,
     file: Option<SourceFile<'_>>,
     names: &NameTable,
-    inline_mode: bool,
 ) -> (Vec<Declaration>, Vec<Diagnostic>) {
     let line_index = LineIndex::from_source(source);
     let comments = CommentAssociation::from_source(source, &line_index, parse_result);
     let root = parse_result.node();
-    let mut collector =
-        InlineCollector::new(source, line_index, file, &comments, names, inline_mode);
+    let mut collector = InlineCollector::new(source, line_index, file, &comments, names);
     collector.visit(&root);
     collector.finish_object_reopen();
     (collector.top_level, collector.diagnostics)

@@ -22,6 +22,7 @@ pub(crate) mod sidekiq;
 mod zeitwerk_synthesis;
 
 pub use inflector::{Inflector, OwnedOrDefault, build_for_config};
+pub(crate) use pipeline::concerning_topic_and_prepend;
 pub use pipeline::{
     CollectedSource, SourceUnit, collect, collect_source, load, load_all, load_all_with_options,
     load_all_with_schema, load_collected,

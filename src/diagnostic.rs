@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
 
@@ -70,12 +71,10 @@ pub struct Diagnostic {
     pub scope: Option<String>,
 }
 
-// serde is derived for the incremental check cache (ADR-0032 Decision 1:
-// structured diagnostics are one of the four persisted artifact kinds).
-// bincode gives no schema evolution — any layout-affecting edit to this
-// enum (or a nested field type) must bump
-// `crate::incremental::CACHE_SCHEMA_VERSION` so old caches fall back to a
-// full recheck instead of misparsing.
+// serde is derived so structured diagnostics can be persisted (the
+// per-file ingest cache planned by ADR-0036 Decision 4 stores them).
+// bincode gives no schema evolution — whatever persists this enum must
+// version its format against layout-affecting edits here.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum DiagnosticKind {
     ArgumentTypeMismatch {
@@ -145,6 +144,9 @@ pub enum DiagnosticKind {
     /// `receiver_type` is exposed as a structured JSON key only so the
     /// message stays role-only and avoids duplicating long unions
     /// (dogfood against rbs/lib saw 21-member, 741-char receivers).
+    /// A receiver typed as a top-level alias renders as the alias name
+    /// (`::RBS::Types::t`) rather than its expansion; dispatch still
+    /// runs on the expansion.
     NoMethod {
         method_name: String,
         receiver_type: String,
@@ -157,10 +159,10 @@ pub enum DiagnosticKind {
         /// method but their block clauses fail to combine. The empty
         /// case is omitted from JSON output so consumers can rely on
         /// the key's presence as a signal that member-level info is
-        /// available. Each entry comes from the same `display_type`
-        /// path that produces `receiver_type`, so the strings are
-        /// directly comparable as substrings of `receiver_type` (no
-        /// alternate formatting). Steep `Ruby::NoMethod` (`type +
+        /// available. Each entry is the expanded member's
+        /// `display_type`, even when `receiver_type` shows an alias
+        /// name, so for a non-alias receiver the strings are substrings
+        /// of `receiver_type` (no alternate formatting). Steep `Ruby::NoMethod` (`type +
         /// method` only) has no equivalent — crema extends here for
         /// narrowing-fix hints.
         missing_from: Vec<String>,
@@ -708,8 +710,7 @@ pub enum DiagnosticKind {
     /// `_ => return` / `_ => None` arms where crema currently gives up on
     /// an unsupported variant. `site` names the instrument location and
     /// `subject_display` carries the unsupported subject so the crema
-    /// developer can pinpoint the gap without re-running with
-    /// `--verbose`.
+    /// developer can pinpoint the gap.
     ///
     /// Defaults to `Severity::Ignore` in every preset (including
     /// `all_error`) — see `DiagnosticKind::is_dev_only_code` and the
@@ -780,7 +781,10 @@ fn candidates_for_scope(
         CandidateScope::None => return Vec::new(),
     };
     let names = env.env().names();
-    let dictionary: Vec<String> = dict.into_iter().map(|s| names.resolve(s)).collect();
+    let dictionary: Vec<String> = dict
+        .into_iter()
+        .map(|s| names.resolve(s).to_string())
+        .collect();
     crate::spell_checker::correct(input, &dictionary)
 }
 
@@ -2413,11 +2417,14 @@ impl fmt::Display for DiagnosticKind {
     }
 }
 
-/// Stream-oriented writer that serializes each `Diagnostic` to a
-/// `Write` sink as soon as the layer produces it. Crema does not buffer
-/// diagnostics across layers — every layer (inline parse, build
-/// validate, type check) calls `emit` directly and the bytes hit the
-/// writer immediately.
+/// Serializes each `Diagnostic` to a `Write` sink in two halves:
+/// [`DiagnosticRenderer`] turns a diagnostic into its output bytes, and
+/// [`DiagnosticCommitter`] applies the result to the run's ordered
+/// state (baseline counts, exit flag, the writer). `emit` runs both in
+/// one call, which is what the environment-level layers (inline parse,
+/// build validate) use; the per-file check phase renders on the pool
+/// thread that checked the file and commits on main in walk order
+/// (ADR-0034), through [`split`](Self::split).
 ///
 /// `format` selects the wire format (currently only `Jsonl`); the field
 /// keeps the door open for additional formats (Sarif, Csv, text) to be
@@ -2436,8 +2443,16 @@ impl fmt::Display for DiagnosticKind {
 /// would punish exactly the UNIX-composition use case crema is
 /// supposed to encourage.
 pub struct DiagnosticEmitter<W: Write> {
+    renderer: DiagnosticRenderer,
+    committer: DiagnosticCommitter<W>,
+}
+
+/// The half of an emit that depends only on the diagnostic and the
+/// source it points into: filter, severity, line number, JSON,
+/// project-relative paths, fingerprint. Shared read-only by every thread
+/// that renders.
+pub struct DiagnosticRenderer {
     format: Format,
-    writer: W,
     config: DiagnosticConfig,
     /// ADR-0029 §3: CLI positional targets narrow the *output* to this
     /// set, leaving the environment scope (and hence `check_source`'s
@@ -2447,25 +2462,17 @@ pub struct DiagnosticEmitter<W: Write> {
     /// filtered-out `Error` never flips the exit code (ADR-0029 slice S3
     /// design point 5 — the CLI argument is a view, not a scope).
     filter: Option<HashSet<PathBuf>>,
-    /// Base directory (the canonicalized process cwd) that every
-    /// emitted `"file"` value is relativized against. Internal file
+    /// Base directory (the canonicalized crema.toml dir) that every
+    /// emitted `"file"` value — and so the fingerprint material and the
+    /// baseline rows — is relativized against. Internal file
     /// identities stay canonical/absolute (filter matching, line-starts
-    /// lookup) — this only affects the serialized output, keeping the
-    /// pre-ADR-0029 cwd-relative display (compact, `jq`-filterable per
-    /// ADR-0005) now that scope paths are canonicalized internally.
+    /// lookup) — this only affects the serialized output, keeping it
+    /// compact and `jq`-filterable (ADR-0005) and identical from every
+    /// subdirectory (ADR-0029 §7 note 3, amended 2026-09-30).
     /// `None` (unresolvable cwd, or unit tests via `new`'s default)
     /// leaves paths untouched.
     display_base: Option<PathBuf>,
     line_starts_by_file: HashMap<PathBuf, Vec<u32>>,
-    // Cache of `line_starts` derived by reading the file off disk when
-    // the location's path was not registered via `register_source`. The
-    // outer Option wraps the read outcome so read failures (missing
-    // file, unreadable) are memoized as `None` and stop re-triggering
-    // disk I/O on later diagnostics pointing at the same path. Held on
-    // top of `line_starts_by_file` — never fed into it — so the
-    // "registered in-memory source beats disk content" invariant stays
-    // observable in the lookup order.
-    fallback_line_starts: HashMap<PathBuf, Option<Vec<u32>>>,
     /// Registered source bytes for fingerprint snippet extraction.
     /// Mirrors the "registered in-memory source beats disk content"
     /// invariant of `line_starts_by_file`: the snippet must come from
@@ -2473,27 +2480,97 @@ pub struct DiagnosticEmitter<W: Write> {
     /// at emit time (mid-run editor saves, `-e` input that never
     /// persists).
     sources_by_file: HashMap<PathBuf, Arc<[u8]>>,
-    /// Source bytes read off disk on demand when the location's path
-    /// was not registered. Populated only when a diagnostic is
-    /// actually emitted, so a zero-diagnostic run pays no cost here.
-    /// `None` memoizes read failures — the snippet material is then
-    /// empty but the fingerprint is still computed and emitted.
-    fingerprint_sources: HashMap<PathBuf, Option<Vec<u8>>>,
-    had_any_error: bool,
-    broken: bool,
-    /// When `true`, `emit()` diverts the fully-serialized JSONL line to
-    /// an internal buffer of (file, code, fingerprint) tuples instead of
-    /// writing streaming output. `finish()` sorts that buffer by
-    /// `(file, code, fingerprint)` byte-lex and writes each row as a
-    /// hand-serialized JSON object with the keys in that same order —
-    /// the sort key is the row's serialized byte prefix, so external
-    /// `LC_ALL=C sort` yields the same order. Contract-level flag
+    /// Sources read off disk on demand when the location's path was not
+    /// registered via `register_source` (a `.rbs` file an
+    /// environment-level diagnostic points into). Populated only when
+    /// such a diagnostic is actually rendered, so a zero-diagnostic run
+    /// pays no cost here. `None` memoizes a read failure (missing file,
+    /// unreadable): later diagnostics on the same path do not re-trigger
+    /// disk I/O, the line is reported as 1 and the fingerprint is
+    /// computed without snippet material. Held on top of the registered
+    /// tables — never fed into them — so the "registered in-memory
+    /// source beats disk content" invariant stays observable in the
+    /// lookup order. Check-phase diagnostics never get here: every check
+    /// target is registered.
+    fallback_sources: Mutex<HashMap<PathBuf, Option<FallbackSource>>>,
+    /// When `true`, a rendered diagnostic carries only its `(file, code,
+    /// fingerprint)` triple and no JSONL line; the committer buffers the
+    /// triples and `finish()` writes them sorted — see
+    /// [`DiagnosticCommitter`]'s `tamp_buffer`. Contract-level flag
     /// (`git status --porcelain` analogue for baseline / lockfile
     /// workflows), orthogonal to `Format` (which will grow serialization
-    /// variants like xml/sarif). `finish()` is idempotent and safe to
-    /// call on a non-tamped emitter (no-op).
+    /// variants like xml/sarif).
     tamped: bool,
+    /// Whether the committer holds a baseline. With one, a diagnostic's
+    /// fingerprint still decides the exit code after the pipe closed.
+    has_baseline: bool,
+    /// Set by the committer when the writer reports `BrokenPipe`.
+    broken: Arc<AtomicBool>,
+}
+
+/// A source the renderer read off disk: its bytes and line starts.
+struct FallbackSource {
+    bytes: Vec<u8>,
+    line_starts: Vec<u32>,
+}
+
+/// One diagnostic after [`DiagnosticRenderer::render`]: all that
+/// [`DiagnosticCommitter::commit`] needs to finish the emit.
+pub struct RenderedDiagnostic {
+    is_error: bool,
+    /// `None` when the pipe was already closed and no baseline is
+    /// installed: only `is_error` can still change the outcome.
+    row: Option<RenderedRow>,
+}
+
+struct RenderedRow {
+    file: String,
+    code: &'static str,
+    fingerprint: String,
+    /// The JSONL line, or `None` in `--tamp` mode.
+    line: Option<String>,
+}
+
+/// The half of an emit that depends on what was emitted before it:
+/// baseline absorption, the exit flag, the `--tamp` buffer and the
+/// writer. One thread owns it and commits in output order.
+pub struct DiagnosticCommitter<W: Write> {
+    writer: W,
+    had_any_error: bool,
+    /// Shared with the renderer so it stops rendering for a closed pipe.
+    broken: Arc<AtomicBool>,
+    /// `--tamp` rows: `commit()` diverts each row here instead of
+    /// writing it. `finish()` sorts the buffer by `(file, code,
+    /// fingerprint)` byte-lex and writes each row as a hand-serialized
+    /// JSON object with the keys in that same order — the sort key is
+    /// the row's serialized byte prefix, so external `LC_ALL=C sort`
+    /// yields the same order. `finish()` is idempotent and safe to call
+    /// on a non-tamped emitter (no-op).
     tamp_buffer: Vec<TampedRecord>,
+    /// Known-diagnostic baseline (`crema.toml` `baseline`): remaining
+    /// absorb count per canonical tamp row (`render_tamp_line`), so a
+    /// row listed twice absorbs two hits (multiset — `--tamp` never
+    /// dedups). A matched diagnostic is dropped before `had_any_error`
+    /// is decided, so the exit code sees only unmatched ones. `None`
+    /// (the default) is the byte-identical no-baseline path.
+    baseline: Option<HashMap<String, usize>>,
+}
+
+/// Render one `--tamp` row: keys in `file` → `code` → `fingerprint`
+/// order, no whitespace. The one place that decides the row bytes —
+/// the stream, the baseline file and the baseline lookup key all go
+/// through it, which is what makes "baseline line == tamp line" hold.
+/// serde_json's Value serializer is alphabetical by default (`code`
+/// first), which would silently break the sort contract;
+/// `preserve_order` would affect the streaming path too.
+pub fn render_tamp_line(file: &str, code: &str, fingerprint: &str) -> String {
+    let file_json = serde_json::to_string(file).expect("string must serialize to JSON");
+    let code_json = serde_json::to_string(code).expect("string must serialize to JSON");
+    let fp_json = serde_json::to_string(fingerprint).expect("string must serialize to JSON");
+    format!(
+        "{{\"file\":{},\"code\":{},\"fingerprint\":{}}}",
+        file_json, code_json, fp_json
+    )
 }
 
 /// One row of a `--tamp` stream: the stable-projection triple that
@@ -2508,37 +2585,63 @@ struct TampedRecord {
 
 impl<W: Write> DiagnosticEmitter<W> {
     pub fn new(format: Format, writer: W, config: DiagnosticConfig) -> Self {
+        let broken = Arc::new(AtomicBool::new(false));
         DiagnosticEmitter {
-            format,
-            writer,
-            config,
-            filter: None,
-            display_base: None,
-            line_starts_by_file: HashMap::new(),
-            fallback_line_starts: HashMap::new(),
-            sources_by_file: HashMap::new(),
-            fingerprint_sources: HashMap::new(),
-            had_any_error: false,
-            broken: false,
-            tamped: false,
-            tamp_buffer: Vec::new(),
+            renderer: DiagnosticRenderer {
+                format,
+                config,
+                filter: None,
+                display_base: None,
+                line_starts_by_file: HashMap::new(),
+                sources_by_file: HashMap::new(),
+                fallback_sources: Mutex::new(HashMap::new()),
+                tamped: false,
+                has_baseline: false,
+                broken: Arc::clone(&broken),
+            },
+            committer: DiagnosticCommitter {
+                writer,
+                had_any_error: false,
+                broken,
+                tamp_buffer: Vec::new(),
+                baseline: None,
+            },
         }
     }
 
-    /// Opt into the `--tamp` stable-projection mode (see the `tamped`
-    /// field doc). No-op when `enabled == false` — this is the CLI
-    /// wiring point, called with the raw `--tamp` boolean.
+    /// Install the known-diagnostic baseline (see the committer's
+    /// `baseline` field doc). `None` keeps the default no-baseline path.
+    pub fn with_baseline(mut self, baseline: Option<HashMap<String, usize>>) -> Self {
+        self.renderer.has_baseline = baseline.is_some();
+        self.committer.baseline = baseline;
+        self
+    }
+
+    /// Baseline rows that absorbed nothing this run — entries whose
+    /// diagnostic is gone (fixed, or moved by an edit). Zero without a
+    /// baseline.
+    pub fn stale_baseline_count(&self) -> usize {
+        self.committer
+            .baseline
+            .as_ref()
+            .map(|b| b.values().sum())
+            .unwrap_or(0)
+    }
+
+    /// Opt into the `--tamp` stable-projection mode (see the renderer's
+    /// `tamped` field doc). No-op when `enabled == false` — this is the
+    /// CLI wiring point, called with the raw `--tamp` boolean.
     pub fn with_tamped(mut self, enabled: bool) -> Self {
-        self.tamped = enabled;
+        self.renderer.tamped = enabled;
         self
     }
 
     /// Set the base directory every emitted `"file"` value is displayed
     /// relative to (see the `display_base` field doc). The caller passes
-    /// the canonicalized process cwd so it compares equal against the
+    /// the canonicalized crema.toml dir so it compares equal against the
     /// canonicalized paths diagnostics carry internally.
     pub fn with_display_base(mut self, base: Option<PathBuf>) -> Self {
-        self.display_base = base;
+        self.renderer.display_base = base;
         self
     }
 
@@ -2548,7 +2651,7 @@ impl<W: Write> DiagnosticEmitter<W> {
     /// same representation `emit`'s `Diagnostic::location.file` uses
     /// (the caller's job — `DiagnosticEmitter` does no normalization).
     pub fn with_filter(mut self, filter: Option<HashSet<PathBuf>>) -> Self {
-        self.filter = filter;
+        self.renderer.filter = filter;
         self
     }
 
@@ -2557,66 +2660,23 @@ impl<W: Write> DiagnosticEmitter<W> {
     /// second owned copy per check-scope file was pure duplication
     /// (~19MB on the gitlab workload).
     pub fn register_source(&mut self, file: PathBuf, source: Arc<[u8]>) {
-        self.line_starts_by_file
+        self.renderer
+            .line_starts_by_file
             .insert(file.clone(), line_starts(&source));
-        self.sources_by_file.insert(file, source);
+        self.renderer.sources_by_file.insert(file, source);
     }
 
     pub fn emit(&mut self, diag: &Diagnostic) {
-        if let Some(filter) = &self.filter
-            && !filter.contains(&diag.location.file)
-        {
-            return;
+        if let Some(rendered) = self.renderer.render(diag) {
+            self.committer.commit(rendered);
         }
-        let severity = self.config.severity_for(&diag.kind);
-        if severity == Severity::Ignore {
-            return;
-        }
-        if severity == Severity::Error {
-            self.had_any_error = true;
-        }
-        if self.broken {
-            return;
-        }
-        match self.format {
-            Format::Jsonl => {
-                let line_number = self.line_for(diag);
-                let mut value = diag.to_json_value_with_line(severity, line_number);
-                if let Some(base) = &self.display_base {
-                    relativize_file_fields(&mut value, base);
-                }
-                let rel_file = value
-                    .get("file")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let fingerprint = self.fingerprint_for(diag, &rel_file);
-                if self.tamped {
-                    // Divert to the internal buffer — `finish()` sorts
-                    // and writes at end-of-run. Streaming would break
-                    // the byte-lex sort contract the tamp mode owes to
-                    // baseline consumers.
-                    self.tamp_buffer.push(TampedRecord {
-                        file: rel_file,
-                        code: diag.kind.code().to_string(),
-                        fingerprint,
-                    });
-                    return;
-                }
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert("fingerprint".into(), json!(fingerprint));
-                }
-                let line =
-                    serde_json::to_string(&value).expect("diagnostic must serialize to JSON");
-                if let Err(err) = writeln!(self.writer, "{}", line) {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        self.broken = true;
-                        return;
-                    }
-                    panic!("diagnostic emit failed: {}", err);
-                }
-            }
-        }
+    }
+
+    /// Borrow the two halves at once: the renderer for the threads that
+    /// render, the committer for the one thread that commits their
+    /// results in output order.
+    pub fn split(&mut self) -> (&DiagnosticRenderer, &mut DiagnosticCommitter<W>) {
+        (&self.renderer, &mut self.committer)
     }
 
     /// Flush the tamp buffer as sorted stable-projection JSONL. No-op on
@@ -2630,10 +2690,183 @@ impl<W: Write> DiagnosticEmitter<W> {
     /// so `crema check --tamp | head -n 5` stays clean, other IO errors
     /// panic.
     pub fn finish(&mut self) {
-        if !self.tamped || self.broken || self.tamp_buffer.is_empty() {
-            self.tamp_buffer.clear();
+        let committer = &mut self.committer;
+        if committer.broken.load(Ordering::Relaxed) || committer.tamp_buffer.is_empty() {
+            committer.tamp_buffer.clear();
             return;
         }
+        for line in committer.take_tamp_lines() {
+            if let Err(err) = writeln!(committer.writer, "{}", line) {
+                if err.kind() == std::io::ErrorKind::BrokenPipe {
+                    committer.broken.store(true, Ordering::Relaxed);
+                    return;
+                }
+                panic!("tamp emit failed: {}", err);
+            }
+        }
+    }
+
+    /// Drain the tamp buffer as sorted, rendered rows. `finish()`
+    /// streams them; `--update-baseline` writes them to the baseline
+    /// file instead (the caller owns that file so an exit-2 path,
+    /// which only ever calls `finish()`, never touches it).
+    pub fn take_tamp_lines(&mut self) -> Vec<String> {
+        self.committer.take_tamp_lines()
+    }
+
+    pub fn had_any_error(&self) -> bool {
+        self.committer.had_any_error
+    }
+}
+
+impl DiagnosticRenderer {
+    /// Render `diag`, or `None` when it never reaches the output (outside
+    /// the filter, or configured to `Severity::Ignore`).
+    pub fn render(&self, diag: &Diagnostic) -> Option<RenderedDiagnostic> {
+        if let Some(filter) = &self.filter
+            && !filter.contains(&diag.location.file)
+        {
+            return None;
+        }
+        let severity = self.config.severity_for(&diag.kind);
+        if severity == Severity::Ignore {
+            return None;
+        }
+        let is_error = severity == Severity::Error;
+        // Closed pipe, no baseline: nothing below can change the
+        // outcome, so keep the pre-baseline early exit (and its cost —
+        // no fingerprint work after `crema check | head`). With a
+        // baseline the fingerprint still decides the exit code.
+        if !self.has_baseline && self.broken.load(Ordering::Relaxed) {
+            return Some(RenderedDiagnostic {
+                is_error,
+                row: None,
+            });
+        }
+        let file = &diag.location.file;
+        let row = match (
+            self.line_starts_by_file.get(file),
+            self.sources_by_file.get(file),
+        ) {
+            (Some(starts), Some(source)) => self.render_row(diag, severity, Some((source, starts))),
+            _ => {
+                let mut fallback = self
+                    .fallback_sources
+                    .lock()
+                    .expect("fallback source memo poisoned");
+                // Memo miss: pay the disk read + PathBuf clone once per file.
+                if !fallback.contains_key(file) {
+                    let source = std::fs::read(file).ok().map(|bytes| FallbackSource {
+                        line_starts: line_starts(&bytes),
+                        bytes,
+                    });
+                    fallback.insert(file.clone(), source);
+                }
+                let source = fallback
+                    .get(file)
+                    .and_then(Option::as_ref)
+                    .map(|s| (&s.bytes[..], &s.line_starts[..]));
+                self.render_row(diag, severity, source)
+            }
+        };
+        Some(RenderedDiagnostic {
+            is_error,
+            row: Some(row),
+        })
+    }
+
+    /// `source` is the bytes and line starts of the file `diag` points
+    /// into, or `None` when the file is neither registered nor readable.
+    fn render_row(
+        &self,
+        diag: &Diagnostic,
+        severity: Severity,
+        source: Option<(&[u8], &[u32])>,
+    ) -> RenderedRow {
+        match self.format {
+            Format::Jsonl => {
+                let line_number = match source {
+                    Some((_, starts)) => line_from_starts(starts, diag.location.range.start_byte),
+                    None => 1,
+                };
+                let mut value = diag.to_json_value_with_line(severity, line_number);
+                if let Some(base) = &self.display_base {
+                    relativize_file_fields(&mut value, base);
+                }
+                let rel_file = value
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let fingerprint = fingerprint_for(diag, &rel_file, source);
+                let line = (!self.tamped).then(|| {
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("fingerprint".into(), json!(fingerprint));
+                    }
+                    serde_json::to_string(&value).expect("diagnostic must serialize to JSON")
+                });
+                RenderedRow {
+                    file: rel_file,
+                    code: diag.kind.code(),
+                    fingerprint,
+                    line,
+                }
+            }
+        }
+    }
+}
+
+impl<W: Write> DiagnosticCommitter<W> {
+    /// Apply one rendered diagnostic: absorb it into the baseline, or
+    /// count it toward the exit code and write it out (buffer it, in
+    /// `--tamp` mode).
+    pub fn commit(&mut self, rendered: RenderedDiagnostic) {
+        let RenderedDiagnostic { is_error, row } = rendered;
+        let Some(row) = row else {
+            if is_error {
+                self.had_any_error = true;
+            }
+            return;
+        };
+        // Baseline hit: drop the record before it can flip
+        // `had_any_error` — "output is gone but exit is still
+        // 1" would be the silent half-feature.
+        if let Some(baseline) = self.baseline.as_mut()
+            && let Some(remaining) =
+                baseline.get_mut(&render_tamp_line(&row.file, row.code, &row.fingerprint))
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return;
+        }
+        if is_error {
+            self.had_any_error = true;
+        }
+        if self.broken.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(line) = row.line else {
+            // Divert to the internal buffer — `finish()` sorts
+            // and writes at end-of-run. Streaming would break
+            // the byte-lex sort contract the tamp mode owes to
+            // baseline consumers.
+            self.tamp_buffer.push(TampedRecord {
+                file: row.file,
+                code: row.code.to_string(),
+                fingerprint: row.fingerprint,
+            });
+            return;
+        };
+        if let Err(err) = writeln!(self.writer, "{}", line) {
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                self.broken.store(true, Ordering::Relaxed);
+                return;
+            }
+            panic!("diagnostic emit failed: {}", err);
+        }
+    }
+
+    fn take_tamp_lines(&mut self) -> Vec<String> {
         // Render each record to its full JSON line first, THEN sort
         // the rendered byte sequences. Sorting the structured
         // `(file, code, fingerprint)` tuple would diverge from
@@ -2644,171 +2877,93 @@ impl<W: Write> DiagnosticEmitter<W> {
         // rendered rows is what the README promises external tools
         // ("preserve the same ordering" under merged-baseline
         // re-sort).
-        //
-        // Hand-serialize with the specific key order (`file` → `code`
-        // → `fingerprint`). serde_json's Value serializer is
-        // alphabetical by default (`code` first), which would silently
-        // break the sort-contract; `preserve_order` would affect the
-        // streaming path too. `serde_json::to_string` on each scalar
-        // handles JSON escapes and Unicode correctly.
         let mut lines: Vec<String> = self
             .tamp_buffer
             .drain(..)
-            .map(|rec| {
-                let file_json =
-                    serde_json::to_string(&rec.file).expect("string must serialize to JSON");
-                let code_json =
-                    serde_json::to_string(&rec.code).expect("string must serialize to JSON");
-                let fp_json =
-                    serde_json::to_string(&rec.fingerprint).expect("string must serialize to JSON");
-                format!(
-                    "{{\"file\":{},\"code\":{},\"fingerprint\":{}}}",
-                    file_json, code_json, fp_json
-                )
-            })
+            .map(|rec| render_tamp_line(&rec.file, &rec.code, &rec.fingerprint))
             .collect();
         lines.sort();
-        for line in lines {
-            if let Err(err) = writeln!(self.writer, "{}", line) {
-                if err.kind() == std::io::ErrorKind::BrokenPipe {
-                    self.broken = true;
-                    return;
-                }
-                panic!("tamp emit failed: {}", err);
-            }
-        }
+        lines
     }
+}
 
-    pub fn had_any_error(&self) -> bool {
-        self.had_any_error
+/// Stable identifier for a diagnostic across runs, unrelated edits
+/// (line shifts) and checkout locations. Material:
+/// `rel_path \0 code \0 scope \0 line_bytes \0 column_u32_le`
+/// hashed with seedless xxh3_64, rendered as 16 hex digits.
+/// `line_bytes` is the source bytes of the line(s) containing the
+/// diagnostic's byte range — from the start of the line containing
+/// `start_byte` to the end of the line containing `end_byte`,
+/// exclusive of the trailing `\n` (a preceding `\r` from CRLF is
+/// kept). `column_u32_le` is `start_byte - line_start` (0-based
+/// byte offset within the starting line) encoded little-endian.
+/// Widening the material from the diag's own byte range to the
+/// enclosing line lets `keys << x` and `vals << y` fingerprint
+/// differently even though the diagnostic itself only spans the
+/// `<<` operator. The trailing column offset keeps
+/// `a.nmae + b.wat` (two `NoMethod`s on the same physical line)
+/// distinct: their line bytes are identical, so line bytes alone
+/// would collapse them. Line numbers, message text and absolute
+/// paths are deliberately excluded — each would break stability
+/// across edits, crema versions, or machines. Identical
+/// `(path, code, scope, line_bytes, column)` yields identical
+/// fingerprints (no ordinal suffix); that collision is an accepted
+/// limit of the scheme. Line-internal reformatting (indent change,
+/// identifier rename, comment edit) changes the fingerprint by
+/// design — "editing a line makes it a different diagnostic" is
+/// the intended semantics; indentation shifts move the column
+/// offset in lockstep with `line_bytes`, so the semantics stay
+/// line-scoped, not column-scoped. Path stability assumes
+/// `display_base` resolved (`rel_file` already relativized); if
+/// cwd resolution failed the whole run degrades to absolute paths
+/// and fingerprints are only machine-local.
+///
+/// `source` is the file's bytes and line starts (`None` when it could
+/// not be read: the line material is then left out). Line boundaries
+/// come from the line starts via `partition_point` (O(log n)) rather
+/// than scanning raw source bytes for `\n` on every diag.
+fn fingerprint_for(diag: &Diagnostic, rel_file: &str, source: Option<(&[u8], &[u32])>) -> String {
+    let mut material = Vec::new();
+    material.extend_from_slice(rel_file.as_bytes());
+    material.push(0);
+    material.extend_from_slice(diag.kind.code().as_bytes());
+    material.push(0);
+    if let Some(scope) = &diag.scope {
+        material.extend_from_slice(scope.as_bytes());
     }
-
-    /// Stable identifier for a diagnostic across runs, unrelated edits
-    /// (line shifts) and checkout locations. Material:
-    /// `rel_path \0 code \0 scope \0 line_bytes \0 column_u32_le`
-    /// hashed with seedless xxh3_64, rendered as 16 hex digits.
-    /// `line_bytes` is the source bytes of the line(s) containing the
-    /// diagnostic's byte range — from the start of the line containing
-    /// `start_byte` to the end of the line containing `end_byte`,
-    /// exclusive of the trailing `\n` (a preceding `\r` from CRLF is
-    /// kept). `column_u32_le` is `start_byte - line_start` (0-based
-    /// byte offset within the starting line) encoded little-endian.
-    /// Widening the material from the diag's own byte range to the
-    /// enclosing line lets `keys << x` and `vals << y` fingerprint
-    /// differently even though the diagnostic itself only spans the
-    /// `<<` operator. The trailing column offset keeps
-    /// `a.nmae + b.wat` (two `NoMethod`s on the same physical line)
-    /// distinct: their line bytes are identical, so line bytes alone
-    /// would collapse them. Line numbers, message text and absolute
-    /// paths are deliberately excluded — each would break stability
-    /// across edits, crema versions, or machines. Identical
-    /// `(path, code, scope, line_bytes, column)` yields identical
-    /// fingerprints (no ordinal suffix); that collision is an accepted
-    /// limit of the scheme. Line-internal reformatting (indent change,
-    /// identifier rename, comment edit) changes the fingerprint by
-    /// design — "editing a line makes it a different diagnostic" is
-    /// the intended semantics; indentation shifts move the column
-    /// offset in lockstep with `line_bytes`, so the semantics stay
-    /// line-scoped, not column-scoped. Path stability assumes
-    /// `display_base` resolved (`rel_file` already relativized); if
-    /// cwd resolution failed the whole run degrades to absolute paths
-    /// and fingerprints are only machine-local.
-    ///
-    /// The `line_starts_by_file` / `fallback_line_starts` caches are
-    /// consulted for line boundaries via `partition_point` (O(log n))
-    /// rather than scanning raw source bytes for `\n` on every diag —
-    /// `emit()` calls `line_for()` before `fingerprint_for()`, so by
-    /// the time we get here one of those two caches is populated for
-    /// the file (either registered up-front or filled by `line_for`'s
-    /// disk-fallback path).
-    fn fingerprint_for(&mut self, diag: &Diagnostic, rel_file: &str) -> String {
-        let mut material = Vec::new();
-        material.extend_from_slice(rel_file.as_bytes());
-        material.push(0);
-        material.extend_from_slice(diag.kind.code().as_bytes());
-        material.push(0);
-        if let Some(scope) = &diag.scope {
-            material.extend_from_slice(scope.as_bytes());
+    material.push(0);
+    if let Some((source, starts)) = source {
+        let start = (diag.location.range.start_byte as usize).min(source.len());
+        let end = (diag.location.range.end_byte as usize)
+            .min(source.len())
+            .max(start);
+        // Line index containing byte `b` = last `starts[i]` with
+        // `starts[i] <= b`. `starts` is monotonically increasing
+        // and always begins with 0, so partition_point returns
+        // >= 1 and the saturating_sub is a defensive no-op.
+        let start_line_idx = starts
+            .partition_point(|&s| (s as usize) <= start)
+            .saturating_sub(1);
+        let end_line_idx = starts
+            .partition_point(|&s| (s as usize) <= end)
+            .saturating_sub(1);
+        let line_start = starts[start_line_idx] as usize;
+        // End of last spanned line = start of next line - 1 (strip
+        // `\n`), or source.len() when the diag lands on the final
+        // line and there is no next entry.
+        let line_end = starts
+            .get(end_line_idx + 1)
+            .map(|&s| (s as usize).saturating_sub(1))
+            .unwrap_or(source.len())
+            .max(line_start);
+        if line_start < line_end {
+            material.extend_from_slice(&source[line_start..line_end]);
         }
         material.push(0);
-        if !self.sources_by_file.contains_key(&diag.location.file) {
-            self.fingerprint_sources
-                .entry(diag.location.file.clone())
-                .or_insert_with(|| std::fs::read(&diag.location.file).ok());
-        }
-        let source = self
-            .sources_by_file
-            .get(&diag.location.file)
-            .map(|s| &s[..])
-            .or_else(|| {
-                self.fingerprint_sources
-                    .get(&diag.location.file)?
-                    .as_deref()
-            });
-        let starts = self
-            .line_starts_by_file
-            .get(&diag.location.file)
-            .or_else(|| {
-                self.fallback_line_starts
-                    .get(&diag.location.file)
-                    .and_then(Option::as_ref)
-            });
-        if let (Some(source), Some(starts)) = (source, starts) {
-            let start = (diag.location.range.start_byte as usize).min(source.len());
-            let end = (diag.location.range.end_byte as usize)
-                .min(source.len())
-                .max(start);
-            // Line index containing byte `b` = last `starts[i]` with
-            // `starts[i] <= b`. `starts` is monotonically increasing
-            // and always begins with 0, so partition_point returns
-            // >= 1 and the saturating_sub is a defensive no-op.
-            let start_line_idx = starts
-                .partition_point(|&s| (s as usize) <= start)
-                .saturating_sub(1);
-            let end_line_idx = starts
-                .partition_point(|&s| (s as usize) <= end)
-                .saturating_sub(1);
-            let line_start = starts[start_line_idx] as usize;
-            // End of last spanned line = start of next line - 1 (strip
-            // `\n`), or source.len() when the diag lands on the final
-            // line and there is no next entry.
-            let line_end = starts
-                .get(end_line_idx + 1)
-                .map(|&s| (s as usize).saturating_sub(1))
-                .unwrap_or(source.len())
-                .max(line_start);
-            if line_start < line_end {
-                material.extend_from_slice(&source[line_start..line_end]);
-            }
-            material.push(0);
-            let column = (start - line_start) as u32;
-            material.extend_from_slice(&column.to_le_bytes());
-        }
-        format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&material))
+        let column = (start - line_start) as u32;
+        material.extend_from_slice(&column.to_le_bytes());
     }
-
-    fn line_for(&mut self, diag: &Diagnostic) -> usize {
-        if let Some(starts) = self.line_starts_by_file.get(&diag.location.file) {
-            return line_from_starts(starts, diag.location.range.start_byte);
-        }
-        if let Some(cached) = self.fallback_line_starts.get(&diag.location.file) {
-            return match cached {
-                Some(starts) => line_from_starts(starts, diag.location.range.start_byte),
-                None => 1,
-            };
-        }
-        // Cache miss: pay the disk read + PathBuf clone once per file.
-        let starts = std::fs::read(&diag.location.file)
-            .ok()
-            .map(|source| line_starts(&source));
-        let line = match &starts {
-            Some(starts) => line_from_starts(starts, diag.location.range.start_byte),
-            None => 1,
-        };
-        self.fallback_line_starts
-            .insert(diag.location.file.clone(), starts);
-        line
-    }
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&material))
 }
 
 /// Rewrite every `"file"` string field in a serialized diagnostic to be

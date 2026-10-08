@@ -1,5 +1,5 @@
 ---
-description: Reduce `crema check` diagnostics in a Ruby project against a committed `--tamp` baseline, one diagnostic code and a few files per cycle. Diffs the baseline by fingerprint after every edit so the agent sees exactly what it removed, what it newly introduced, and what surfaced from the same root cause. Use when a project keeps a crema baseline file (rubocop_todo.yml style) and wants it to shrink without regressions.
+description: Reduce `crema check` diagnostics in a Ruby project against the baseline file named by `baseline` in its `crema.toml`, one diagnostic code and a few files per cycle. Reads crema's own baseline matching after every edit so the agent sees exactly what it removed, what it newly introduced, and what surfaced from the same root cause. Use when a project keeps a crema baseline (rubocop_todo.yml style) and wants it to shrink without regressions.
 license: MIT
 metadata:
     github-path: skills/crema-reduce-diagnostics
@@ -9,16 +9,18 @@ name: crema-reduce-diagnostics
 # crema-reduce-diagnostics
 
 One cycle = one diagnostic code, a few files. The baseline says what is
-known, the fingerprint diff says what changed, the human approves the
-diff. Counts never decide anything; the fingerprint diff does.
+known, crema's matching says what changed, the human approves the
+diff. Counts never decide anything; the matching does.
 
 ## Why this shape
 
-- **The baseline is the contract.** `crema check --tamp` projects each
-  record to `file`, `code`, `fingerprint`, sorted, so the file is stable
-  under line shifts and diffable in git. Every cycle starts by matching
-  the baseline and ends by regenerating it. A cycle that skips either
-  step cannot say what it changed.
+- **The baseline is the contract.** `baseline` in `crema.toml` names a
+  file of `file`, `code`, `fingerprint` rows, stable under line shifts
+  and diffable in git. `crema check` drops every record that matches a
+  row, so its stdout is exactly what the baseline does not know, and one
+  stderr line counts the rows that no longer match anything. Every cycle
+  starts by matching the baseline and ends by regenerating it. A cycle
+  that skips either step cannot say what it changed.
 - **A code is too wide, a file is too narrow.** One code across a whole
   project is hundreds of records with several root causes; one file
   mixes codes with unrelated fixes. A code plus the files where it
@@ -26,43 +28,50 @@ diff. Counts never decide anything; the fingerprint diff does.
 - **Introduced beats removed.** Fixing a NoMethod on `x.foo` often makes
   crema see further: an ArgumentTypeMismatch or UnresolvedOverloading
   that was silent behind the error now appears, sometimes in a file you
-  did not touch. The fingerprint diff shows those as new records. A cycle
-  reports every new record with a verdict; a cycle that only reports the
-  count going down is not finished.
+  did not touch. crema prints those as records the baseline does not
+  know. A cycle reports every new record with a verdict; a cycle that
+  only reports the count going down is not finished.
 - **The fix for a code lives in `crema doc`.** Run
   `crema doc diagnostic <code>` before the first edit; its *Typical fix*
   is the catalogue. This skill holds the loop, not the fixes.
 
 ## Inputs
 
-- A project with `crema.toml` and a committed baseline produced by
-  `crema check --tamp > <baseline>`. Name and location are the project's;
-  a Rake task or script that regenerates it is common but not required —
-  find it with `grep -rn -- '--tamp' Rakefile rakelib bin scripts
-  2>/dev/null`, and when there is none, the bare command is the
-  regeneration step.
+- A project whose `crema.toml` has `baseline = true` (the file is
+  `crema_baseline.jsonl` next to `crema.toml`) or `baseline = "<path>"`
+  (relative to the `crema.toml` directory), and that file committed.
+  `<baseline>` below is that file. `crema doc config` describes the key.
 - `jq`, `comm`, `grep`.
-- `crema check` exits 1 whenever it printed a record, including under
-  `--tamp`. A wrapper that regenerates the baseline must tolerate that
-  exit code; a bare `crema check --tamp > file` in a shell does.
+- Three ways to run the check, used for different questions:
+  - `crema check` — only the records the baseline does not know, every
+    field; exit `1` if any of them is an error.
+  - `crema check --no-baseline` — every record, as if there were no
+    baseline.
+  - `crema check --update-baseline` — rewrite `<baseline>` from the
+    current records; exit `0`, prints nothing.
 
-### No baseline yet
+### No `baseline` key
 
-When the project has no baseline file, create one before step 0. It is a
-snapshot, not a judgement, so the agent may take it:
+Stop before step 0 and ask the human. Turning the key on changes what a
+bare `crema check` prints and its exit code (a project with 100 known
+records goes from exit `1` to exit `0`, in CI too), and that is the
+project's decision, not the agent's. Propose the one line and say what
+it changes:
 
-```sh
-crema check --tamp > crema-check-tamped.jsonl
-grep -qx '/.crema/' .gitignore 2>/dev/null || echo '/.crema/' >> .gitignore
-git add crema-check-tamped.jsonl .gitignore
-git commit -m "Add crema baseline"
-```
+- No baseline of any kind: `baseline = true` at the top level of
+  `crema.toml` (before any `[table]`), then
+  `crema check --update-baseline` and commit the new file on its own.
+- A hand-kept `crema check --tamp > <file>` baseline (often behind a Rake
+  task): `baseline = "<file>"`. The rows are the same format, so the
+  existing file works as it is; no regeneration. Mention that the Rake
+  task can then be replaced by `crema check` and
+  `crema check --update-baseline`, and leave that to the project.
 
-Its own commit, nothing else in it: a baseline born in the same commit
-as a fix cannot show what the fix changed. Do not add a Rake task or
-script; whether the project wants one is the project's decision. Tell
-the reviewer the file's path and the one-line command that regenerates
-it, and continue from step 0 with that file.
+When the key is on but the file does not exist (`crema check` exits `2`
+with `baseline file not found`), the decision is already made: run
+`crema check --update-baseline` and commit the file on its own, nothing
+else in that commit. A baseline born in the same commit as a fix cannot
+show what the fix changed.
 
 ## Cycle
 
@@ -73,16 +82,18 @@ cut stream is a wrong count with no warning. Redirect to a file, then
 query the file.
 
 ```sh
-crema check > /tmp/crema.jsonl            # full records
-jq -r .fingerprint <baseline> | sort > /tmp/base.fp
-jq -r .fingerprint /tmp/crema.jsonl | sort > /tmp/now.fp
-comm -3 /tmp/base.fp /tmp/now.fp | wc -l  # must print 0
+crema check > /tmp/new.jsonl 2> /tmp/check.err
+grep '^baseline:' /tmp/check.err  # must print nothing
+wc -l < /tmp/new.jsonl            # must print 0
 ```
 
-A non-zero count means the baseline is stale (someone edited without
-regenerating, a different crema version, a gem update). Stop and
-regenerate it as its own commit before any fix; otherwise the diff at
-step 4 mixes your work with the drift.
+Both together mean the current records and the baseline rows are the
+same set. A record in `/tmp/new.jsonl` or a `baseline: N entries no
+longer reported` line means the baseline is stale (someone edited
+without regenerating, a different crema version, a gem update). Stop and
+regenerate it with `crema check --update-baseline` as its own commit
+before any fix; otherwise the diff at step 4 mixes your work with the
+drift. Other stderr lines (warnings) are not drift.
 
 Also note `git status` and `crema --version` now. Files already modified
 before the cycle are not yours: leave them alone and name them in the
@@ -95,7 +106,11 @@ do not delete it to "retry".
 
 ### 1. Pick one code and its files
 
+The baseline hides every known record from a bare `crema check`, so
+picking reads the full set:
+
 ```sh
+crema check --no-baseline > /tmp/crema.jsonl
 jq -r .code /tmp/crema.jsonl | sort | uniq -c | sort -rn
 jq -r 'select(.code=="<Code>") | .file' /tmp/crema.jsonl | sort | uniq -c | sort -rn
 ```
@@ -172,11 +187,20 @@ For each group decide, in this order:
 ### 3. Edit, re-check the touched files
 
 crema takes file arguments, so iterate on the files of this cycle
-(milliseconds) and run the whole project once at the end:
+(milliseconds) and run the whole project once at the end. Two runs
+answer two questions:
 
 ```sh
+# what is left to fix in these files, known or not
+crema check --no-baseline <file1> <file2> | jq -c '{file, line, code, severity, message}'
+# what in these files the baseline does not know: introduced, surfaced, moved
 crema check <file1> <file2> | jq -c '{file, line, code, severity, message}'
 ```
+
+The second list should stay empty or hold only records you can already
+explain; step 4 gives each one a verdict. A run with file arguments
+never prints the `baseline:` stale line (it cannot see the rest of the
+project), so removals are counted at step 4.
 
 Every edit is the smallest change that handles the type. An `or return`
 / `or next` after a nilable read, a `&.` on an optional block, an inline
@@ -186,23 +210,26 @@ hashes the line, so an unrelated edit on a line with a baseline record
 turns that record into a "removed + added" pair in step 4 and costs the
 reviewer a look.
 
-### 4. Diff the baseline by fingerprint
+### 4. Read the match
 
-After the last edit of the cycle, the whole project once:
+After the last edit of the cycle, the whole project:
 
 ```sh
-crema check > /tmp/after.jsonl
-jq -r .fingerprint /tmp/after.jsonl | sort > /tmp/after.fp
-comm -23 /tmp/base.fp /tmp/after.fp > /tmp/removed.fp
-comm -13 /tmp/base.fp /tmp/after.fp > /tmp/added.fp
-wc -l /tmp/removed.fp /tmp/added.fp
-[ -s /tmp/removed.fp ] && grep -F -f /tmp/removed.fp <baseline> | jq -r .code | sort | uniq -c
-[ -s /tmp/added.fp ] && grep -F -f /tmp/added.fp /tmp/after.jsonl \
-  | jq -c '{file, line, code, severity, message}'
+crema check > /tmp/added.jsonl 2> /tmp/check.err  # records the baseline does not know
+grep '^baseline:' /tmp/check.err                   # "baseline: N entries no longer reported"
+crema check --tamp > /tmp/after.tamp               # every record as a baseline row
+LC_ALL=C comm -23 <baseline> /tmp/after.tamp > /tmp/removed.jsonl
+wc -l < /tmp/removed.jsonl                         # must equal N (0 when no line)
+jq -r .code /tmp/removed.jsonl | sort | uniq -c
+jq -c '{file, line, code, severity, message}' /tmp/added.jsonl
 ```
 
-(The `-s` guards matter: `grep -F -f` with an empty pattern file matches
-every line.)
+`/tmp/added.jsonl` is crema's own answer, with every field. The
+`removed` rows come from the baseline itself, because crema only counts
+them; `--tamp` prints the same rows the baseline holds, in the same
+byte order (`LC_ALL=C` keeps `comm` on that order). If the removed count
+is not N, the baseline file was edited by hand or is not crema's: stop
+and say so instead of reading the lists.
 
 Read `added` to the last record and give each one a verdict:
 
@@ -225,8 +252,11 @@ only the tests say whether the project accepts it.
 ### 5. Regenerate the baseline and report
 
 ```sh
-crema check --tamp > <baseline>       # or the project's task for it
+crema check --update-baseline
 ```
+
+Then step 0's three lines once more: nothing printed, `0`. That is the
+proof the new baseline matches the tree you hand over.
 
 The report for the reviewer:
 
@@ -237,8 +267,8 @@ The report for the reviewer:
   `untyped`); groups left for a whole-gem signature job; checker bugs
   left in place with the Ruby evidence.
 - Test result, verbatim summary line; the crema version.
-- The next cycle's code and its top files, from the two step 1 queries
-  run on `/tmp/after.jsonl`.
+- The next cycle's code and its top files, from step 1 run again on the
+  regenerated tree.
 
 The baseline shrinking is the visible progress; the `added` list with
 verdicts is what the reviewer reads.

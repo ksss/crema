@@ -262,12 +262,7 @@ impl AncestorGraph {
     /// originally-drafted "re-walk the old normalize target's children"
     /// rule as redundant with the existence-change rule above, which
     /// already covers alias deletion and dangling-alias resolution.
-    pub fn update(
-        self,
-        new_env: Arc<Environment>,
-        seeds: &FxHashSet<TypeName>,
-        changed_constants: &FxHashSet<TypeName>,
-    ) -> AncestorGraph {
+    pub fn update(self, new_env: Arc<Environment>, seeds: &FxHashSet<TypeName>) -> AncestorGraph {
         let extended = self.extend_seeds(&new_env, seeds);
 
         let AncestorGraph {
@@ -285,8 +280,7 @@ impl AncestorGraph {
             }
         }
 
-        let new_ancestor_builder =
-            ancestor_builder.update(Arc::clone(&new_env), &extended, changed_constants);
+        let new_ancestor_builder = ancestor_builder.update(Arc::clone(&new_env), &extended);
 
         // Rebuild only for names `new_env` actually walks as a
         // class_names/interface_names source (mirrors `Self::build`'s

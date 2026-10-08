@@ -256,12 +256,12 @@ fn baked_to_mirror(baked: &RoastedGScan, names: &NameTable) -> MBakedDiagnostics
                             crate::definition::VariableDuplicationKind::Instance => 0,
                             crate::definition::VariableDuplicationKind::ClassInstance => 1,
                         },
-                        variable_name: names.resolve(d.variable_name),
+                        variable_name: names.resolve(d.variable_name).to_string(),
                         location: d.location.as_ref().map(baked_loc),
                         ruby_source_location: d
                             .ruby_source_location
                             .as_ref()
-                            .map(|r| (names.resolve(r.file), r.start_byte, r.end_byte)),
+                            .map(|r| (names.resolve(r.file).to_string(), r.start_byte, r.end_byte)),
                     })
                     .collect(),
             })

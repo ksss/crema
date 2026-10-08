@@ -30,12 +30,10 @@ use crate::name::Name;
 use crate::type_name::{Kind, TypeName};
 use crate::type_param::TypeParamScope;
 use crate::types::{
-    FunctionType, Ty, Type, TypeTable, Visibility, partition_falsy, partition_truthy, union_of,
-    union_of_many,
+    FunctionType, Ty, Type, Visibility, partition_falsy, partition_truthy, union_of, union_of_many,
 };
 
 use super::TypeChecker;
-use super::calls::ResolvedCall;
 use super::inference::{ConstantPathOutcome, resolve_cvar_at_self, resolve_ivar_at_self};
 use super::is_special_lvar_name;
 
@@ -78,7 +76,7 @@ impl<'a> AssertionTypeLocator<'a> {
 /// the gate sits in `visit_program_node` (the
 /// `check_statements_with_hint`-driven gate doesn't reach inside the
 /// inner StatementsNode through Visit-trait descent).
-fn unwrap_top_level_parens<'pr>(mut current: Node<'pr>) -> Node<'pr> {
+pub(super) fn unwrap_top_level_parens<'pr>(mut current: Node<'pr>) -> Node<'pr> {
     loop {
         let next = if let Some(parens) = current.as_parentheses_node()
             && let Some(body) = parens.body()
@@ -149,7 +147,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             let super_name = String::from_utf8_lossy(cr.name().as_slice()).to_string();
             let start = super_node.location().start_offset();
             let end = super_node.location().end_offset();
-            match self.try_resolve_constant_read(&super_name, &super_node) {
+            match self.try_resolve_constant_read(&super_name) {
                 Some(constant) => {
                     // extract v7: the superclass position records like
                     // a read, with the check's own resolution.
@@ -259,7 +257,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                     });
                 }
                 Some(DeclKindLocal::Module) => {
-                    let qualified = self.env.names().resolve(tn);
+                    let qualified = self.env.names().display_type_name(tn);
                     let location = self.offset_to_location(node.location().start_offset());
                     self.push_diagnostic(Diagnostic {
                         scope: None,
@@ -368,7 +366,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                     });
                 }
                 Some(DeclKindLocal::Class) => {
-                    let qualified = self.env.names().resolve(tn);
+                    let qualified = self.env.names().display_type_name(tn);
                     let location = self.offset_to_location(node.location().start_offset());
                     self.push_diagnostic(Diagnostic {
                         scope: None,
@@ -591,11 +589,12 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
         // `check_node`'s CallNode arm, where the hint is passed as an
         // explicit argument. This callback handles the remaining paths
         // where a call is reached via the Visit-trait's automatic
-        // descent (yield args, block bodies via `check_call`'s
-        // `self.visit(&block)`, write-node RHSs whose visitor we
-        // haven't taken over). The hint is `None` here by design:
-        // those paths have no enclosing assertion to forward.
-        let resolved = ResolvedCall::resolve(self, node);
+        // descent (a block body's non-tail statements, write-node RHSs
+        // whose visitor we haven't taken over). The hint is `None` here
+        // by design: a position that has a hint to forward (a hinted
+        // block body's tail, a yield argument) is walked through
+        // `check_node` instead, so the walk types it under that hint.
+        let resolved = self.resolve_call_in_check(node, super::calls::OwnKey::Unbuilt);
         self.check_call(node, None, &resolved);
         // Extract record. `return_type` is the value the enclosing check
         // frame already computed for this site and handed down through
@@ -608,17 +607,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             node.location().start_offset() as u32,
             node.location().end_offset() as u32,
         ));
-        if let Some(target) = resolved.target.as_ref() {
-            self.record_extract_call(
-                node.location().start_offset(),
-                node.location().end_offset(),
-                target,
-                resolved.receiver_ty,
-                carried,
-            );
-        } else {
-            self.record_extract_call_no_target(node, resolved.receiver_ty, carried);
-        }
+        self.record_extract_call_site(node, &resolved, carried);
     }
 
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
@@ -950,19 +939,21 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                     kind: DiagnosticKind::UnexpectedYield { method_name },
                 });
             } else if let Some(arguments) = node.arguments() {
-                let checker = self.subtyper();
                 let defined_in = self
                     .ctx
                     .defined_in()
                     .map(|tn| self.env.names().display_type_name(tn));
-                for (index, (arg, &expected)) in arguments
-                    .arguments()
-                    .iter()
-                    .zip(req_positionals.iter())
-                    .enumerate()
-                {
-                    let actual = self.infer_type(&arg, Some(expected));
-                    if !checker.check(actual, expected) {
+                // Each argument is walked once, under its block parameter
+                // when it has one, so the walk types it as the read-only
+                // inference would (a hint-driven report then comes from
+                // here); the default traversal below would re-walk it.
+                for (index, arg) in arguments.arguments().iter().enumerate() {
+                    let Some(&expected) = req_positionals.get(index) else {
+                        self.check_node(&arg, None);
+                        continue;
+                    };
+                    let actual = self.check_node(&arg, Some(expected));
+                    if !self.subtyper().check(actual, expected) {
                         let position = self.offset_to_location(arg.location().start_offset());
                         self.push_diagnostic(Diagnostic {
                             scope: None,
@@ -978,28 +969,12 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                         });
                     }
                 }
+                return;
             }
         }
 
         visit_yield_node(self, node);
     }
-}
-
-/// A write-node's own expression value never legitimately diverges
-/// control flow (the assignment always completes) — only the RHS's
-/// *type* can degenerate to `Ty::BOTTOM` (e.g. `@x = a_method_declared
-/// _to_never_return`). `check_statements_with_hint`'s divergence
-/// cutoff (`if last_ty == Ty::BOTTOM { break }`) treats a `Ty::BOTTOM`
-/// statement value as "unreachable code follows" (return / raise /
-/// diverging if), so surfacing a real `Ty::BOTTOM` from a write kind's
-/// `check_node` dispatch arm would silently skip live, still-reachable
-/// statements after it. Caps to `Ty::UNTYPED` here.
-/// `check_local_variable_write` has its own inline variant of this
-/// same cap instead of calling this, because it also needs to bind the
-/// lvar to the real (uncapped) `Ty::BOTTOM` in the env first (`y =
-/// self.boom` — `y.foo` must still see `y: bot` and report NoMethod).
-fn cap_write_value_bottom(ty: Ty) -> Ty {
-    if ty == Ty::BOTTOM { Ty::UNTYPED } else { ty }
 }
 
 impl<'env> TypeChecker<'env> {
@@ -1161,14 +1136,12 @@ impl<'env> TypeChecker<'env> {
             //   callers). `infer_type` *does* return the RHS type for
             //   these, so e.g. `def f; @@x ||= 1; end` still reports a
             //   return-type mismatch against a non-Integer declared type.
-            // - `Ty::BOTTOM`: `check_statements_with_hint` stops walking
-            //   a statement list as soon as a stmt evaluates to BOTTOM
-            //   (divergent control flow — the rest is dead code under a
-            //   stale env), so a trailing unreachable statement after an
-            //   explicit `return`/`raise` is never walked and the body's
-            //   value collapses to that BOTTOM. `infer_type`'s statement
-            //   arm has no such cutoff — it evaluates whichever node is
-            //   textually last regardless of reachability — matching
+            // - `Ty::BOTTOM`: a statement list stays BOTTOM once a stmt
+            //   evaluates to BOTTOM (sticky-bot, `check_statements_with_hint`),
+            //   so after an explicit `return`/`raise` (or a write whose RHS
+            //   is bot, `y = boom`) the body's value is BOTTOM even though
+            //   the trailing unreachable statement is walked. `infer_type`'s statement arm returns whichever
+            //   node is textually last regardless of reachability — matching
             //   this method's existing contract that trailing dead code
             //   is still checked against the declared return type
             //   (`test_explicit_return_does_not_double_report_with_last_expression`).
@@ -1236,6 +1209,27 @@ impl<'env> TypeChecker<'env> {
         node: &ruby_prism::LocalVariableTargetNode<'_>,
         ty: Ty,
     ) {
+        self.bind_local_variable_target_with(node, ty, false);
+    }
+
+    /// `bind_local_variable_target` for a target that takes the RHS value
+    /// itself (`a, b = boom` binds `a` to `boom`). A bot RHS is recorded the
+    /// way `check_local_variable_write` records `y = boom`, so `a.foo`
+    /// reports NoMethod on `bot` while a narrowed-to-bot local stays silent.
+    fn bind_local_variable_target_from_rhs(
+        &mut self,
+        node: &ruby_prism::LocalVariableTargetNode<'_>,
+        ty: Ty,
+    ) {
+        self.bind_local_variable_target_with(node, ty, true);
+    }
+
+    fn bind_local_variable_target_with(
+        &mut self,
+        node: &ruby_prism::LocalVariableTargetNode<'_>,
+        ty: Ty,
+        from_rhs: bool,
+    ) {
         let name_str = String::from_utf8_lossy(node.name().as_slice());
         let name = self.checker_names().intern(&name_str);
         let ty = self.freeze_lvar_bound_type(ty, node.depth());
@@ -1246,7 +1240,12 @@ impl<'env> TypeChecker<'env> {
         {
             return;
         }
-        self.ctx.set_local_variable_at_depth(name, ty, node.depth());
+        if from_rhs {
+            self.ctx
+                .set_local_variable_at_depth_from_bot_rhs(name, ty, node.depth());
+        } else {
+            self.ctx.set_local_variable_at_depth(name, ty, node.depth());
+        }
     }
 
     /// Multi-assignment fallback helper: bind the target's lvar to UNTYPED
@@ -1394,7 +1393,7 @@ impl<'env> TypeChecker<'env> {
     ) {
         let mut targets = lefts.iter().chain(rights.iter());
         if let Some(first) = targets.next() {
-            self.bind_local_variable_target(first, value_ty);
+            self.bind_local_variable_target_from_rhs(first, value_ty);
         }
         for target in targets {
             self.bind_local_variable_target(target, Ty::NIL);
@@ -1596,7 +1595,9 @@ impl<'env> TypeChecker<'env> {
             && let Some(block_node) = block_arg.as_block_node()
             && let Some(body) = block_node.body()
         {
-            self.check_node(&body, None);
+            // A `next` here exits this block, which has no expected
+            // return type; an enclosing block's must not reach it.
+            self.with_next_hint(None, |checker| checker.check_node(&body, None));
         }
 
         self.ctx
@@ -1638,8 +1639,15 @@ impl<'env> TypeChecker<'env> {
         let Some(block_node) = block.as_block_node() else {
             return false;
         };
-        let Some(concern) = self.ctx.current_class_typename().copied() else {
+        let Some(current) = self.ctx.current_class_typename().copied() else {
             return false;
+        };
+        // Inside `concerning :Topic do`, the pipeline keyed the block by
+        // the synthesized `<owner>::<Topic>` module, not the lexical owner
+        // the class stack still names.
+        let concern = match self.concerning_module {
+            Some((owner, module)) if owner == current => module,
+            _ => current,
         };
         let location = crate::inline_parser::prism_location_range(block_node.location());
         let source_file = self.env.names().intern(&self.file.to_string_lossy());
@@ -1683,13 +1691,54 @@ impl<'env> TypeChecker<'env> {
                 let ty = self.env.types().class_singleton(target);
                 self.ctx.set_local_variable(base, ty);
             }
-            self.check_node(&body, None);
+            // Same as `walk_class_construction_block_body`: no expected
+            // type for a `next` that exits this block.
+            self.with_next_hint(None, |checker| checker.check_node(&body, None));
             self.ctx
                 .replace_singleton_class_depth(saved_singleton_class_depth);
             self.ctx.restore_class_stack(saved_class_stack);
         }
         self.concern_block_target_walk = saved_walk;
         true
+    }
+
+    /// Records the `<owner>::<Topic>` module of a receiver-less
+    /// `concerning :Topic do` call for the duration of its block walk
+    /// (the caller restores the returned previous value afterwards).
+    /// The module name is composed exactly as the pipeline's
+    /// `collect_concerning_call` composes it — same literal-topic parser,
+    /// same `append_type_name` on the same `NameTable` — so the
+    /// `concern_block_targets` lookup hits the entry the pipeline wrote.
+    /// A nested `concerning` appends to the enclosing synthesized module,
+    /// as the pipeline's scope stack does. Returns the previous value
+    /// unchanged for any other call.
+    pub(super) fn enter_concerning_block<'pr>(
+        &mut self,
+        call: &CallNode<'pr>,
+    ) -> Option<(TypeName, TypeName)> {
+        let saved = self.concerning_module;
+        if call.receiver().is_some()
+            || self.ctx.method_name().is_some()
+            || call.name().as_slice() != b"concerning"
+            || call.block().and_then(|b| b.as_block_node()).is_none()
+        {
+            return saved;
+        }
+        let Some((topic, _, _)) = crate::infusion_collector::concerning_topic_and_prepend(call)
+        else {
+            return saved;
+        };
+        let Some(current) = self.ctx.current_class_typename().copied() else {
+            return saved;
+        };
+        let base = match saved {
+            Some((owner, module)) if owner == current => module,
+            _ => current,
+        };
+        let names = self.env.names();
+        let module = names.append_type_name(base, names.intern_symbol(&topic));
+        self.concerning_module = Some((current, module));
+        saved
     }
 
     /// Push a `class` / `module` declaration onto the context stack keyed by
@@ -1770,8 +1819,13 @@ impl<'env> TypeChecker<'env> {
                 return None;
             }
         };
-        let context =
-            build_lowering_context_from_cref_stack(self.ctx.cref_stack(), self.env.names());
+        // Relative names resolve through Ruby's lexical nesting
+        // (`Module.nesting`), which is the cref, not `class_stack`: a
+        // `Const = Class.new do ... end` block does not extend it even
+        // though `self` / `def` inside belong to the new class. rbs's
+        // `InlineParser` and Steep resolve such names at the enclosing
+        // scope; `::Ctor::Widget` must not shadow `::Widget` there.
+        let context: Vec<TypeName> = self.ctx.cref_stack().to_vec();
         let ty = self
             .env
             .lower_ast_type(&ast_type, &context, &TypeParamScope::default());
@@ -1844,8 +1898,7 @@ impl<'env> TypeChecker<'env> {
         let type_text = self.trailing_node_assertion_adjacent(end_offset)?;
         let type_text = type_text.to_string();
         let ast_type = ast_builder::parse_trailing_type_text(&type_text, self.env.names())?;
-        let context =
-            build_lowering_context_from_cref_stack(self.ctx.cref_stack(), self.env.names());
+        let context: Vec<TypeName> = self.ctx.cref_stack().to_vec();
         let ty = self
             .env
             .lower_ast_type(&ast_type, &context, &TypeParamScope::default());
@@ -1982,7 +2035,7 @@ impl<'env> TypeChecker<'env> {
     fn check_assertion_class_type_arg_bounds(
         &mut self,
         ast_ty: &ast_types::Type,
-        context: &[Option<Name>],
+        context: &[TypeName],
         locator: &mut AssertionTypeLocator<'_>,
     ) {
         match ast_ty {
@@ -1991,7 +2044,7 @@ impl<'env> TypeChecker<'env> {
                     .env
                     .lower_ast_type(ast_ty, context, &TypeParamScope::default());
                 if let Type::ClassInstance { name, args } = self.env.types().resolve(ty) {
-                    let container_name = self.env.names().resolve(name).to_string();
+                    let container_name = self.env.names().display_type_name(*name);
                     let position_offset = locator.find_type_application(&container_name);
                     self.emit_assertion_class_type_arg_bound_violations(
                         *name,
@@ -2052,7 +2105,7 @@ impl<'env> TypeChecker<'env> {
     fn check_assertion_class_type_arg_bounds_in_fn(
         &mut self,
         ast_fn: &ast_types::Function,
-        context: &[Option<Name>],
+        context: &[TypeName],
         locator: &mut AssertionTypeLocator<'_>,
     ) {
         let ast_fn = match ast_fn {
@@ -2111,7 +2164,7 @@ impl<'env> TypeChecker<'env> {
             return;
         }
 
-        let container_name = self.env.names().resolve(name).to_string();
+        let container_name = self.env.names().display_type_name(name);
         let position = self.offset_to_location(position_offset);
         for violation in violations {
             self.push_diagnostic(Diagnostic {
@@ -2119,7 +2172,7 @@ impl<'env> TypeChecker<'env> {
                 location: position.clone(),
                 kind: DiagnosticKind::TypeArgumentBoundViolation {
                     container_name: container_name.clone(),
-                    param_name: self.env.names().resolve(violation.param_name),
+                    param_name: self.env.names().resolve(violation.param_name).to_string(),
                     bound_kind: violation.bound_kind,
                     bound: self.display_type(violation.bound),
                     actual: self.display_type(violation.actual),
@@ -2278,7 +2331,7 @@ impl<'env> TypeChecker<'env> {
         );
         let name_loc = node.name_loc();
         self.check_deprecated_global_ref(&name_str, name_loc.start_offset(), name_loc.end_offset());
-        cap_write_value_bottom(rhs_ty)
+        rhs_ty
     }
 
     /// `Const = expr` in value position (`(Const = expr).method`,
@@ -2332,7 +2385,7 @@ impl<'env> TypeChecker<'env> {
                 },
             });
             let ty = self.check_node(&node.value(), None);
-            return cap_write_value_bottom(ty);
+            return ty;
         }
         // Extract bookkeeping first, before the `Class.new do` fast
         // path below returns early, so that route records once too.
@@ -2406,8 +2459,7 @@ impl<'env> TypeChecker<'env> {
         }
 
         let declared = resolved.map(|rc| rc.ty);
-        let ty = self.check_node(&node.value(), declared);
-        cap_write_value_bottom(ty)
+        self.check_node(&node.value(), declared)
     }
 
     /// `Const::Path = expr` in value position — the constant-path
@@ -2443,7 +2495,7 @@ impl<'env> TypeChecker<'env> {
             node.location().end_offset(),
             static_constant_path_string(&target),
         );
-        let ty = if matches!(outcome, ConstantPathOutcome::Malformed) {
+        if matches!(outcome, ConstantPathOutcome::Malformed) {
             // Dynamic parent (`obj.foo::BAR = v`) — `target` isn't a
             // constant path at all, so there's no existence check to
             // run, but the parent sub-expression may still have its
@@ -2460,8 +2512,7 @@ impl<'env> TypeChecker<'env> {
             let declared_ty = outcome.resolved_ty();
             let hint = (!declared_ty.is_untyped()).then_some(declared_ty);
             self.check_node(&node.value(), hint)
-        };
-        cap_write_value_bottom(ty)
+        }
     }
 
     pub(super) fn check_global_variable_or_write<'pr>(
@@ -2904,18 +2955,22 @@ impl<'env> TypeChecker<'env> {
         // returning a non-expandable type, and a nilable receiver all
         // yield the pre-conversion type). A trailing assertion
         // (`a, b = expr #: T`) keeps the Phase 1 scope-out (bound above,
-        // not returned as a value). `cap_write_value_bottom` guards a
-        // statically-all-falsy RHS (`x, y = nil`): the assignment always
-        // completes, so a raw `Ty::BOTTOM` here would trip
-        // `check_statements_with_hint`'s divergence cutoff and silently
-        // skip live statements after it (crema-review adversarial
-        // finding, 2026-07-18 — reproduced via a mid-body `x, y = nil`
-        // swallowing a later `NoMethod`).
+        // not returned as a value).
+        //
+        // A bot RHS (`a, b = boom`) never completes, so the value stays
+        // `Ty::BOTTOM` and the enclosing statement list diverges
+        // (sticky-bot, `check_statements_with_hint`) like Steep. A
+        // statically-all-falsy RHS (`a, b = nil`) also reaches BOTTOM
+        // here (Steep's empty `truthy_rhs_type`), but that assignment
+        // does complete at runtime, so it is deliberately not treated as
+        // divergence (user decision 2026-10-07, diverging from Steep's
+        // unsound narrow after it) and surfaces as `Ty::UNTYPED`.
+        let rhs_diverges = value_ty == Ty::BOTTOM;
         let value_position = |ty: Ty| -> Ty {
-            if assertion_ty.is_none() {
-                cap_write_value_bottom(ty)
-            } else {
+            if assertion_ty.is_some() || (ty == Ty::BOTTOM && !rhs_diverges) {
                 Ty::UNTYPED
+            } else {
+                ty
             }
         };
         if let Some(truthy) = truthy
@@ -3161,29 +3216,19 @@ impl<'env> TypeChecker<'env> {
         if let Some(pinned) = self.bind_pinned_lvar_write(name, bound_ty, depth, byte_range) {
             return pinned;
         }
+        // A bot RHS keeps the write's value BOTTOM (Steep `lvasgn` types
+        // the node as the RHS type): the assignment never completes, so
+        // the enclosing statement list diverges (sticky-bot) and an arm
+        // containing it drops out of the env join. Later statements are
+        // still walked, and the bot-RHS binding lets `y.foo` report
+        // NoMethod on `bot` (`test_bottom_lvar_receiver_reports_no_method`).
         if value_type == Ty::BOTTOM && bound_ty == Ty::BOTTOM {
             self.ctx
                 .set_local_variable_at_depth_from_bot_rhs(name, bound_ty, depth);
-            // Return UNTYPED, not `bound_ty` (BOTTOM), for this branch
-            // specifically: `check_statements_with_hint`'s divergence
-            // cutoff (`if last_ty == Ty::BOTTOM { break }`) treats a
-            // BOTTOM statement value as unreachable-code-follows (return
-            // / raise / an if-all-arms-diverge). A bot-*valued* RHS
-            // bound to an lvar (`y = self.boom` where `boom: () -> bot`)
-            // is a different thing — the assignment itself completes
-            // normally and later statements are still live code (`y.foo`
-            // must still be walked and diagnosed, pinned by
-            // `test_bottom_lvar_receiver_reports_no_method`). Before
-            // this kind was split out of the UNTYPED-discard cluster,
-            // `check_node` always returned `Ty::UNTYPED` here regardless
-            // of the RHS, so the cutoff never saw this case; UNTYPED
-            // preserves that pre-migration behavior for this one branch
-            // while the non-bot branch below returns the real value.
-            Ty::UNTYPED
         } else {
             self.ctx.set_local_variable_at_depth(name, bound_ty, depth);
-            bound_ty
         }
+        bound_ty
     }
 
     pub(super) fn check_local_variable_operator_write<'pr>(
@@ -3287,15 +3332,14 @@ impl<'env> TypeChecker<'env> {
         let name_str = String::from_utf8_lossy(name_bytes).into_owned();
         let var_sym = self.env.names().intern_symbol(&name_str);
         let declared = resolve_ivar_at_self(self, var_sym);
-        let rhs_ty = self.check_var_write_rhs(
+        self.check_var_write_rhs(
             &node.value(),
             &name_str,
             declared,
             declared,
             |name| DiagnosticKind::UnknownInstanceVariable { name },
             node.location().start_offset(),
-        );
-        cap_write_value_bottom(rhs_ty)
+        )
     }
 
     pub(super) fn check_instance_variable_operator_write<'pr>(
@@ -3401,11 +3445,10 @@ impl<'env> TypeChecker<'env> {
             |name| DiagnosticKind::UnknownClassVariable { name },
             node.location().start_offset(),
         );
-        let ty = match declared {
+        match declared {
             Some(lhs) if self.subtyper().check(rhs_ty, lhs) => rhs_ty,
             _ => Ty::UNTYPED,
-        };
-        cap_write_value_bottom(ty)
+        }
     }
 
     pub(super) fn check_class_variable_operator_write<'pr>(
@@ -3781,11 +3824,11 @@ impl<'env> TypeChecker<'env> {
                 // `check_index_compound_write` step 4).
                 IndexCompoundWriteOp::Or => {
                     let widened = self.widen_literal_to_base(value_ty);
-                    or_write_value_ty(read_ty, widened, self.env.types())
+                    or_write_value_ty(read_ty, widened, self.env)
                 }
                 IndexCompoundWriteOp::And => {
                     let widened = self.widen_literal_to_base(value_ty);
-                    and_write_value_ty(read_ty, widened, self.env.types())
+                    and_write_value_ty(read_ty, widened, self.env)
                 }
             }
         }
@@ -3946,11 +3989,11 @@ impl<'env> TypeChecker<'env> {
                 // narrower literal than the declared param type.
                 IndexCompoundWriteOp::Or => {
                     let widened = self.widen_literal_to_base(value_ty);
-                    or_write_value_ty(read_ty, widened, self.env.types())
+                    or_write_value_ty(read_ty, widened, self.env)
                 }
                 IndexCompoundWriteOp::And => {
                     let widened = self.widen_literal_to_base(value_ty);
-                    and_write_value_ty(read_ty, widened, self.env.types())
+                    and_write_value_ty(read_ty, widened, self.env)
                 }
             }
         }
@@ -4140,7 +4183,7 @@ impl<'env> TypeChecker<'env> {
             None => false,
         };
         if !exists {
-            out.push(self.env.names().resolve(name));
+            out.push(self.env.names().display_type_name(*name));
         }
     }
 }
@@ -4168,16 +4211,17 @@ enum IndexCompoundWriteOp<'a> {
 ///
 /// `pub(super)`: also called from `infer_type`'s read-only `IndexOrWriteNode`
 /// arm (`inference.rs`) so the two paths' value types stay in sync.
-pub(super) fn or_write_value_ty(read_ty: Ty, write_value_ty: Ty, types: &TypeTable) -> Ty {
-    match partition_falsy(read_ty, types) {
+pub(super) fn or_write_value_ty(
+    read_ty: Ty,
+    write_value_ty: Ty,
+    env: crate::definition_builder::ConsultationView,
+) -> Ty {
+    match crate::narrowing::partition_union(read_ty, env) {
         // No falsy member: `[]`'s result is statically always-truthy,
         // so the `[]=` branch never executes at runtime. Steep folds
         // the whole expression to the read type alone.
-        None => read_ty,
-        Some(_) => {
-            let truthy = partition_truthy(read_ty, types).unwrap_or(Ty::BOTTOM);
-            union_of(truthy, write_value_ty, types)
-        }
+        (_, None) => read_ty,
+        (truthy, Some(_)) => union_of(truthy.unwrap_or(Ty::BOTTOM), write_value_ty, env.types()),
     }
 }
 
@@ -4198,13 +4242,15 @@ pub(super) fn or_write_value_ty(read_ty: Ty, write_value_ty: Ty, types: &TypeTab
 ///
 /// `pub(super)`: also called from `infer_type`'s read-only `IndexAndWriteNode`
 /// arm (`inference.rs`) so the two paths' value types stay in sync.
-pub(super) fn and_write_value_ty(read_ty: Ty, write_value_ty: Ty, types: &TypeTable) -> Ty {
-    match partition_falsy(read_ty, types) {
-        None => write_value_ty,
-        Some(falsy) => match partition_truthy(read_ty, types) {
-            None => falsy,
-            Some(_) => union_of(write_value_ty, falsy, types),
-        },
+pub(super) fn and_write_value_ty(
+    read_ty: Ty,
+    write_value_ty: Ty,
+    env: crate::definition_builder::ConsultationView,
+) -> Ty {
+    match crate::narrowing::partition_union(read_ty, env) {
+        (_, None) => write_value_ty,
+        (None, Some(falsy)) => falsy,
+        (Some(_), Some(falsy)) => union_of(write_value_ty, falsy, env.types()),
     }
 }
 
@@ -4294,26 +4340,4 @@ fn is_data_struct_named_lhs_pattern(call: &CallNode<'_>) -> bool {
         return false;
     };
     block_arg.as_block_node().is_some()
-}
-
-/// Convert the type checker's `cref_stack` (parsed `TypeName`s like
-/// `::A`, `::A::B`) into the `&[Option<Name>]` shape that
-/// `type_builder::build_type` walks for relative-name resolution. Each
-/// entry's path is interned against the environment `NameTable` so it
-/// participates in the resolver's `all_names`-driven lookup.
-///
-/// The input is the cref, not `class_stack`: a bare type name written
-/// in an annotation resolves through Ruby's lexical nesting
-/// (`Module.nesting`), which a `Const = Class.new do ... end` block
-/// does not extend even though `self` / `def` inside it belong to the
-/// new class. rbs's `InlineParser` and Steep resolve such names at the
-/// enclosing scope; `::Ctor::Widget` must not shadow `::Widget` there.
-pub(super) fn build_lowering_context_from_cref_stack(
-    stack: &[TypeName],
-    names: &crate::name::NameTable,
-) -> Vec<Option<Name>> {
-    stack
-        .iter()
-        .map(|tn| Some(names.intern(&names.resolve(tn))))
-        .collect()
 }

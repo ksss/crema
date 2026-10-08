@@ -21,7 +21,7 @@ use crate::type_name::TypeName;
 /// Mirrors `RBS::AST::Members::Public` / `Private` plus the
 /// per-method visibility annotation. Defaulted to `Public` by the
 /// resolver when no explicit marker is in scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Visibility {
     Public,
     Private,
@@ -37,7 +37,7 @@ pub enum Visibility {
 ///   singleton). The build layer fans this out into separate
 ///   instance and singleton definitions, matching rbs's
 ///   `:singleton_instance` handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MethodKind {
     Instance,
     Singleton,
@@ -50,7 +50,7 @@ pub enum MethodKind {
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
 /// RBS rejects `singleton?`-style shorthand for attrs so only
 /// `Instance` and `Singleton` are valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AttributeKind {
     Instance,
     Singleton,
@@ -60,7 +60,7 @@ pub enum AttributeKind {
 ///
 /// Mirrors `RBS::AST::Members::AliasKind`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AliasKind {
     Instance,
     Singleton,
@@ -74,7 +74,7 @@ pub enum AliasKind {
 /// - `Unspecified` — implicit `@name` from attr's name (`attr_reader foo: T`).
 /// - `Name(sym)` — explicit `attr_reader foo (@bar): T`.
 /// - `Empty` — `attr_reader foo (): T` (function only, no ivar).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum IvarName {
     Unspecified,
     Empty,
@@ -89,7 +89,7 @@ pub enum IvarName {
 /// one specific signature line), so the port keeps the annotation
 /// alongside the method type rather than collapsing the pair into a
 /// bare `MethodType`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MethodDefinitionOverload {
     pub method_type: MethodType,
     pub annotations: Vec<Annotation>,
@@ -104,7 +104,7 @@ pub struct MethodDefinitionOverload {
 /// `Some(_)` eagerly by folding the surrounding `private` / `public`
 /// marker (and method-kind defaults) at build time, so downstream
 /// code observes a concrete visibility on every method.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MethodDefinitionMember {
     pub name: Symbol,
     pub kind: MethodKind,
@@ -121,7 +121,7 @@ pub struct MethodDefinitionMember {
 ///
 /// Mirrors `RBS::AST::Members::IncludeMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IncludeMember {
     pub name: TypeName,
     pub args: Vec<Type>,
@@ -135,7 +135,7 @@ pub struct IncludeMember {
 ///
 /// Mirrors `RBS::AST::Members::ExtendMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExtendMember {
     pub name: TypeName,
     pub args: Vec<Type>,
@@ -149,7 +149,7 @@ pub struct ExtendMember {
 ///
 /// Mirrors `RBS::AST::Members::PrependMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PrependMember {
     pub name: TypeName,
     pub args: Vec<Type>,
@@ -169,7 +169,7 @@ pub struct PrependMember {
 /// The build layer preserves raw values without folding against surrounding
 /// markers; folding is deferred to the definition layer, mirroring
 /// RBS gem's `DefinitionBuilder`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttrReaderMember {
     pub name: Symbol,
     pub ty: Type,
@@ -186,7 +186,7 @@ pub struct AttrReaderMember {
 ///
 /// Mirrors `RBS::AST::Members::AttrWriterMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttrWriterMember {
     pub name: Symbol,
     pub ty: Type,
@@ -203,7 +203,7 @@ pub struct AttrWriterMember {
 ///
 /// Mirrors `RBS::AST::Members::AttrAccessorMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttrAccessorMember {
     pub name: Symbol,
     pub ty: Type,
@@ -220,7 +220,7 @@ pub struct AttrAccessorMember {
 ///
 /// Mirrors `RBS::AST::Members::PublicMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PublicMember {
     pub location: Option<LocationRange>,
 }
@@ -229,7 +229,7 @@ pub struct PublicMember {
 ///
 /// Mirrors `RBS::AST::Members::PrivateMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PrivateMember {
     pub location: Option<LocationRange>,
 }
@@ -241,7 +241,7 @@ pub struct PrivateMember {
 ///
 /// `visibility` is absent — rbs does not allow explicit visibility on
 /// alias declarations (unlike MethodDefinition and AttrReader/Writer/Accessor).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AliasMember {
     pub new_name: Symbol,
     pub old_name: Symbol,
@@ -257,7 +257,7 @@ pub struct AliasMember {
 /// Mirrors `RBS::AST::Members::InstanceVariableMember`
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
 /// Populated into the instance-side Definition's `instance_variables`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InstanceVariableMember {
     pub name: Symbol,
     pub ty: Type,
@@ -273,7 +273,7 @@ pub struct InstanceVariableMember {
 /// Declares an instance variable on the class object itself (singleton-side
 /// instance). rbs's `build_singleton0` registers these in the singleton-side
 /// Definition's `instance_variables` (not `class_variables`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassInstanceVariableMember {
     pub name: Symbol,
     pub ty: Type,
@@ -288,7 +288,7 @@ pub struct ClassInstanceVariableMember {
 /// (`rbs/rust/ruby-rbs/src/ast/members.rs`).
 /// Stored on the instance-side `class_variables`; rbs's `build_singleton0`
 /// does not propagate these to the singleton side.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassVariableMember {
     pub name: Symbol,
     pub ty: Type,

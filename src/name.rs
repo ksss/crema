@@ -1,8 +1,11 @@
-use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use rustc_hash::FxHashMap;
+use xxhash_rust::xxh3::xxh3_64;
+
+use crate::once_table::{OnceStore, OnceTable};
 
 use crate::ids::SymbolId;
 use crate::interner::StringInterner;
@@ -26,6 +29,29 @@ use crate::type_name::{Kind, TypeName, TypeNameInterner};
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Name(NonZeroU32);
 
+// Serialized as the bare overlay id. A `Name` is positional, so the id
+// only means something to the table that minted it; the ingest cache
+// (the one persisted consumer) remaps it through its codec scope — see
+// `ingest_cache::encoding_name` / `decoding_name`.
+impl serde::Serialize for Name {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        crate::ingest_cache::encoding_name(self.0.get());
+        serializer.serialize_u32(self.0.get())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Name {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = u32::deserialize(deserializer)?;
+        let raw = crate::ingest_cache::decoding_name(raw).ok_or_else(|| {
+            serde::de::Error::custom("Name other than the file's own in an ingest record")
+        })?;
+        NonZeroU32::new(raw)
+            .map(Name)
+            .ok_or_else(|| serde::de::Error::custom("Name id must be non-zero"))
+    }
+}
+
 impl fmt::Debug for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Name({})", self.0.get())
@@ -33,10 +59,16 @@ impl fmt::Debug for Name {
 }
 
 impl Name {
-    /// Wrap a raw [`NameOverlay`] id (always `>= 1`, see its `next_id`
-    /// doc) as a `Name`.
+    /// Wrap a raw [`NameOverlay`] id (always `>= 1`, see its doc) as a
+    /// `Name`.
     fn from_overlay_id(id: u32) -> Name {
         Name(NonZeroU32::new(id).expect("NameOverlay ids start at 1"))
+    }
+
+    /// The raw overlay id, for the ingest cache's `Name` remap
+    /// (`ingest_cache`). Meaningless outside the table that minted it.
+    pub(crate) fn overlay_id(self) -> u32 {
+        self.0.get()
     }
 }
 
@@ -76,85 +108,108 @@ impl Symbol {
     /// check) establishes before decode reaches a call site that needs
     /// this. A `raw` that was never actually interned resolves to a
     /// panic on first display, the same "corrupt payload, delete
-    /// `.crema/cache`" contract the snapshot backends document for
+    /// `.crema`" contract the snapshot backends document for
     /// other post-open decode failures.
     pub(crate) fn from_raw_id(raw: u64) -> Symbol {
         Symbol(SymbolId::from_hash(raw))
-    }
-
-    /// The content-addressed 64-bit id itself — the inverse of
-    /// [`Symbol::from_raw_id`], and process-stable for the same reason
-    /// (ADR-0025 content addressing). Used by the incremental cache as
-    /// persistent probe material (ADR-0032 Decision 4).
-    pub(crate) fn raw_id(self) -> u64 {
-        self.0.get()
     }
 }
 
 /// Self-rolled interner backing [`Name`] (ADR-0028 F3, replacing
 /// `lasso::Rodeo`). Unlike [`Symbol`]/[`TypeName`], `Name`'s id is NOT
-/// content-addressed — it is assigned by insertion order.
+/// content-addressed — it is assigned by insertion order, starting at 1.
 ///
-/// `entries`/`map` are the interned strings in insertion order —
-/// physical index `i` holds id `i + 1`.
-#[derive(Default, Clone)]
+/// `entries` holds the interned strings in insertion order — physical
+/// index `i` holds id `i + 1`. `index` maps the xxh3 of a string to its
+/// id; a hit is confirmed against `entries`, so two strings sharing a
+/// hash panic instead of sharing an id. Reads and hits take no lock;
+/// minting a new id takes `mint`, looks the string up again under it,
+/// then fills `entries` before publishing the id in `index`, so ids stay
+/// dense and one string never gets two ids even across threads.
+#[derive(Default)]
 struct NameOverlay {
-    entries: Vec<Box<str>>,
-    map: FxHashMap<Box<str>, u32>,
-    /// The id the next `intern` call will hand out.
-    next_id: u32,
+    entries: OnceStore<Box<str>>,
+    index: OnceTable<u32>,
+    /// Number of ids handed out. Written only under `mint`.
+    len: AtomicU32,
+    mint: Mutex<()>,
+}
+
+impl Clone for NameOverlay {
+    /// Re-interns in id order, so every `Name` keeps its id.
+    fn clone(&self) -> Self {
+        let fresh = NameOverlay::new();
+        for id in 1..=self.len() as u32 {
+            fresh.intern(self.resolve(id));
+        }
+        fresh
+    }
 }
 
 impl NameOverlay {
     fn new() -> Self {
-        NameOverlay {
-            entries: Vec::new(),
-            map: FxHashMap::default(),
-            next_id: 1,
-        }
+        NameOverlay::default()
     }
 
     fn len(&self) -> usize {
-        self.entries.len()
+        self.len.load(Ordering::Acquire) as usize
     }
 
     fn resolve(&self, id: u32) -> &str {
-        &self.entries[(id - 1) as usize]
+        self.entries
+            .get((id - 1) as usize)
+            .unwrap_or_else(|| panic!("Name not interned: {id}"))
+    }
+
+    fn find(&self, hash: u64, s: &str) -> Option<u32> {
+        let id = *self.index.get(hash)?;
+        assert!(self.resolve(id) == s, "xxh3 collision between Name strings");
+        Some(id)
     }
 
     fn lookup(&self, s: &str) -> Option<u32> {
-        self.map.get(s).copied()
+        self.find(xxh3_64(s.as_bytes()), s)
     }
 
-    fn intern(&mut self, s: &str) -> u32 {
-        if let Some(&id) = self.map.get(s) {
+    fn intern(&self, s: &str) -> u32 {
+        let hash = xxh3_64(s.as_bytes());
+        if let Some(id) = self.find(hash, s) {
             return id;
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.entries.push(Box::from(s));
-        self.map.insert(Box::from(s), id);
+        let _mint = self.mint.lock().unwrap();
+        if let Some(id) = self.find(hash, s) {
+            return id;
+        }
+        let len = self.len.load(Ordering::Relaxed);
+        self.entries.set(len as usize, Box::from(s));
+        let id = len + 1;
+        self.len.store(id, Ordering::Release);
+        self.index.insert(hash, id);
         id
     }
 }
 
 /// A string interner that maps strings to `Name` IDs.
 /// Same string always maps to the same `Name`.
-/// Uses interior mutability so `intern` can be called through shared references.
 ///
-/// See [`NameOverlay`] for the id-space mechanics.
+/// `Send + Sync`: every method takes `&self`, and threads sharing one
+/// table (the frozen `Environment` during a parallel check, ADR-0034)
+/// see each other's interned `Name`s / `Symbol`s / `TypeName`s. Reads and
+/// hits take no lock; only adding a new entry is serialized. See
+/// [`NameOverlay`] for the `Name` id space and [`crate::once_table`] for
+/// the storage.
 #[derive(Clone)]
 pub struct NameTable {
-    names: RefCell<NameOverlay>,
+    names: NameOverlay,
     /// Content-addressed interner backing [`Symbol`]. Separate from the
     /// overlay backing [`Name`]: `Symbol` follows the rbs Rust
     /// representation (ADR-0025) while `Name` has no rbs counterpart.
-    symbols: RefCell<StringInterner>,
+    symbols: StringInterner,
     /// Parent-chain interner backing [`TypeName`] (rbs #2964 port). The
     /// methods below delegate so call sites keep the `&NameTable`
     /// plumbing; the ported interner API itself stays in
     /// [`crate::type_name`].
-    type_names: RefCell<TypeNameInterner>,
+    type_names: TypeNameInterner,
     builtins: BuiltinNames,
 }
 
@@ -163,17 +218,17 @@ impl fmt::Debug for NameTable {
         write!(
             f,
             "NameTable({} names, {} symbols)",
-            self.names.borrow().len(),
-            self.symbols.borrow().len()
+            self.names.len(),
+            self.symbols.len()
         )
     }
 }
 
 impl NameTable {
     pub fn new() -> Self {
-        let names = RefCell::new(NameOverlay::new());
-        let symbols = RefCell::new(StringInterner::new());
-        let type_names = RefCell::new(TypeNameInterner::new());
+        let names = NameOverlay::new();
+        let symbols = StringInterner::new();
+        let type_names = TypeNameInterner::new();
         let builtins = BuiltinNames::pre_intern(&symbols, &type_names);
         NameTable {
             names,
@@ -183,15 +238,21 @@ impl NameTable {
         }
     }
 
-    fn resolve_name(&self, name: Name) -> String {
-        self.names.borrow().resolve(name.0.get()).to_string()
+    /// Fold the growth chains of the three tables into single segments.
+    pub(crate) fn compact(&mut self) {
+        self.symbols.compact();
+        self.type_names.compact();
+        self.names.index.compact();
+    }
+
+    fn resolve_name(&self, name: Name) -> &str {
+        self.names.resolve(name.0.get())
     }
 
     /// Resolve `name`'s raw entry as `(parent, segment, absolute)`.
     /// `None` if `name` was never interned.
     fn tn_lookup(&self, name: TypeName) -> Option<(Option<TypeName>, Option<Symbol>, bool)> {
         self.type_names
-            .borrow()
             .try_entry(name)
             .map(|(p, s, a)| (p, s.map(Symbol), a))
     }
@@ -216,18 +277,18 @@ impl NameTable {
 
     /// The absolute root namespace `::` as a [`TypeName`].
     pub fn absolute_root(&self) -> TypeName {
-        self.type_names.borrow().absolute_root()
+        self.type_names.absolute_root()
     }
 
     /// The relative empty namespace `""` as a [`TypeName`].
     pub fn relative_root(&self) -> TypeName {
-        self.type_names.borrow().relative_root()
+        self.type_names.relative_root()
     }
 
     /// [`absolute_root`](Self::absolute_root) when `absolute`, else
     /// [`relative_root`](Self::relative_root).
     pub fn type_name_root(&self, absolute: bool) -> TypeName {
-        self.type_names.borrow().root(absolute)
+        self.type_names.root(absolute)
     }
 
     /// Returns `parent::segment`. Resolves `parent`'s `absolute` flag
@@ -238,7 +299,6 @@ impl NameTable {
         let id = TypeName::from_hash(crate::type_name::child_hash(parent, segment.0));
         let absolute = self.type_name_is_absolute(parent);
         self.type_names
-            .borrow_mut()
             .insert_child(id, parent, segment.0, absolute);
         id
     }
@@ -266,15 +326,6 @@ impl NameTable {
         self.tn_lookup(name)
             .unwrap_or_else(|| panic!("TypeName not interned: {name:?}"))
             .1
-    }
-
-    /// Non-panicking sibling of [`Self::last_segment`] for the incremental
-    /// cache's probe path (ADR-0032 Decision 4): a fingerprint key removed
-    /// from the fresh env may hold a `TypeName` this run never interned.
-    /// Flattens "not interned" with "root, no segment" — neither can
-    /// supply probe material.
-    pub(crate) fn last_segment_if_interned(&self, name: TypeName) -> Option<Symbol> {
-        self.tn_lookup(name).and_then(|(_, seg, _)| seg)
     }
 
     pub fn type_name_is_absolute(&self, name: TypeName) -> bool {
@@ -334,16 +385,7 @@ impl NameTable {
     /// [`Kind`] of the trailing segment, derived from its first
     /// character. `None` for roots.
     pub fn type_name_kind(&self, name: TypeName) -> Option<Kind> {
-        let seg = self.last_segment(name)?;
-        let s = self.resolve(seg);
-        let first = *s.as_bytes().first()?;
-        Some(if first == b'_' {
-            Kind::Interface
-        } else if first.is_ascii_uppercase() {
-            Kind::Class
-        } else {
-            Kind::Alias
-        })
+        self.type_names.kind(name, &self.symbols)
     }
 
     pub fn is_class(&self, name: TypeName) -> bool {
@@ -361,19 +403,7 @@ impl NameTable {
     /// Render `name` in the canonical RBS string form (`::Foo::Bar`,
     /// `Foo::bar`). Successor of the retired `TypeName::to_path_string`.
     pub fn display_type_name(&self, name: TypeName) -> String {
-        let segs = self.type_name_segments(name);
-        let absolute = self.type_name_is_absolute(name);
-        let mut s = String::new();
-        if absolute {
-            s.push_str("::");
-        }
-        for (i, seg) in segs.into_iter().enumerate() {
-            if i > 0 {
-                s.push_str("::");
-            }
-            s.push_str(&self.resolve(seg));
-        }
-        s
+        self.type_names.display(name, &self.symbols)
     }
 
     /// Pre-interned [`TypeName`]s for the rbs builtin classes / modules.
@@ -395,36 +425,38 @@ impl NameTable {
     /// than let dangling `Name`s reach a diagnostic.
     pub fn merge(&self, other: NameTable) {
         assert!(
-            other.names.borrow().len() == 0,
+            other.names.len() == 0,
             "merged NameTable must not carry positional `Name` entries"
         );
-        self.symbols.borrow_mut().merge(other.symbols.into_inner());
-        self.type_names
-            .borrow_mut()
-            .merge(other.type_names.into_inner());
+        self.symbols.merge(other.symbols);
+        self.type_names.merge(other.type_names);
     }
 
     /// Intern a string, returning the same `Name` for equal strings.
     pub fn intern(&self, s: &str) -> Name {
-        Name::from_overlay_id(self.names.borrow_mut().intern(s))
+        Name::from_overlay_id(self.names.intern(s))
     }
 
     /// Intern a string as a [`Symbol`] (RBS-level Ruby identifier).
     /// Goes through the content-addressed [`StringInterner`], so the same
     /// string yields the same `Symbol` in any `NameTable`.
     pub fn intern_symbol(&self, s: &str) -> Symbol {
-        Symbol(self.symbols.borrow_mut().intern(s))
+        Symbol(self.symbols.intern(s))
     }
 
-    /// Resolve a `Name` or structured `TypeName` back to its string (owned clone).
-    pub fn resolve<N: ResolvableName>(&self, name: N) -> String {
+    /// The string a `Name` / `Symbol` was interned from, borrowed from the
+    /// table. Entries never move while the table is shared (only
+    /// `compact`, which takes `&mut self`, rebuilds the index), so the
+    /// borrow lives as long as `&self`. A [`TypeName`] is not a single
+    /// interned string; render it with [`display_type_name`](Self::display_type_name).
+    pub fn resolve<N: ResolvableName>(&self, name: N) -> &str {
         name.resolve_with(self)
     }
 
     /// Look up a string without interning. Returns `None` if not yet
     /// interned.
     pub fn lookup(&self, s: &str) -> Option<Name> {
-        self.names.borrow().lookup(s).map(Name::from_overlay_id)
+        self.names.lookup(s).map(Name::from_overlay_id)
     }
 
     /// Look up a string as a [`Symbol`] without interning. Returns `None`
@@ -435,7 +467,7 @@ impl NameTable {
         // Mirrors StringInterner::intern's id recipe (xxh3 of the bytes);
         // the presence check keeps "never interned" answering None.
         let id = SymbolId::from_hash(xxhash_rust::xxh3::xxh3_64(s.as_bytes()));
-        self.symbols.borrow().try_resolve(id).map(|_| Symbol(id))
+        self.symbols.try_resolve(id).map(|_| Symbol(id))
     }
 
     /// Look up a name that is expected to be interned. Panics if not found.
@@ -458,48 +490,37 @@ impl Default for NameTable {
     }
 }
 
+/// An id that maps back to exactly one interned string in a [`NameTable`].
 pub trait ResolvableName {
-    fn resolve_with(self, names: &NameTable) -> String;
+    fn resolve_with(self, names: &NameTable) -> &str;
 }
 
 impl ResolvableName for Name {
-    fn resolve_with(self, names: &NameTable) -> String {
+    fn resolve_with(self, names: &NameTable) -> &str {
         names.resolve_name(self)
     }
 }
 
 /// Shared by every `Symbol`-resolving `ResolvableName` impl below.
-fn resolve_symbol_id(names: &NameTable, id: SymbolId) -> String {
-    names.symbols.borrow().resolve(id).to_string()
+fn resolve_symbol_id(names: &NameTable, id: SymbolId) -> &str {
+    names.symbols.resolve(id)
 }
 
 impl ResolvableName for Symbol {
-    fn resolve_with(self, names: &NameTable) -> String {
+    fn resolve_with(self, names: &NameTable) -> &str {
         resolve_symbol_id(names, self.0)
     }
 }
 
 impl ResolvableName for crate::type_param::TypeVarKey {
-    fn resolve_with(self, names: &NameTable) -> String {
+    fn resolve_with(self, names: &NameTable) -> &str {
         resolve_symbol_id(names, self.raw.0)
     }
 }
 
 impl ResolvableName for &crate::type_param::TypeVarKey {
-    fn resolve_with(self, names: &NameTable) -> String {
+    fn resolve_with(self, names: &NameTable) -> &str {
         resolve_symbol_id(names, self.raw.0)
-    }
-}
-
-impl ResolvableName for &TypeName {
-    fn resolve_with(self, names: &NameTable) -> String {
-        names.display_type_name(*self)
-    }
-}
-
-impl ResolvableName for TypeName {
-    fn resolve_with(self, names: &NameTable) -> String {
-        names.display_type_name(self)
     }
 }
 
@@ -509,7 +530,7 @@ impl ResolvableName for TypeName {
 ///
 /// Built once at [`NameTable::new`] and exposed via [`NameTable::builtins`].
 /// Compare with `==` rather than calling `parse_absolute` again at use sites.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct BuiltinNames {
     pub basic_object: TypeName,
     pub object: TypeName,
@@ -539,14 +560,9 @@ pub struct BuiltinNames {
 }
 
 impl BuiltinNames {
-    fn pre_intern(
-        symbols: &RefCell<StringInterner>,
-        type_names: &RefCell<TypeNameInterner>,
-    ) -> Self {
-        let mut strings = symbols.borrow_mut();
-        let mut names = type_names.borrow_mut();
+    fn pre_intern(strings: &StringInterner, names: &TypeNameInterner) -> Self {
         let root = names.absolute_root();
-        let mut cn = |s: &str| {
+        let cn = |s: &str| {
             let sym = strings.intern(s);
             names.append(root, sym)
         };

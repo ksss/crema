@@ -34,7 +34,7 @@ pub type TypeParamScope = FxHashMap<Symbol, TypeVarKey>;
 /// `Method` carries `kind` and `overload_index` so that `def a` /
 /// `def self.a` and per-overload `[T]`s are distinguishable identities, even
 /// when they share the same raw spelling.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TypeVarScope {
     /// Stray reference outside any declared scope. Behaves like a free
     /// variable; treated as `untyped` by downstream consumers that do not
@@ -55,7 +55,7 @@ pub enum TypeVarScope {
 /// (`def a`) or a singleton (`def self.a`) method. The two share table
 /// space in different `Definition` slots, but the `[T]` declared on each
 /// must still be a distinct variable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MethodKind {
     Instance,
     Singleton,
@@ -68,7 +68,7 @@ pub enum MethodKind {
 /// substitution mappings and per-call bindings maps. Two `TypeVarKey`s
 /// compare equal iff they came from the same declaration site, so a `T`
 /// from one method does not collide with a `T` from another.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TypeVarKey {
     pub raw: Symbol,
     pub scope: TypeVarScope,
@@ -91,7 +91,7 @@ impl TypeVarKey {
 
 /// Mirrors RBS's `:invariant` / `:covariant` / `:contravariant` symbols.
 /// Default is `Invariant` — matches RBS when the `in` / `out` keyword is absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Variance {
     Invariant,
     Covariant,
@@ -123,7 +123,7 @@ impl Variance {
 ///
 /// Phase B populates only `name` and `variance`. Other fields are reserved
 /// and always carry their zero value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypeParam {
     pub name: TypeVarKey,
     pub variance: Variance,

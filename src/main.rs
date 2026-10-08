@@ -5,32 +5,41 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::{Parser, Subcommand};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use std::io::{BufWriter, Write};
 
-use crema::config::{CollectionCliOverride, CollectionMode, Config, ConfigError};
-use crema::definition_builder::{ConsultationLog, DefinitionBuilder};
-use crema::diagnostic::{DiagnosticEmitter, DiagnosticKind, join_did_you_mean};
+use crema::config::{CONFIG_FILE, CollectionCliOverride, CollectionMode, Config, ConfigError};
+use crema::definition_builder::DefinitionBuilder;
+use crema::diagnostic::{
+    DiagnosticEmitter, DiagnosticKind, DiagnosticRenderer, RenderedDiagnostic, join_did_you_mean,
+};
 use crema::gem_dir_cache::ResolvedGemDirs;
+use crema::ingest_cache::{DirEntry, DirListing, FileStat};
 use crema::rbs_collection::{self, DiscoveredLockfile};
-use crema::type_checker::{CheckOptions, check_source_with_log};
+use crema::type_checker::check_source;
 use crema::validator;
 
 mod prompts;
 
 #[derive(Parser)]
-#[command(name = "crema", version, about = "An AI-agent-first Ruby type checker")]
+#[command(
+    name = "crema",
+    version = concat!(env!("CARGO_PKG_VERSION"), env!("CREMA_GIT_INFO")),
+    about = "An AI-agent-first Ruby type checker"
+)]
 struct Cli {
     /// Path to a config file to load instead of `./crema.toml`. When
-    /// set, walk-up discovery is bypassed entirely (no merge). Relative
-    /// paths inside the file (e.g. `sig = [...]`) are still resolved
-    /// from the current working directory, not the config file's dir.
-    /// (This asymmetry is intentional: auto-discovery without `--config`
-    /// walks up to the nearest `crema.toml` or `.git` boundary and
-    /// resolves relative paths against the discovered file's directory.)
+    /// set, walk-up discovery is bypassed entirely (no merge). The file
+    /// is treated as if it were the project's `crema.toml`: its
+    /// directory is the project root, so relative paths inside it (e.g.
+    /// `sig = [...]`, `check = [...]`), the `.crema` directory and
+    /// the `file` paths in the output are all relative to that directory,
+    /// not the current one. CLI path arguments (`--sig`, positional
+    /// filters) stay relative to the current directory.
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
@@ -65,7 +74,7 @@ enum DocCommands {
 #[derive(Subcommand)]
 enum InternalSnapshotCommands {
     /// Build the G-layer (gem environment) snapshot and write it to
-    /// `.crema/cache/g_snapshot_v1.bin` under the project root
+    /// `.crema/g_snapshot_v1.bin` under the project root
     Dump {
         /// Project root to load the gem environment from
         project_root: PathBuf,
@@ -126,10 +135,6 @@ enum Commands {
         #[arg(long = "add-sig", value_name = "PATH")]
         add_sig_dirs: Vec<PathBuf>,
 
-        /// Print type checker decisions to stderr for debugging
-        #[arg(long)]
-        verbose: bool,
-
         /// Whether to read `# @rbs` inline annotations from .rb files
         /// (default: true). Set to false to use only sig/ as source of truth.
         /// Note: when false, sig/ should declare all classes/modules used in
@@ -150,7 +155,7 @@ enum Commands {
 
         /// Disable the gem (G-layer) snapshot cache. By default crema
         /// caches the gem environment as a binary snapshot under
-        /// `.crema/cache/g_snapshot_v1.bin` and rebuilds from it on warm
+        /// `.crema/g_snapshot_v1.bin` and rebuilds from it on warm
         /// runs; passing `--no-g-snapshot` takes the full-rebuild path
         /// on every run (neither reads nor writes the snapshot file).
         /// Escape hatch for isolating regressions and comparing timings
@@ -171,14 +176,29 @@ enum Commands {
         /// The output format is tamped (stably projected).
         /// The keys for each record are reduced to only `file`, `code`,
         /// and `fingerprint`, and are sorted in this order.
-        /// This output is ideal for use as a baseline.
+        /// This output is ideal for use as a baseline. Never filtered
+        /// by `crema.toml`'s `baseline` (it is the full projection
+        /// `--update-baseline` writes).
         #[arg(long = "tamp")]
         tamp: bool,
 
-        /// Number of threads for the parallel phases (parse + inline
-        /// collection). Defaults to `CREMA_THREADS` if set, else every
-        /// available core. `1` runs single-threaded, which is the
-        /// yardstick for timing comparisons.
+        /// Rewrite the baseline file named by `crema.toml`'s `baseline`
+        /// with this run's diagnostics (same rows and order as
+        /// `--tamp`) and exit 0. Whole-scope only: cannot be combined
+        /// with file arguments, `-e`, `--tamp` or `--no-baseline`.
+        #[arg(long = "update-baseline")]
+        update_baseline: bool,
+
+        /// Ignore `crema.toml`'s `baseline` for this run: every
+        /// diagnostic is reported, including grandfathered ones.
+        #[arg(long = "no-baseline")]
+        no_baseline: bool,
+
+        /// Number of threads for the parallel phases (parse, inline
+        /// collection and type check). Defaults to `CREMA_THREADS` if
+        /// set, else every available core. `1` runs single-threaded,
+        /// which is the yardstick for CPU-time comparisons; the default
+        /// thread count is the yardstick for wall-clock time.
         #[arg(long = "threads", value_name = "N")]
         threads: Option<usize>,
     },
@@ -196,10 +216,12 @@ enum Commands {
         #[arg(short = 'e')]
         eval: Option<String>,
 
-        /// Number of threads for the parallel phases (parse + inline
-        /// collection). Defaults to `CREMA_THREADS` if set, else every
-        /// available core. `1` runs single-threaded, which is the
-        /// yardstick for timing comparisons.
+        /// Number of threads for the parallel phases (parse, inline
+        /// collection and the per-file check). Defaults to
+        /// `CREMA_THREADS` if set, else every available core. `1` runs
+        /// single-threaded, which is the yardstick for CPU-time
+        /// comparisons; the default thread count is the yardstick for
+        /// wall-clock time.
         #[arg(long = "threads", value_name = "N")]
         threads: Option<usize>,
     },
@@ -216,26 +238,113 @@ enum Commands {
     },
 }
 
-const G_SNAPSHOT_FILE: &str = ".crema/cache/g_snapshot_v1.bin";
-// `GEMFILE` / `GEMFILE_LOCK` moved to `crema::bundle_root` so the
-// `project_root` walk-up and the flat sites share one source of truth
-// for the filenames. `find_gemfile` still walks from `cwd`, so it
-// keeps using the shared constant via `use crema::bundle_root::GEMFILE`.
+const G_SNAPSHOT_FILE: &str = ".crema/g_snapshot_v1.bin";
+// `GEMFILE` / `GEMFILE_LOCK` live in `crema::bundle_root` so the
+// `project_root` walk-up and `find_gemfile` share one source of truth
+// for the filenames.
 use crema::bundle_root::{GEMFILE, GEMFILE_LOCK, discover_bundle_root};
 
-/// Build the Command used to spawn the Ruby gem-dir resolver. Split out
-/// so the bundler-vs-plain-ruby selection can be exercised in unit tests
-/// without spawning a child process.
-fn build_resolver_command(use_bundler: bool, script: &str) -> std::process::Command {
-    let mut cmd = if use_bundler {
-        let mut c = std::process::Command::new("bundle");
-        c.args(["exec", "ruby", "-e", script]);
-        c
-    } else {
-        let mut c = std::process::Command::new("ruby");
-        c.args(["-e", script]);
-        c
-    };
+/// Where gem resolution starts, so a run from any directory of the
+/// project reads the lockfile a run from the project root reads.
+///
+/// The ruby child runs in `project_root`: bundler searches its Gemfile
+/// up from its own cwd (`Bundler::SharedHelpers#search_up`), and the
+/// G-snapshot key predicts the lockfile from the project root, so the
+/// two must start from the same place. `BUNDLE_GEMFILE` /
+/// `BUNDLE_LOCKFILE` keep bundler's meaning — a relative value names a
+/// file under the cwd crema was started from — so they are absolutized
+/// against that cwd before the child is moved.
+struct ResolverAnchor {
+    project_root: PathBuf,
+    bundle_gemfile: Option<PathBuf>,
+    bundle_lockfile: Option<PathBuf>,
+}
+
+impl ResolverAnchor {
+    /// Read `BUNDLE_GEMFILE` / `BUNDLE_LOCKFILE` and the cwd from the
+    /// process.
+    fn from_env(project_root: &Path) -> Self {
+        let cwd = std::env::current_dir().ok();
+        Self::new(
+            project_root,
+            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
+            std::env::var_os("BUNDLE_LOCKFILE").as_deref(),
+            cwd.as_deref(),
+        )
+    }
+
+    /// An empty value is unset, as bundler treats it. Without a `cwd` a
+    /// relative value is kept as given.
+    fn new(
+        project_root: &Path,
+        bundle_gemfile: Option<&OsStr>,
+        bundle_lockfile: Option<&OsStr>,
+        cwd: Option<&Path>,
+    ) -> Self {
+        let absolutize = |value: Option<&OsStr>| {
+            value.filter(|v| !v.is_empty()).map(|v| match cwd {
+                Some(cwd) => cwd.join(v),
+                None => PathBuf::from(v),
+            })
+        };
+        ResolverAnchor {
+            project_root: project_root.to_path_buf(),
+            bundle_gemfile: absolutize(bundle_gemfile),
+            bundle_lockfile: absolutize(bundle_lockfile),
+        }
+    }
+
+    fn uses_bundler(&self, no_bundler: bool) -> bool {
+        resolver_uses_bundler(
+            no_bundler,
+            self.bundle_gemfile.as_deref().map(Path::as_os_str),
+            &self.project_root,
+        )
+    }
+
+    /// The Gemfile.lock whose content feeds the G-snapshot key: the one
+    /// bundler reads (`Bundler::SharedHelpers#default_lockfile`) when
+    /// the env names it, else the walk-up from the project root. Under
+    /// `--no-bundler` the env is not consulted, as the resolver ignores
+    /// it.
+    fn gemfile_lock(&self, no_bundler: bool) -> Option<PathBuf> {
+        if !no_bundler {
+            if let Some(lock) = &self.bundle_lockfile {
+                return Some(lock.clone());
+            }
+            if let Some(gemfile) = &self.bundle_gemfile {
+                return Some(if gemfile.file_name() == Some(OsStr::new("gems.rb")) {
+                    gemfile.with_file_name("gems.locked")
+                } else {
+                    let mut lock = gemfile.clone().into_os_string();
+                    lock.push(".lock");
+                    PathBuf::from(lock)
+                });
+            }
+        }
+        discover_bundle_root(&self.project_root).map(|dir| dir.join(GEMFILE_LOCK))
+    }
+
+    /// Run `cmd` from the project root with the absolutized env.
+    fn apply(&self, cmd: &mut std::process::Command) {
+        cmd.current_dir(&self.project_root);
+        if let Some(gemfile) = &self.bundle_gemfile {
+            cmd.env("BUNDLE_GEMFILE", gemfile);
+        }
+        if let Some(lock) = &self.bundle_lockfile {
+            cmd.env("BUNDLE_LOCKFILE", lock);
+        }
+    }
+}
+
+/// Build the Command used to spawn a Ruby gem-dir script (the plain
+/// `name=path` resolver or the bundler probe). Always plain `ruby`:
+/// bundler mode no longer runs under `bundle exec`, it reads
+/// `Gemfile.lock` itself and asks Ruby only where bundler looks.
+fn build_resolver_command(script: &str, anchor: &ResolverAnchor) -> std::process::Command {
+    let mut cmd = std::process::Command::new("ruby");
+    cmd.args(["-e", script]);
+    anchor.apply(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -272,24 +381,25 @@ fn escape_control_chars(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
-fn find_gemfile(cwd: &Path) -> Option<PathBuf> {
-    cwd.ancestors()
+fn find_gemfile(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
         .map(|dir| dir.join(GEMFILE))
         .find(|path| path.is_file())
 }
 
-fn should_use_bundler(bundle_gemfile: Option<&OsStr>, cwd: &Path) -> bool {
+fn should_use_bundler(bundle_gemfile: Option<&OsStr>, start: &Path) -> bool {
     match bundle_gemfile {
         Some(path) if !path.is_empty() => true,
-        _ => find_gemfile(cwd).is_some(),
+        _ => find_gemfile(start).is_some(),
     }
 }
 
 /// `should_use_bundler` gated by the `--no-bundler` opt-out: the flag
 /// wins over both `BUNDLE_GEMFILE` and Gemfile discovery, so `bundle`
 /// is never consulted (neither spawned nor suggested) when it is set.
-fn resolver_uses_bundler(no_bundler: bool, bundle_gemfile: Option<&OsStr>, cwd: &Path) -> bool {
-    !no_bundler && should_use_bundler(bundle_gemfile, cwd)
+fn resolver_uses_bundler(no_bundler: bool, bundle_gemfile: Option<&OsStr>, start: &Path) -> bool {
+    !no_bundler && should_use_bundler(bundle_gemfile, start)
 }
 
 /// Print a G-construction warning immediately (so a cold run's stderr
@@ -303,31 +413,134 @@ fn warn_and_record(warnings: &mut Vec<String>, message: String) {
     warnings.push(message);
 }
 
-/// Resolve gem dirs for `rbs` and every entry in `entries` in a single
-/// Ruby invocation. Each entry is `(name, Some(version))` when the
-/// caller wants the spec pinned (rbs-collection rubygems-source gems
-/// carry their lock pin here), or `(name, None)` when only the name is
-/// known (`crema.toml libraries = [...]` and `rbs` itself).
+/// Bundler's answer to "where do gems live", printed one `key=value` per
+/// line (`gem_path` once per root). Run under plain `ruby`:
+/// `Bundler.configure` makes `Gem.path` bundler's effective search roots
+/// (`BUNDLE_PATH` set means vendor only, never the shared gems); without
+/// it `Gem.path` would also show system gems and be more permissive than
+/// bundler. Which gem at which version comes from `Gemfile.lock`, read in
+/// Rust (`gem_lockfile`).
+const BUNDLER_PROBE_SCRIPT: &str = r##"
+require "bundler"
+Bundler.configure
+puts "lockfile=#{Bundler.default_lockfile}"
+puts "root=#{Bundler.root}"
+puts "bundle_path=#{Bundler.bundle_path}"
+Gem.path.each { |path| puts "gem_path=#{path}" }
+"##;
+
+/// What a ruby script reads on stdin, plus the lines to echo for it
+/// under `CREMA_DEBUG_RESOLVER=1`.
+struct ResolverStdin {
+    payload: String,
+    debug_lines: Vec<String>,
+}
+
+/// Spawn `ruby -e <script>`, feed `stdin` (or nothing), and return its
+/// stdout. A non-zero exit is `Err("error: ruby exited with failure: ..")`.
+/// `stdout_label` names the child's stdout lines in the debug dump
+/// (`stdout` for the resolver, `probe` for the bundler probe) so they
+/// are never mistaken for the final `name=path` result.
+fn run_ruby_script(
+    script: &str,
+    anchor: &ResolverAnchor,
+    extra_args: &[&str],
+    stdin: Option<ResolverStdin>,
+    stdout_label: &str,
+    debug_resolver: bool,
+) -> Result<String, String> {
+    let mut cmd = build_resolver_command(script, anchor);
+    cmd.args(extra_args);
+    if stdin.is_none() {
+        cmd.stdin(std::process::Stdio::null());
+    }
+    if debug_resolver {
+        eprint_resolver_spawn(&cmd);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("error: failed to spawn ruby: {}", e))?;
+
+    let mut writer = None;
+    if let Some(stdin) = stdin {
+        if debug_resolver {
+            for line in &stdin.debug_lines {
+                eprintln!("{line}");
+            }
+        }
+        // Hand stdin to a writer thread so `wait_with_output` can drain
+        // stdout/stderr in parallel. Without this, a large payload can
+        // fill Ruby's stdout pipe buffer (typically 64 KB) before the
+        // parent finishes writing stdin, deadlocking both sides.
+        let mut pipe = child
+            .stdin
+            .take()
+            .ok_or_else(|| "error: ruby stdin unavailable".to_string())?;
+        writer = Some(std::thread::spawn(move || {
+            pipe.write_all(stdin.payload.as_bytes())
+        }));
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("error: failed to wait for ruby: {}", e))?;
+
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| "error: ruby stdin writer panicked".to_string())?
+            .map_err(|e| format!("error: failed to write to ruby stdin: {}", e))?;
+    }
+
+    if debug_resolver {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            eprintln!("resolver: {} {}", stdout_label, line);
+        }
+        // Unlike the failure path below, this dumps stderr even on
+        // success — the whole point of CREMA_DEBUG_RESOLVER is to
+        // surface what the normal path silently discards.
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            eprintln!("resolver: stderr {}", line);
+        }
+        // `ExitStatus`'s own `Display` already reads "exit status: N".
+        eprintln!("resolver: {}", output.status);
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("error: ruby exited with failure: {}", stderr));
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| format!("error: ruby stdout is not UTF-8: {}", e))
+}
+
+/// Resolve gem dirs for `rbs` and every entry in `entries`. Each entry is
+/// `(name, Some(version))` when the caller wants the spec pinned
+/// (rbs-collection rubygems-source gems carry their lock pin here), or
+/// `(name, None)` when only the name is known (`crema.toml libraries =
+/// [...]` and `rbs` itself).
 ///
-/// Entries are written to Ruby's stdin as `name\tversion\n` (version
-/// empty when `None`); the script writes `name=path\n` for each. When
-/// a pinned lookup misses (`Gem::MissingSpecError`, which also covers
-/// the `MissingSpecVersionError` subclass raised for a wrong version),
-/// the script retries unpinned and, if that succeeds *and* the
+/// Two protocols, chosen by `resolver_uses_bundler`:
+///
+/// - **bundler mode** (a Gemfile is discoverable from the project root
+///   or `BUNDLE_GEMFILE`, and not `--no-bundler`): see
+///   [`resolve_gem_dirs_from_lockfile`]. `bundle` is never spawned.
+/// - **plain mode** (no Gemfile, or `--no-bundler`, or script mode): one
+///   `ruby -e` over the whole `entries` list, below.
+///
+/// Plain mode writes entries to Ruby's stdin as `name\tversion\n`
+/// (version empty when `None`); the script writes `name=path\n` for each.
+/// When a pinned lookup misses (`Gem::MissingSpecError`, which also
+/// covers the `MissingSpecVersionError` subclass raised for a wrong
+/// version), the script retries unpinned and, if that succeeds *and* the
 /// fallback actually ships type definitions (a `core/` dir for `rbs`
 /// itself, `sig/` for everything else — mirroring rbs's own
 /// `EnvironmentLoader.gem_sig_path`'s `path.directory?` gate before its
 /// analogous stale-pin self-heal in `add_collection`), reports the
-/// self-healed dir with the installed version as a third
-/// tab-separated field (`name=path\tinstalled_version`) so the caller
-/// can warn about the stale pin. An empty path means neither the
-/// pinned lookup nor a usable fallback was found. When Bundler would
-/// discover a Gemfile from cwd or `BUNDLE_GEMFILE`, the resolver is
-/// spawned under `bundle exec` so bundler-managed gems (vendor/bundle,
-/// `BUNDLE_PATH`) are visible and the rbs gem itself resolves to the
-/// version the host project pins. If `bundle` is not on PATH, we warn
-/// and retry with plain `ruby`. `no_bundler` (`--no-bundler`) skips
-/// bundler entirely: plain `ruby` from the start, no fallback warning.
+/// self-healed dir with the installed version as a third tab-separated
+/// field (`name=path\tinstalled_version`) so the caller can warn about
+/// the stale pin. An empty path means neither the pinned lookup nor a
+/// usable fallback was found.
 ///
 /// `rbs_runtime_deps` (script mode only) additionally walks the rbs
 /// gemspec's `runtime_dependencies` transitively and reports every
@@ -344,11 +557,17 @@ fn warn_and_record(warnings: &mut Vec<String>, message: String) {
 /// never passes the flag, so its stdin / stdout stay byte-identical.
 fn resolve_gem_dirs(
     entries: &[(String, Option<String>)],
+    anchor: &ResolverAnchor,
     no_bundler: bool,
     rbs_runtime_deps: bool,
     warnings: &mut Vec<String>,
 ) -> Result<ResolvedGemDirs, String> {
     let debug_resolver = std::env::var_os("CREMA_DEBUG_RESOLVER").is_some_and(|v| v == "1");
+    if anchor.uses_bundler(no_bundler) {
+        // Script mode forces `no_bundler`, so the two never meet.
+        debug_assert!(!rbs_runtime_deps);
+        return resolve_gem_dirs_from_lockfile(entries, anchor, debug_resolver);
+    }
     let script = r##"
 $stdin.each_line do |line|
   name, version = line.chomp.split("\t", 2)
@@ -395,48 +614,6 @@ $stdin.each_line do |line|
 end
 "##;
 
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("error: failed to get current dir: {}", e))?;
-    let bundle_gemfile = std::env::var_os("BUNDLE_GEMFILE");
-    let use_bundler = resolver_uses_bundler(no_bundler, bundle_gemfile.as_deref(), &cwd);
-    let mut cmd = build_resolver_command(use_bundler, script);
-    if rbs_runtime_deps {
-        // `--` ends ruby's own option parsing so the flag lands in ARGV.
-        cmd.args(["--", "--rbs-runtime-deps"]);
-    }
-    if debug_resolver {
-        eprint_resolver_spawn(&cmd);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        // Fall back to plain ruby only when `bundle` is missing from PATH.
-        // Other spawn errors (EACCES, ENOEXEC, ...) point at a misconfigured
-        // bundler install that the user needs to see, not silently work around.
-        Err(e) if use_bundler && e.kind() == std::io::ErrorKind::NotFound => {
-            warn_and_record(
-                warnings,
-                format!(
-                    "warning: bundle not found on PATH (falling back to ruby): {}",
-                    e
-                ),
-            );
-            let mut fallback = build_resolver_command(false, script);
-            if rbs_runtime_deps {
-                fallback.args(["--", "--rbs-runtime-deps"]);
-            }
-            if debug_resolver {
-                eprint_resolver_spawn(&fallback);
-            }
-            fallback
-                .spawn()
-                .map_err(|e| format!("error: failed to spawn ruby: {}", e))?
-        }
-        Err(e) if use_bundler => {
-            return Err(format!("error: failed to spawn bundle: {}", e));
-        }
-        Err(e) => return Err(format!("error: failed to spawn ruby: {}", e)),
-    };
-
     let mut payload = String::new();
     for (name, version) in entries {
         payload.push_str(name);
@@ -446,65 +623,42 @@ end
         }
         payload.push('\n');
     }
-    if debug_resolver {
-        // Dumped from the structured `entries`, not by re-splitting
-        // `payload` on `\n` — a `crema.toml` `libraries` name or a
-        // lock-pinned version is unvalidated free text (src/config.rs's
-        // `libraries: Vec<String>`), and an embedded newline there would
-        // otherwise fabricate an extra, misleading "resolver: stdin"
-        // line when troubleshooting via this exact flag.
-        for (name, version) in entries {
-            eprintln!(
+    // Dumped from the structured `entries`, not by re-splitting
+    // `payload` on `\n` — a `crema.toml` `libraries` name or a
+    // lock-pinned version is unvalidated free text (src/config.rs's
+    // `libraries: Vec<String>`), and an embedded newline there would
+    // otherwise fabricate an extra, misleading "resolver: stdin"
+    // line when troubleshooting via this exact flag.
+    let debug_lines = entries
+        .iter()
+        .map(|(name, version)| {
+            format!(
                 "resolver: stdin {}\t{}",
                 escape_control_chars(name),
                 version
                     .as_deref()
                     .map(escape_control_chars)
                     .unwrap_or_default()
-            );
-        }
-    }
-
-    // Hand stdin to a writer thread so `wait_with_output` can drain
-    // stdout/stderr in parallel. Without this, a large payload can
-    // fill Ruby's stdout pipe buffer (typically 64 KB) before the
-    // parent finishes writing stdin, deadlocking both sides.
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "error: ruby stdin unavailable".to_string())?;
-    let writer = std::thread::spawn(move || stdin.write_all(payload.as_bytes()));
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("error: failed to wait for ruby: {}", e))?;
-
-    writer
-        .join()
-        .map_err(|_| "error: ruby stdin writer panicked".to_string())?
-        .map_err(|e| format!("error: failed to write to ruby stdin: {}", e))?;
-
-    if debug_resolver {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            eprintln!("resolver: stdout {}", line);
-        }
-        // Unlike the failure path below, this dumps stderr even on
-        // success — the whole point of CREMA_DEBUG_RESOLVER is to
-        // surface what the normal path silently discards.
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            eprintln!("resolver: stderr {}", line);
-        }
-        // `ExitStatus`'s own `Display` already reads "exit status: N".
-        eprintln!("resolver: {}", output.status);
-    }
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("error: ruby exited with failure: {}", stderr));
-    }
-
-    let stdout = std::str::from_utf8(&output.stdout)
-        .map_err(|e| format!("error: ruby stdout is not UTF-8: {}", e))?;
+            )
+        })
+        .collect();
+    let extra_args: &[&str] = if rbs_runtime_deps {
+        // `--` ends ruby's own option parsing so the flag lands in ARGV.
+        &["--", "--rbs-runtime-deps"]
+    } else {
+        &[]
+    };
+    let stdout = run_ruby_script(
+        script,
+        anchor,
+        extra_args,
+        Some(ResolverStdin {
+            payload,
+            debug_lines,
+        }),
+        "stdout",
+        debug_resolver,
+    )?;
 
     let mut rbs_gem_dir: Option<PathBuf> = None;
     let mut libraries: HashMap<String, Option<PathBuf>> = HashMap::new();
@@ -567,6 +721,18 @@ end
         }
     }
 
+    finish_resolved(rbs_gem_dir, libraries, stale, rbs_runtime_dep_dirs)
+}
+
+/// `rbs` is the one gem every run needs: without it there is no core RBS,
+/// so a missing `rbs_gem_dir` is the (warning-prefixed) missing-gem error
+/// whichever protocol produced the result.
+fn finish_resolved(
+    rbs_gem_dir: Option<PathBuf>,
+    libraries: HashMap<String, Option<PathBuf>>,
+    stale: HashMap<String, String>,
+    rbs_runtime_deps: Vec<(String, PathBuf)>,
+) -> Result<ResolvedGemDirs, String> {
     let rbs_gem_dir = rbs_gem_dir.ok_or_else(|| {
         format!(
             "warning: rbs gem not found. Install rbs gem to enable type checking.\n{}",
@@ -577,8 +743,121 @@ end
         rbs_gem_dir,
         libraries,
         stale,
-        rbs_runtime_deps: rbs_runtime_dep_dirs,
+        rbs_runtime_deps,
     })
+}
+
+/// Bundler-mode resolution: one probe for bundler's roots, then
+/// `Gemfile.lock` read as text and each gem placed by `gem_lockfile`.
+/// Replaces `bundle exec ruby`, whose cost is dominated by bundler
+/// re-resolving the whole lockfile in every cold run.
+///
+/// The lockfile is the authority on versions. A lock-pinned entry whose
+/// pin differs from the locked version self-heals to the locked version
+/// (reported in `stale`) only if that install ships type definitions
+/// (`core/` for `rbs`, `sig/` otherwise — the same gate as the plain
+/// resolver's fallback). A gem the lockfile does not list is a miss, as
+/// bundler hides it. A gem crema reads that the lockfile lists but no
+/// probe root holds is an error: crema cannot type-check against code
+/// that is not installed, and `bundle install` is the fix. Gems crema
+/// does not read are never looked at.
+fn resolve_gem_dirs_from_lockfile(
+    entries: &[(String, Option<String>)],
+    anchor: &ResolverAnchor,
+    debug_resolver: bool,
+) -> Result<ResolvedGemDirs, String> {
+    let probe_stdout = run_ruby_script(
+        BUNDLER_PROBE_SCRIPT,
+        anchor,
+        &[],
+        None,
+        "probe",
+        debug_resolver,
+    )?;
+    let roots = crema::gem_lockfile::parse_probe_output(&probe_stdout)?;
+    let lock_text = match fs::read_to_string(&roots.lockfile) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "error: {} not found. Run `bundle install` to create it (or pass --no-bundler to resolve gems without bundler)",
+                roots.lockfile.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "error: failed to read {}: {}",
+                roots.lockfile.display(),
+                e
+            ));
+        }
+    };
+    let lock = crema::gem_lockfile::Lockfile::parse(&lock_text);
+
+    let mut rbs_gem_dir: Option<PathBuf> = None;
+    let mut libraries: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut stale: HashMap<String, String> = HashMap::new();
+    let mut not_installed: Vec<String> = Vec::new();
+    for (name, pin) in entries {
+        use crema::gem_lockfile::Located;
+        let mut healed_from: Option<String> = None;
+        let found = match lock.locate(name, &roots) {
+            Located::NotLocked => None,
+            Located::NotInstalled { version } => {
+                not_installed.push(format!("{name} ({version})"));
+                continue;
+            }
+            Located::Installed { version, dir } => {
+                let pinned_elsewhere = pin
+                    .as_deref()
+                    .is_some_and(|p| !p.is_empty() && p != version);
+                let sig_dir = if name == "rbs" { "core" } else { "sig" };
+                if pinned_elsewhere && !dir.join(sig_dir).is_dir() {
+                    None
+                } else {
+                    if pinned_elsewhere {
+                        healed_from = Some(version);
+                    }
+                    Some(dir)
+                }
+            }
+        };
+        if debug_resolver {
+            eprintln!(
+                "resolver: stdout {}={}{}",
+                name,
+                found
+                    .as_ref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default(),
+                healed_from
+                    .as_ref()
+                    .map(|v| format!("\t{v}"))
+                    .unwrap_or_default()
+            );
+        }
+        if name == "rbs" {
+            if let Some(dir) = found {
+                rbs_gem_dir = Some(dir);
+                if let Some(version) = healed_from {
+                    stale.insert(name.clone(), version);
+                }
+            }
+        } else {
+            let has_dir = found.is_some();
+            libraries.insert(name.clone(), found);
+            if let (true, Some(version)) = (has_dir, healed_from) {
+                stale.insert(name.clone(), version);
+            }
+        }
+    }
+    if !not_installed.is_empty() {
+        return Err(format!(
+            "error: {} lists gems that are not installed: {}. Run `bundle install` (or pass --no-bundler to resolve gems without bundler)",
+            roots.lockfile.display(),
+            not_installed.join(", ")
+        ));
+    }
+    finish_resolved(rbs_gem_dir, libraries, stale, Vec::new())
 }
 
 /// Resolve gem dirs via Ruby every call — no persistent cache. `entries`
@@ -597,11 +876,11 @@ end
 /// about so the caller can bake them into that snapshot.
 ///
 /// Baked warnings are only as fresh as `compute_g_snapshot_key`'s
-/// invalidation key (crema version, lockfile/crema.toml content, sig
-/// paths) — none of which change when the *installed* gem state does
+/// invalidation key (crema version and binary identity,
+/// lockfile/crema.toml content, sig paths) — none of which change when the *installed* gem state does
 /// (`bundle install` with an already-correct lockfile, or a plain `gem
-/// install`). A resolved-but-later-fixed "bundle not found on PATH" or
-/// stale-pin warning keeps replaying verbatim until something touches
+/// install`). A resolved-but-later-fixed stale-pin
+/// warning keeps replaying verbatim until something touches
 /// one of those key inputs or `--refresh-g-snapshot` is passed. This
 /// mirrors the pre-existing tradeoff for the G layer's actual RBS
 /// content (a warm hit never re-reads gem sig files either); it is not
@@ -609,6 +888,7 @@ end
 fn get_gem_dirs(
     entries: &[(String, Option<String>)],
     rbs_collection_lock: Option<&Path>,
+    anchor: &ResolverAnchor,
     no_bundler: bool,
     rbs_runtime_deps: bool,
     warnings: &mut Vec<String>,
@@ -626,11 +906,18 @@ fn get_gem_dirs(
                 .chain(entries.iter().cloned())
                 .collect()
         };
-    let resolved = resolve_gem_dirs(&resolver_input, no_bundler, rbs_runtime_deps, warnings)?;
+    let resolved = resolve_gem_dirs(
+        &resolver_input,
+        anchor,
+        no_bundler,
+        rbs_runtime_deps,
+        warnings,
+    )?;
     emit_stale_pin_warnings(
         &resolved,
         entries,
         rbs_collection_lock,
+        anchor,
         no_bundler,
         warnings,
     );
@@ -662,6 +949,7 @@ fn emit_stale_pin_warnings(
     gem_dirs: &ResolvedGemDirs,
     entries: &[(String, Option<String>)],
     rbs_collection_lock: Option<&Path>,
+    anchor: &ResolverAnchor,
     no_bundler: bool,
     warnings: &mut Vec<String>,
 ) {
@@ -672,7 +960,8 @@ fn emit_stale_pin_warnings(
         .and_then(|p| p.file_name())
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| "rbs_collection.lock.yaml".to_string());
-    let sync_command = collection_update_command(no_bundler);
+    let sync_command =
+        collection_update_command(no_bundler, anchor, std::env::var_os("PATH").as_deref());
 
     let mut names: Vec<&String> = gem_dirs.stale.keys().collect();
     names.sort();
@@ -697,20 +986,19 @@ fn emit_stale_pin_warnings(
 
 /// The command to suggest for re-syncing a stale lock pin: bundler
 /// wraps it when a Gemfile is in play *and* `bundle` is actually on
-/// PATH. A Gemfile alone isn't enough — `resolve_gem_dirs` falls back
-/// to plain `ruby` (with its own warning) when `bundle` is missing, so
-/// suggesting `bundle exec ...` in that case would tell the user to
-/// run a command that was just shown not to work. Likewise under
-/// `--no-bundler` (`no_bundler`): bundler was deliberately bypassed, so
-/// the suggestion follows the resolver and drops the `bundle exec`.
-fn collection_update_command(no_bundler: bool) -> &'static str {
-    let use_bundler = std::env::current_dir().is_ok_and(|cwd| {
-        resolver_uses_bundler(
-            no_bundler,
-            std::env::var_os("BUNDLE_GEMFILE").as_deref(),
-            &cwd,
-        )
-    }) && bundle_on_path(std::env::var_os("PATH").as_deref());
+/// PATH. A Gemfile alone isn't enough — crema itself never spawns
+/// `bundle`, so nothing has shown it works, and suggesting `bundle exec
+/// ...` on a machine without it would point the user at a command that
+/// does not exist. Likewise under `--no-bundler` (`no_bundler`): bundler
+/// was deliberately bypassed, so the suggestion follows the resolver and
+/// drops the `bundle exec`. The Gemfile is looked for from the project
+/// root, as the resolver does.
+fn collection_update_command(
+    no_bundler: bool,
+    anchor: &ResolverAnchor,
+    path_env: Option<&OsStr>,
+) -> &'static str {
+    let use_bundler = anchor.uses_bundler(no_bundler) && bundle_on_path(path_env);
     if use_bundler {
         "bundle exec rbs collection update"
     } else {
@@ -718,10 +1006,8 @@ fn collection_update_command(no_bundler: bool) -> &'static str {
     }
 }
 
-/// Cheap PATH scan for a `bundle` executable — mirrors the check
-/// `Command::new("bundle").spawn()` performs internally, without
-/// spawning a process, so `collection_update_command` can agree with
-/// `resolve_gem_dirs`'s own NotFound fallback.
+/// Cheap PATH scan for a `bundle` executable, without spawning a
+/// process, for `collection_update_command`.
 fn bundle_on_path(path_env: Option<&OsStr>) -> bool {
     let Some(paths) = path_env else {
         return false;
@@ -785,22 +1071,58 @@ fn validate_sig_dirs(dirs: &[PathBuf], label: &str) {
     }
 }
 
-/// Walk `dir` recursively and append every `.rb` file into `out`. Kept
-/// structurally symmetric with `EnvironmentDraft::load_dir` (the `.rbs`
-/// walker); read errors warn and skip the subtree rather than abort, since
-/// a permission glitch in one directory should not kill the whole check.
-/// Resolve CLI `check` arguments into a flat list of `.rb` files: directories
-/// are walked recursively (`.rb` only), files pass through unchanged, and a
-/// missing path is fatal so the user sees their typo. Exits the process on
-/// I/O errors rather than returning, matching the surrounding CLI style.
-fn expand_targets(targets: &[PathBuf]) -> Vec<PathBuf> {
+/// A `.rb` file found by [`collect_rb_files`]. `joinable` is true when
+/// every component from the walk root down to the file is a non-symlink
+/// entry whose type `read_dir` reported — then `realpath(path)` is
+/// `realpath(walk root)` + `path` relative to the root (the walk never
+/// descends a symlinked directory and `read_dir` never yields `.`/`..`),
+/// so [`canonicalize_walked`] can skip the per-file realpath (ADR-0035
+/// Decision 2).
+struct WalkedRb {
+    path: PathBuf,
+    joinable: bool,
+}
+
+/// One `check` entry resolved by [`expand_targets`]: a file passed
+/// through as given, or a directory with the `.rb` files walked under it.
+enum ExpandedTarget {
+    File(PathBuf),
+    Dir { root: PathBuf, files: Vec<WalkedRb> },
+}
+
+/// The directory listings a walk produced, for the ingest cache's
+/// write-back (see [`DirListing`]), plus how many it took from the
+/// cache instead of `read_dir`.
+#[derive(Default)]
+struct WalkedDirs {
+    listings: Vec<DirListing>,
+    reused: usize,
+}
+
+/// Resolve CLI `check` arguments: directories are walked recursively
+/// (`.rb` only), files pass through unchanged, and a missing path is
+/// fatal so the user sees their typo. Exits the process on I/O errors
+/// rather than returning, matching the surrounding CLI style. `cached`
+/// is the previous run's directory listings (ingest cache), consulted
+/// by [`walk_rb_dir`]; every listing this walk ends up with goes to
+/// `dirs`.
+fn expand_targets(
+    targets: &[PathBuf],
+    cached: Option<&FxHashMap<String, DirListing>>,
+    dirs: &mut WalkedDirs,
+) -> Vec<ExpandedTarget> {
     let mut expanded = Vec::new();
     for target in targets {
         match fs::metadata(target) {
             Ok(m) if m.is_dir() => {
-                collect_rb_files(target, &mut expanded);
+                let mut files = Vec::new();
+                collect_rb_files(target, true, cached, &mut files, dirs);
+                expanded.push(ExpandedTarget::Dir {
+                    root: target.clone(),
+                    files,
+                });
             }
-            Ok(_) => expanded.push(target.clone()),
+            Ok(_) => expanded.push(ExpandedTarget::File(target.clone())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("error: file not found: {}", target.display());
                 process::exit(2);
@@ -814,48 +1136,240 @@ fn expand_targets(targets: &[PathBuf]) -> Vec<PathBuf> {
     expanded
 }
 
+/// Canonicalize every file of [`expand_targets`]'s result, in order.
+/// Runs after the whole walk so every walk warning is printed before a
+/// resolve error exits.
+fn canonicalize_expanded(expanded: &[ExpandedTarget]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for target in expanded {
+        match target {
+            ExpandedTarget::File(path) => out.push(canonicalize_or_exit(path)),
+            ExpandedTarget::Dir { root, files } => canonicalize_walked(root, files, &mut out),
+        }
+    }
+    out
+}
+
+/// Canonicalize the files [`collect_rb_files`] found under `root`: a
+/// joinable file costs no syscall (one realpath of `root`, made lazily on
+/// the first one), any other is resolved on its own.
+fn canonicalize_walked(root: &Path, files: &[WalkedRb], out: &mut Vec<PathBuf>) {
+    let mut canonical_root: Option<PathBuf> = None;
+    for file in files {
+        if file.joinable {
+            let base = canonical_root.get_or_insert_with(|| canonicalize_or_exit(root));
+            let rel = file
+                .path
+                .strip_prefix(root)
+                .expect("collect_rb_files only yields paths under its root");
+            out.push(base.join(rel));
+        } else {
+            out.push(canonicalize_or_exit(&file.path));
+        }
+    }
+}
+
 /// Recursively collect every `.rb` file under `dir` into `out`. An
 /// unreadable directory or entry warns and is skipped — a partial walk
-/// under-represents `out` rather than aborting the run.
-fn collect_rb_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("warning: cannot read directory {}: {}", dir.display(), e);
-            return;
+/// under-represents `out` rather than aborting the run. `dir` is walked
+/// by its nominal spelling, so warnings name the path the user wrote.
+/// `joinable` says whether `dir` itself is reachable from the walk root
+/// through non-symlink entries only (see [`WalkedRb`]).
+///
+/// Subdirectories are walked on the global pool, so the pool must exist
+/// before the first walk (`run_check` builds it up front). Files and
+/// warnings still come out in the serial `read_dir` DFS order: each
+/// directory's results are concatenated in entry order, and the
+/// warnings are printed once the whole walk is done.
+fn collect_rb_files(
+    dir: &Path,
+    joinable: bool,
+    cached: Option<&FxHashMap<String, DirListing>>,
+    out: &mut Vec<WalkedRb>,
+    dirs: &mut WalkedDirs,
+) {
+    let mut walked = Vec::new();
+    walk_rb_dir(dir, joinable, cached, &mut walked);
+    for item in walked {
+        match item {
+            Walked::Rb(file) => out.push(file),
+            Walked::Warning(warning) => eprintln!("{warning}"),
+            Walked::Dir { listing, reused } => {
+                dirs.listings.push(listing);
+                dirs.reused += reused as usize;
+            }
         }
+    }
+}
+
+/// One result of [`walk_rb_dir`], in walk order. A directory's listing
+/// comes out before anything found under it.
+enum Walked {
+    Rb(WalkedRb),
+    Warning(String),
+    Dir { listing: DirListing, reused: bool },
+}
+
+/// One entry of a directory being walked, before its subtree is.
+enum WalkEntry {
+    Done(Walked),
+    Dir { path: PathBuf, joinable: bool },
+}
+
+/// Walk one directory: from its cached listing when `cached` has one
+/// under the same spelling with the same stat, else by `read_dir`. The
+/// stat is taken first so a change landing before the `read_dir` is
+/// seen as stale next run (see the `ingest_cache` module doc).
+fn walk_rb_dir(
+    dir: &Path,
+    joinable: bool,
+    cached: Option<&FxHashMap<String, DirListing>>,
+    out: &mut Vec<Walked>,
+) {
+    use rayon::prelude::*;
+
+    let stat = fs::metadata(dir).ok().map(|m| FileStat::of(&m));
+    // A non-UTF-8 directory path is simply never cached.
+    let key = dir.to_str();
+    let cached_listing = match (cached, stat, key) {
+        (Some(cached), Some(stat), Some(key)) => cached.get(key).filter(|l| l.stat == stat),
+        _ => None,
     };
-    for entry in entries {
-        let entry = match entry {
+    let mut items = Vec::new();
+    let listing = if let Some(listing) = cached_listing {
+        for entry in &listing.entries {
+            let path = dir.join(&entry.name);
+            let entry_joinable = entry.joinable && joinable;
+            if entry.is_dir {
+                items.push(WalkEntry::Dir {
+                    path,
+                    joinable: entry_joinable,
+                });
+            } else {
+                items.push(WalkEntry::Done(Walked::Rb(WalkedRb {
+                    path,
+                    joinable: entry_joinable,
+                })));
+            }
+        }
+        Some(Walked::Dir {
+            listing: DirListing {
+                path: listing.path.clone(),
+                stat: listing.stat,
+                entries: listing.entries.clone(),
+            },
+            reused: true,
+        })
+    } else {
+        let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("warning: cannot read entry in {}: {}", dir.display(), e);
-                continue;
+                out.push(Walked::Warning(format!(
+                    "warning: cannot read directory {}: {}",
+                    dir.display(),
+                    e
+                )));
+                return;
             }
         };
-        let path = entry.path();
-        // `entry.file_type()` reads the type `read_dir` already
-        // returned — usually free of an extra stat, unlike
-        // `path.is_dir()` (always one). A symlink costs one stat to
-        // tell dir from file: a symlinked directory is pruned (Steep's
-        // `**/*.rb` glob never descends one — Ruby's `**` skips symlink
-        // dirs, which also keeps a self-loop link from walking until
-        // PATH_MAX), a symlinked `.rb` file is still collected (same
-        // rule as `file_finder::each_file` on the `.rbs` side).
-        let is_dir = match entry.file_type() {
-            Ok(ft) if ft.is_symlink() => {
-                if path.is_dir() {
+        // `None` once the directory turns out not to be cacheable: a
+        // warning (not stored, so the next run warns again) or a
+        // non-UTF-8 entry name.
+        let mut fresh: Option<Vec<DirEntry>> = Some(Vec::new());
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    items.push(WalkEntry::Done(Walked::Warning(format!(
+                        "warning: cannot read entry in {}: {}",
+                        dir.display(),
+                        e
+                    ))));
+                    fresh = None;
                     continue;
                 }
-                false
+            };
+            let path = entry.path();
+            // `entry.file_type()` reads the type `read_dir` already
+            // returned — usually free of an extra stat, unlike
+            // `path.is_dir()` (always one). A symlink costs one stat to
+            // tell dir from file: a symlinked directory is pruned (Steep's
+            // `**/*.rb` glob never descends one — Ruby's `**` skips symlink
+            // dirs, which also keeps a self-loop link from walking until
+            // PATH_MAX), a symlinked `.rb` file is still collected (same
+            // rule as `file_finder::each_file` on the `.rbs` side).
+            //
+            // `entry_joinable` is false for a symlinked file and for an
+            // entry whose type is unknown: the `Err` arm's `is_dir()`
+            // follows links, so it may even descend a symlinked directory,
+            // and nothing below it can be derived from the root.
+            let (is_dir, inherits_joinable) = match entry.file_type() {
+                Ok(ft) if ft.is_symlink() => {
+                    if path.is_dir() {
+                        continue;
+                    }
+                    (false, false)
+                }
+                Ok(ft) => (ft.is_dir(), true),
+                Err(_) => (path.is_dir(), false),
+            };
+            let entry_joinable = inherits_joinable && joinable;
+            let is_rb = !is_dir && path.extension().is_some_and(|ext| ext == "rb");
+            if !is_dir && !is_rb {
+                continue;
             }
-            Ok(ft) => ft.is_dir(),
-            Err(_) => path.is_dir(),
-        };
-        if is_dir {
-            collect_rb_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rb") {
-            out.push(path);
+            if let Some(fresh_entries) = &mut fresh {
+                match entry.file_name().to_str() {
+                    Some(name) => fresh_entries.push(DirEntry {
+                        name: name.to_string(),
+                        is_dir,
+                        joinable: inherits_joinable,
+                    }),
+                    None => fresh = None,
+                }
+            }
+            if is_dir {
+                items.push(WalkEntry::Dir {
+                    path,
+                    joinable: entry_joinable,
+                });
+            } else {
+                items.push(WalkEntry::Done(Walked::Rb(WalkedRb {
+                    path,
+                    joinable: entry_joinable,
+                })));
+            }
+        }
+        match (fresh, stat, key) {
+            (Some(entries), Some(stat), Some(key)) => Some(Walked::Dir {
+                listing: DirListing {
+                    path: key.to_string(),
+                    stat,
+                    entries,
+                },
+                reused: false,
+            }),
+            _ => None,
+        }
+    };
+    out.extend(listing);
+    // Each subtree goes into a Vec of its own and is appended in entry
+    // order, whichever finishes first.
+    let subtrees: Vec<Vec<Walked>> = items
+        .par_iter()
+        .map(|item| match item {
+            WalkEntry::Dir { path, joinable } => {
+                let mut subtree = Vec::new();
+                walk_rb_dir(path, *joinable, cached, &mut subtree);
+                subtree
+            }
+            WalkEntry::Done(_) => Vec::new(),
+        })
+        .collect();
+    for (item, mut subtree) in items.into_iter().zip(subtrees) {
+        match item {
+            WalkEntry::Done(walked) => out.push(walked),
+            WalkEntry::Dir { .. } => out.append(&mut subtree),
         }
     }
 }
@@ -875,9 +1389,10 @@ fn canonicalize_or_exit(path: &Path) -> PathBuf {
 /// ADR-0029 §4: print the copy-pasteable "add a `check` field" error and
 /// exit 2. `config_missing` prepends a line naming the more specific
 /// cause (no crema.toml found at all, vs. one found without `check`)
-/// and, in that case, appends a hint pointing to zero-config `-e` — the
-/// only trial-run path that works without crema.toml (ADR-0029 §5
-/// amendment).
+/// and, in that case, appends a hint listing both trial-run paths that
+/// work without crema.toml: zero-config `-e` (ADR-0029 §5 amendment) and
+/// `--script FILE`. The hint does not depend on whether files were
+/// passed — bare `crema check` and `crema check a.rb` print the same text.
 fn print_no_check_target_configured_and_exit(config_missing: bool) -> ! {
     if config_missing {
         eprintln!("error: no crema.toml found");
@@ -892,9 +1407,12 @@ fn print_no_check_target_configured_and_exit(config_missing: bool) -> ! {
     eprintln!("See https://github.com/ksss/crema for details.");
     if config_missing {
         eprintln!();
-        eprintln!("hint: to try crema without a config file, use `-e`:");
+        eprintln!("hint: to try crema without a config file:");
         eprintln!();
-        eprintln!("    crema check -e '1 + 1'");
+        eprintln!("    crema check -e '1 + 1'        # inline Ruby");
+        eprintln!(
+            "    crema check --script FILE     # one script using only the stdlib (no gems or project files)"
+        );
     }
     process::exit(2);
 }
@@ -975,6 +1493,7 @@ fn build_diagnostic_filter(
     cli_targets: &[PathBuf],
     scope: &[PathBuf],
     ignored_files: &HashSet<PathBuf>,
+    cached_dirs: Option<&FxHashMap<String, DirListing>>,
 ) -> Option<HashSet<PathBuf>> {
     if cli_targets.is_empty() {
         return None;
@@ -994,10 +1513,15 @@ fn build_diagnostic_filter(
             }
         };
         if metadata.is_dir() {
+            // The scope walk already produced the listings of every
+            // directory under `check`; a CLI directory is usually one of
+            // them, so its listings are read but not written back.
             let mut dir_files = Vec::new();
-            collect_rb_files(target, &mut dir_files);
-            for f in dir_files {
-                let canon = canonicalize_or_exit(&f);
+            let mut dirs = WalkedDirs::default();
+            collect_rb_files(target, true, cached_dirs, &mut dir_files, &mut dirs);
+            let mut canonical = Vec::new();
+            canonicalize_walked(target, &dir_files, &mut canonical);
+            for canon in canonical {
                 if scope_set.contains(&canon) {
                     filter.insert(canon);
                 }
@@ -1024,16 +1548,16 @@ fn build_diagnostic_filter(
     Some(filter)
 }
 
-/// Discover an `rbs_collection.lock.yaml` by walking up from cwd,
-/// stopping at `.git`. Errors are formatted into a single string so
-/// the caller can route them through the same `error:`/`warning:`
-/// stderr convention as `get_gem_dirs`. A missing config (no
-/// `rbs_collection.yaml` along the walk) and a config without a lock
-/// both return `Ok(None)` silently — rbs CLI parity.
-fn discover_lockfile_from_cwd() -> Result<Option<DiscoveredLockfile>, String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("error: cannot read current dir: {}", e))?;
-    rbs_collection::discover_lockfile(&cwd).map_err(|e| e.to_string())
+/// Discover an `rbs_collection.lock.yaml` by walking up from the
+/// project root, stopping at `.git` — so a subdirectory run (or
+/// `--config` naming another project) reads the lock a root run reads,
+/// the one the G-snapshot key hashes. Errors are formatted into a single
+/// string so the caller can route them through the same
+/// `error:`/`warning:` stderr convention as `get_gem_dirs`. A missing
+/// config (no `rbs_collection.yaml` along the walk) and a config without
+/// a lock both return `Ok(None)` silently — rbs CLI parity.
+fn discover_collection_lockfile(project_root: &Path) -> Result<Option<DiscoveredLockfile>, String> {
+    rbs_collection::discover_lockfile(project_root).map_err(|e| e.to_string())
 }
 
 /// Load file config according to the top-level `--config <PATH>` flag.
@@ -1041,31 +1565,63 @@ fn discover_lockfile_from_cwd() -> Result<Option<DiscoveredLockfile>, String> {
 /// a hard exit-2 error). When absent, fall back to cwd discovery
 /// (NotFound silently yields None).
 fn load_file_config(cli_config: Option<&Path>) -> Option<Config> {
-    load_file_config_with_dir(cli_config).0
+    load_file_config_with_dir(cli_config).config
 }
 
-fn load_file_config_with_dir(cli_config: Option<&Path>) -> (Option<Config>, PathBuf) {
+/// Base directory every output path (`"file"`, fingerprint material,
+/// baseline rows, extract `files` keys) is relativized against: the
+/// canonicalized crema.toml dir, so the output does not depend on which
+/// subdirectory crema runs from (ADR-0029 §7 note 3, amended
+/// 2026-09-30). `-e` without a config and `--script` already carry
+/// `project_root` = cwd. Canonicalized so it string-prefix-matches the
+/// canonical paths diagnostics carry internally; falls back to the
+/// canonicalized cwd, and to `None` (paths left untouched) when both
+/// fail. Files outside the base keep their absolute path.
+fn output_display_base(project_root: &Path) -> Option<PathBuf> {
+    project_root.canonicalize().ok().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| d.canonicalize().ok())
+    })
+}
+
+/// The config a run loaded, where it came from, and the project root it
+/// anchors. `--config <PATH>` and walk-up discovery are the same here:
+/// `project_root` is the loaded file's directory and every relative path
+/// inside the file has already been resolved against it. With no config
+/// file, `project_root` is the cwd and `path` is `None`.
+struct LoadedFileConfig {
+    config: Option<Config>,
+    project_root: PathBuf,
+    /// The file `config` was read from — the one the G-snapshot key must
+    /// hash, whatever its name.
+    path: Option<PathBuf>,
+}
+
+fn load_file_config_with_dir(cli_config: Option<&Path>) -> LoadedFileConfig {
     let result = match cli_config {
-        Some(path) => Config::load_from_file(path).map(|cfg| {
-            let dir = if path.is_absolute() {
-                path.parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("."))
-            } else {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                cwd.join(path)
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or(cwd)
-            };
-            (Some(cfg), dir)
+        Some(path) => Config::load_from_file(path).map(|(cfg, dir)| {
+            let file = dir.join(path.file_name().unwrap_or(path.as_os_str()));
+            LoadedFileConfig {
+                config: Some(cfg),
+                project_root: dir,
+                path: Some(file),
+            }
         }),
         None => {
             let cwd = std::env::current_dir().map_err(ConfigError::Io);
             match cwd {
                 Ok(cwd) => Config::discover_walking_up(&cwd).map(|found| match found {
-                    Some((cfg, dir)) => (Some(cfg), dir),
-                    None => (None, cwd),
+                    Some((cfg, dir)) => LoadedFileConfig {
+                        config: Some(cfg),
+                        path: Some(dir.join(CONFIG_FILE)),
+                        project_root: dir,
+                    },
+                    None => LoadedFileConfig {
+                        config: None,
+                        project_root: cwd,
+                        path: None,
+                    },
                 }),
                 Err(err) => Err(err),
             }
@@ -1082,20 +1638,28 @@ fn load_file_config_with_dir(cli_config: Option<&Path>) -> (Option<Config>, Path
 
 /// G-snapshot invalidation key over the current run's inputs (ADR-0028
 /// Decision 4: lockfiles, crema version, crema.toml, sig path set) plus
-/// the `--no-bundler` resolver mode.
-/// All project resources (Gemfile.lock, crema.toml) are read from
-/// `project_root` so subdirectory execution and root execution compute
-/// the same key.
+/// the `--no-bundler` resolver mode. The crema version is refined to the
+/// running binary's size + mtime
+/// ([`crema::snapshot::invalidation::crema_version`]), so another build
+/// of the same version misses rather than replaying this build's caches.
+/// Gemfile.lock is the one the resolver reads
+/// ([`ResolverAnchor::gemfile_lock`]): searched from the project root
+/// so subdirectory execution and root execution compute the same key,
+/// or named by `BUNDLE_GEMFILE` / `BUNDLE_LOCKFILE`. The config
+/// content is read from `config_path`, the file the run actually loaded
+/// (`--config` names any file; `None` when no config was loaded).
 fn compute_g_snapshot_key(
     sig_dirs: &[PathBuf],
     rbs_collection_lock: Option<&Path>,
-    project_root: &Path,
+    anchor: &ResolverAnchor,
+    config_path: Option<&Path>,
     no_bundler: bool,
 ) -> crema::snapshot::invalidation::InvalidationKey {
-    let gemfile_lock_content =
-        discover_bundle_root(project_root).and_then(|dir| fs::read(dir.join(GEMFILE_LOCK)).ok());
+    let gemfile_lock_content = anchor
+        .gemfile_lock(no_bundler)
+        .and_then(|lock| fs::read(lock).ok());
     let rbs_collection_lock_content = rbs_collection_lock.and_then(|p| fs::read(p).ok());
-    let crema_toml_content = fs::read(project_root.join("crema.toml")).ok();
+    let crema_toml_content = config_path.and_then(|p| fs::read(p).ok());
     let mut sig_paths: Vec<String> = sig_dirs
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -1140,7 +1704,7 @@ fn sig_file_targets(sig_dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// `_internal snapshot dump`: load the project's gem environment (rbs
 /// core + crema.toml libraries + rbs collection — the G layer, no sig/
 /// and no inline), freeze it, and write the snapshot with its
-/// invalidation key to `.crema/cache/g_snapshot_v1.bin`.
+/// invalidation key to `.crema/g_snapshot_v1.bin`.
 ///
 /// This is the write-path validation vehicle for ADR-0028 slice 1b:
 /// the check pipeline never calls it; slice 1c wires reading and decides
@@ -1148,6 +1712,10 @@ fn sig_file_targets(sig_dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// mirrors `Commands::Check` (kept duplicated because slice scope
 /// forbids touching the check path; slice 1c reconciles the two).
 fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler: bool) {
+    // Taken before the chdir: a relative `BUNDLE_GEMFILE` /
+    // `BUNDLE_LOCKFILE` names a file under the directory crema was
+    // started from, as in `run_check`.
+    let launch_cwd = std::env::current_dir().ok();
     if let Err(e) = std::env::set_current_dir(project_root) {
         eprintln!(
             "error: cannot enter project root {}: {}",
@@ -1156,8 +1724,21 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
         );
         process::exit(2);
     }
+    // `project_root` may be relative (`dump .`); the Gemfile walk-up
+    // needs the absolute directory to see its ancestors.
+    let absolute_root = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
+    let anchor = ResolverAnchor::new(
+        &absolute_root,
+        std::env::var_os("BUNDLE_GEMFILE").as_deref(),
+        std::env::var_os("BUNDLE_LOCKFILE").as_deref(),
+        launch_cwd.as_deref(),
+    );
 
-    let file_config = load_file_config(cli_config);
+    let LoadedFileConfig {
+        config: file_config,
+        path: config_path,
+        ..
+    } = load_file_config_with_dir(cli_config);
     let resolved = match Config::resolve_with_cli_collecting_warnings(
         file_config,
         &[],
@@ -1178,7 +1759,7 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
     };
 
     let lockfile = match &resolved.collection {
-        CollectionMode::Auto => match discover_lockfile_from_cwd() {
+        CollectionMode::Auto => match discover_collection_lockfile(project_root) {
             Ok(opt) => opt,
             Err(msg) => {
                 eprintln!("{}", msg);
@@ -1259,6 +1840,7 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
     match get_gem_dirs(
         &all_entries,
         rbs_collection_lock_path.as_deref(),
+        &anchor,
         no_bundler,
         false,
         &mut g_warnings,
@@ -1375,7 +1957,8 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
     let key = compute_g_snapshot_key(
         &resolved.sig_dirs,
         rbs_collection_lock_path.as_deref(),
-        project_root,
+        &anchor,
+        config_path.as_deref(),
         no_bundler,
     );
 
@@ -1400,41 +1983,6 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
     );
 }
 
-/// Render one verify-mode divergence (ADR-0032 Decision 6) to stderr,
-/// with enough detail to identify the recording bug without rerunning:
-/// the file, both pre-join diagnostic lists, every lost query by name,
-/// and stale stored-only projection hashes.
-fn report_verify_divergence(
-    path: &str,
-    stored: &crema::incremental::FileEntry,
-    fresh: &[crema::diagnostic::Diagnostic],
-    div: &crema::incremental::VerifyDivergence,
-) {
-    let json = |d: &crema::diagnostic::Diagnostic| {
-        serde_json::to_string(d).unwrap_or_else(|_| format!("{d:?}"))
-    };
-    eprintln!("incremental verify: divergence in {path}");
-    if div.diagnostics_differ {
-        eprintln!(
-            "  diagnostics differ: {} stored vs {} fresh (the replay would have been wrong)",
-            stored.diagnostics.len(),
-            fresh.len()
-        );
-        for d in &stored.diagnostics {
-            eprintln!("    stored: {}", json(d));
-        }
-        for d in fresh {
-            eprintln!("    fresh:  {}", json(d));
-        }
-    }
-    for k in &div.missing_keys {
-        eprintln!("  query consulted by the fresh check but missing from the stored set: {k:?}");
-    }
-    for h in &div.stale_hashes {
-        eprintln!("  stored consulted hash with no fresh counterpart: {h:#018x}");
-    }
-}
-
 /// Everything `Commands::Check` carries, bundled so `run_check` can be
 /// shared by `crema check` and `crema extract` — the latter runs the
 /// same environment-building pipeline with default flags, a suppressed
@@ -1446,12 +1994,13 @@ struct CheckInvocation {
     script: Option<PathBuf>,
     sig_dirs: Vec<PathBuf>,
     add_sig_dirs: Vec<PathBuf>,
-    verbose: bool,
     inline: Option<bool>,
     collection: Option<PathBuf>,
     no_g_snapshot: bool,
     refresh_g_snapshot: bool,
     tamp: bool,
+    update_baseline: bool,
+    no_baseline: bool,
     threads: Option<usize>,
 }
 
@@ -1479,14 +2028,47 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         script,
         sig_dirs,
         add_sig_dirs,
-        verbose,
         inline,
         collection,
         no_g_snapshot,
         refresh_g_snapshot,
         tamp,
+        update_baseline,
+        no_baseline,
         threads,
     } = args;
+    // Pool size for the parallel phases — the `.rb` walk, ingest
+    // (ADR-0033) and check (ADR-0034): `--threads N` wins, then `CREMA_THREADS=<n>` (what
+    // the perf gate exports so User time keeps measuring algorithmic
+    // cost single-threaded), then rayon's default (available
+    // parallelism).
+    //
+    // Main joins the pool as its thread 0 (ADR-0035). With a one-thread
+    // pool main then runs every ingest and check job itself, so the
+    // ASTs and declarations are allocated on the thread that later
+    // drops them: allocating on a worker and freeing on main costs the
+    // check phase ~3% (mimalloc frees across threads), and the
+    // single-thread run is the perf gate's and the Steep / Sorbet
+    // comparison's yardstick.
+    // Built before anything touches rayon: the first rayon call would
+    // create a default global pool, and `build_global` would then fail —
+    // dropping `--threads` / `CREMA_THREADS` and main's thread 0. Every
+    // phase stays correct without either, so a release build carries
+    // on; a debug build (what the CLI tests run) asserts, so moving any
+    // rayon use ahead of this point fails the suite.
+    let threads = threads.or_else(|| {
+        std::env::var_os("CREMA_THREADS")
+            .and_then(|v| v.to_str().and_then(|v| v.parse::<usize>().ok()))
+    });
+    let pool_built = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.unwrap_or(0))
+        .stack_size(POOL_STACK_BYTES)
+        .use_current_thread()
+        .build_global();
+    debug_assert!(
+        pool_built.is_ok(),
+        "rayon ran before the global pool was built: {pool_built:?}"
+    );
     // Captured once, ahead of `eval`'s move into the `sources`
     // construction below (ADR-0029 §5) — every later gate reads
     // this instead of re-borrowing the (by-then-moved) `eval`.
@@ -1495,13 +2077,30 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         eprintln!("error: -e and files are mutually exclusive");
         process::exit(2);
     }
+    // `--update-baseline` must see the whole scope (a filtered subset
+    // would make every other row "new" on the next run) and owns the
+    // tamp rows (stdout vs file, and disabling vs updating contradict).
+    if update_baseline {
+        let conflicts = [
+            ("files", !cli_targets.is_empty()),
+            ("-e", eval_active),
+            ("--tamp", tamp),
+            ("--no-baseline", no_baseline),
+        ];
+        for (name, set) in conflicts {
+            if set {
+                eprintln!("error: --update-baseline cannot be combined with {}", name);
+                process::exit(2);
+            }
+        }
+    }
     // Script mode (`--script FILE`): every flag below would be
     // silently overridden by the mode's fixed choices (no config, no
     // sig, inline on, no snapshot), so their co-use is an error rather
     // than a no-op (specs/config.md Design Goal 5).
     let script_active = script.is_some();
     if script_active {
-        let conflicts: [(&str, bool); 9] = [
+        let conflicts: [(&str, bool); 11] = [
             ("files", !cli_targets.is_empty()),
             ("-e", eval_active),
             ("--config", cli_config.is_some()),
@@ -1511,6 +2110,8 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
             ("--inline", inline.is_some()),
             ("--no-g-snapshot", no_g_snapshot),
             ("--refresh-g-snapshot", refresh_g_snapshot),
+            ("--update-baseline", update_baseline),
+            ("--no-baseline", no_baseline),
         ];
         for (name, set) in conflicts {
             if set {
@@ -1533,17 +2134,26 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // config is not "found and ignored", it is not looked for at all
     // (a malformed crema.toml in cwd must not break a script check).
     // `project_root` only feeds paths that are disabled below
-    // (snapshot / incremental cache) and `ignore` matching over an
+    // (snapshot) and `ignore` matching over an
     // empty list, so cwd is a fine stand-in.
-    let (file_config, project_root) = if script_active {
+    let LoadedFileConfig {
+        config: file_config,
+        project_root,
+        path: config_path,
+    } = if script_active {
         let cwd = std::env::current_dir().unwrap_or_else(|e| {
             eprintln!("error: cannot read current dir: {}", e);
             process::exit(2);
         });
-        (None, cwd)
+        LoadedFileConfig {
+            config: None,
+            project_root: cwd,
+            path: None,
+        }
     } else {
         load_file_config_with_dir(cli_config)
     };
+    let resolver_anchor = ResolverAnchor::from_env(&project_root);
 
     // ADR-0029 §4: the environment scope now lives in crema.toml's
     // `check` field, so a missing crema.toml or a missing `check`
@@ -1627,6 +2237,32 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         }
     };
 
+    // Baseline (crema.toml `baseline`): resolve the file once, up
+    // front, so a missing or malformed file fails before any checking
+    // happens (spec Design Goal 5 — never a silent no-op). Extract mode
+    // discards diagnostics and never consults it. `--no-baseline`
+    // disables matching for this run only.
+    // `--tamp` is the raw projection `--update-baseline` writes, so it
+    // bypasses matching the same way `--no-baseline` does.
+    let baseline_path = match (&mode, &resolved.baseline) {
+        (RunMode::Check, Some(path)) if !no_baseline && !tamp => Some(path.clone()),
+        _ => None,
+    };
+    if update_baseline && baseline_path.is_none() {
+        eprintln!("error: --update-baseline needs `baseline = true` (or a path) in crema.toml");
+        process::exit(2);
+    }
+    let baseline = match (&baseline_path, update_baseline) {
+        (Some(path), false) => match load_baseline(path) {
+            Ok(b) => Some(b),
+            Err(msg) => {
+                eprintln!("{}", msg);
+                process::exit(2);
+            }
+        },
+        _ => None,
+    };
+
     let ignore_set = build_glob_set(&resolved.ignore);
     // `sig_ignore` subtracts here, once, regardless of a sig
     // entry's origin (config `sig` / `--sig` / `--add-sig`,
@@ -1666,80 +2302,6 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         }
     }
 
-    // ADR-0029 §1: the environment scope is `resolved.check`
-    // (guaranteed `Some` — checked above, before `file_config` was
-    // moved into `resolve_with_cli_collecting_warnings`), expanded
-    // the same way CLI targets used to be and canonicalized so
-    // every downstream file identity (sources, diagnostics,
-    // snapshot fingerprints) agrees on one representation
-    // regardless of how the CLI filter argument was spelled
-    // (`./foo.rb` vs `foo.rb`, symlinked dirs, etc — ADR-0029
-    // slice S3 design point 5's "most bug-prone" seam).
-    //
-    // ADR-0029 §5 (slice S4): `-e` mode builds this exact same
-    // scope — the eval code is a separate, unpersisted source
-    // added on top (see the `sources` construction below), never
-    // a substitute for it. This is what lets `-e` see project
-    // classes/sig exactly like `crema check` does.
-    // ADR-0029 §5 amendment: zero-config `-e` (crema.toml absent)
-    // has no `check` scope at all — the eval pseudo-source is the
-    // only thing type-checked. `unwrap_or_default` gives that path
-    // an empty Vec; the ADR-0029 gate above still guarantees
-    // `Some(_)` in every other invocation.
-    // Script mode: the scope is exactly the one script (the mode's
-    // whole point is that no `check` field exists to expand).
-    let check_field = match &script {
-        Some(path) => vec![path.clone()],
-        None => resolved.check.clone().unwrap_or_default(),
-    };
-    let expanded = expand_targets(&check_field);
-    // Canonicalize the full pre-`ignore` expansion first (and
-    // dedup — `check`'s entries are a union, ADR-0029 §1: a
-    // directory and a file it already contains, or two
-    // overlapping directories, must not double-ingest the same
-    // file, which would otherwise surface as a spurious
-    // `Ruby::DuplicatedMethodDefinitionError`), *then* subtract
-    // `ignore` — so `files` and `ignored_files` below share one
-    // canonicalization pass. Matching `ignore` against the
-    // nominal (pre-canonicalize) path first and re-matching the
-    // canonical path later (in `build_diagnostic_filter`) let a
-    // symlinked ignored subtree agree with itself on inclusion
-    // but disagree on *why* a CLI target naming it was excluded.
-    let mut seen = HashSet::new();
-    let all_files: Vec<PathBuf> = expanded
-        .iter()
-        .map(|p| canonicalize_or_exit(p))
-        .filter(|p| seen.insert(p.clone()))
-        .collect();
-    let mut files: Vec<PathBuf> = Vec::new();
-    // Exactly the files `ignore` subtracted from `check`'s scope
-    // — not "any path matching the glob" (a `lib/x.rb` that was
-    // never in `check` to begin with could coincidentally match
-    // an unrelated `ignore` entry). `build_diagnostic_filter`
-    // uses this set to give a precise "is ignored" error only
-    // for CLI targets that were actually excluded this way.
-    let mut ignored_files: HashSet<PathBuf> = HashSet::new();
-    for p in all_files {
-        if is_ignored(&p, &project_root, &ignore_set, &resolved.ignore) {
-            ignored_files.insert(p);
-        } else {
-            files.push(p);
-        }
-    }
-
-    // ADR-0029 §3/§5: CLI positional targets are a diagnostic
-    // output filter over the config scope; `-e` mode filters down
-    // to just the eval pseudo-file instead (its own diagnostics
-    // only — scope files are still built and validated, but
-    // never surfaced, matching §5's "type check only" contract).
-    let diagnostic_filter = if eval_active {
-        let mut filter = HashSet::new();
-        filter.insert(PathBuf::from("-e"));
-        Some(filter)
-    } else {
-        build_diagnostic_filter(&cli_targets, &files, &ignored_files)
-    };
-
     // ADR-0017 Phase 5b switchover: production runs through the
     // Phase 5a `crate::definition_builder::DefinitionBuilder` built from a
     // frozen `Environment`. The `LegacyEnvironmentBuffer` is kept
@@ -1753,7 +2315,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         // Script mode: an rbs_collection.lock.yaml in cwd belongs to
         // the surrounding project, not to the script.
         CollectionMode::Auto if script_active => None,
-        CollectionMode::Auto => match discover_lockfile_from_cwd() {
+        CollectionMode::Auto => match discover_collection_lockfile(&project_root) {
             Ok(opt) => opt,
             Err(msg) => {
                 eprintln!("{}", msg);
@@ -1856,17 +2418,139 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // path loads as usual, freezes the G-only draft, persists it,
     // and re-opens the just-encoded bytes through the same
     // backend join point — cold and warm share one code path.
-    let g_snapshot_key = if no_g_snapshot {
-        None
-    } else {
-        Some(compute_g_snapshot_key(
-            &resolved.sig_dirs,
-            rbs_collection_lock_path.as_deref(),
-            &project_root,
-            no_bundler,
-        ))
-    };
+    // The ingest cache (ADR-0036 Decision 4-1) keys on the same inputs
+    // plus the CLI inline override, so the base key is computed once
+    // whether or not the G snapshot is in play.
+    let base_invalidation_key = compute_g_snapshot_key(
+        &resolved.sig_dirs,
+        rbs_collection_lock_path.as_deref(),
+        &resolver_anchor,
+        config_path.as_deref(),
+        no_bundler,
+    );
+    let g_snapshot_key = (!no_g_snapshot).then_some(base_invalidation_key);
     let g_snapshot_path = project_root.join(G_SNAPSHOT_FILE);
+    let ingest_cache_key = crema::ingest_cache::derive_key(&base_invalidation_key, resolved.inline);
+    let ingest_cache_path = project_root.join(crema::ingest_cache::INGEST_CACHE_FILE);
+
+    // Per-file ingest cache (ADR-0036 Decision 4-1), opened before the
+    // scope walk so the walk can reuse its directory listings. Lookup
+    // serves only files outside the diagnostic filter: a target's AST
+    // is needed for Layer 3, so it is always read and parsed. A run
+    // without a filter (every file is a target) looks nothing up but
+    // still writes, so a project-wide check warms the cache the editor
+    // hook's single-file checks then hit. Writing shares the G
+    // snapshot's gates: no crema.toml, no persistence; `-e` never
+    // persists; extract reads every AST and neither reads nor writes
+    // the cache. The lookup condition is `diagnostic_filter.is_some()`
+    // spelled from its inputs, since the filter is built after the walk.
+    let ingest_cache_lookup =
+        matches!(mode, RunMode::Check) && (eval_active || !cli_targets.is_empty());
+    let ingest_cache_write = matches!(mode, RunMode::Check) && has_config && !eval_active;
+    let mut ingest_cache_cold_reason: Option<String> = None;
+    let mut ingest_cache_records: FxHashMap<String, crema::ingest_cache::Record> =
+        FxHashMap::default();
+    let mut ingest_cache_dirs: FxHashMap<String, DirListing> = FxHashMap::default();
+    let t_ingest_cache_open = std::time::Instant::now();
+    if ingest_cache_lookup {
+        match crema::ingest_cache::read_file(&ingest_cache_path, &ingest_cache_key) {
+            Ok(contents) => {
+                ingest_cache_records.reserve(contents.records.len());
+                for record in contents.records {
+                    ingest_cache_records.insert(record.path.clone(), record);
+                }
+                ingest_cache_dirs.reserve(contents.dirs.len());
+                for listing in contents.dirs {
+                    ingest_cache_dirs.insert(listing.path.clone(), listing);
+                }
+            }
+            Err(reason) => ingest_cache_cold_reason = Some(reason),
+        }
+    }
+    let d_ingest_cache_open = t_ingest_cache_open.elapsed();
+    let mut walked_dirs = WalkedDirs::default();
+
+    // ADR-0029 §1: the environment scope is `resolved.check`
+    // (guaranteed `Some` — checked above, before `file_config` was
+    // moved into `resolve_with_cli_collecting_warnings`), expanded
+    // the same way CLI targets used to be and canonicalized so
+    // every downstream file identity (sources, diagnostics,
+    // snapshot fingerprints) agrees on one representation
+    // regardless of how the CLI filter argument was spelled
+    // (`./foo.rb` vs `foo.rb`, symlinked dirs, etc — ADR-0029
+    // slice S3 design point 5's "most bug-prone" seam).
+    //
+    // ADR-0029 §5 (slice S4): `-e` mode builds this exact same
+    // scope — the eval code is a separate, unpersisted source
+    // added on top (see the `sources` construction below), never
+    // a substitute for it. This is what lets `-e` see project
+    // classes/sig exactly like `crema check` does.
+    // ADR-0029 §5 amendment: zero-config `-e` (crema.toml absent)
+    // has no `check` scope at all — the eval pseudo-source is the
+    // only thing type-checked. `unwrap_or_default` gives that path
+    // an empty Vec; the ADR-0029 gate above still guarantees
+    // `Some(_)` in every other invocation.
+    // Script mode: the scope is exactly the one script (the mode's
+    // whole point is that no `check` field exists to expand).
+    let check_field = match &script {
+        Some(path) => vec![path.clone()],
+        None => resolved.check.clone().unwrap_or_default(),
+    };
+    let expanded = expand_targets(
+        &check_field,
+        ingest_cache_lookup.then_some(&ingest_cache_dirs),
+        &mut walked_dirs,
+    );
+    // Canonicalize the full pre-`ignore` expansion first (and
+    // dedup — `check`'s entries are a union, ADR-0029 §1: a
+    // directory and a file it already contains, or two
+    // overlapping directories, must not double-ingest the same
+    // file, which would otherwise surface as a spurious
+    // `Ruby::DuplicatedMethodDefinitionError`), *then* subtract
+    // `ignore` — so `files` and `ignored_files` below share one
+    // canonicalization pass. Matching `ignore` against the
+    // nominal (pre-canonicalize) path first and re-matching the
+    // canonical path later (in `build_diagnostic_filter`) let a
+    // symlinked ignored subtree agree with itself on inclusion
+    // but disagree on *why* a CLI target naming it was excluded.
+    let mut seen = HashSet::new();
+    let all_files: Vec<PathBuf> = canonicalize_expanded(&expanded)
+        .into_iter()
+        .filter(|p| seen.insert(p.clone()))
+        .collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    // Exactly the files `ignore` subtracted from `check`'s scope
+    // — not "any path matching the glob" (a `lib/x.rb` that was
+    // never in `check` to begin with could coincidentally match
+    // an unrelated `ignore` entry). `build_diagnostic_filter`
+    // uses this set to give a precise "is ignored" error only
+    // for CLI targets that were actually excluded this way.
+    let mut ignored_files: HashSet<PathBuf> = HashSet::new();
+    for p in all_files {
+        if is_ignored(&p, &project_root, &ignore_set, &resolved.ignore) {
+            ignored_files.insert(p);
+        } else {
+            files.push(p);
+        }
+    }
+
+    // ADR-0029 §3/§5: CLI positional targets are a diagnostic
+    // output filter over the config scope; `-e` mode filters down
+    // to just the eval pseudo-file instead (its own diagnostics
+    // only — scope files are still built and validated, but
+    // never surfaced, matching §5's "type check only" contract).
+    let diagnostic_filter = if eval_active {
+        let mut filter = HashSet::new();
+        filter.insert(PathBuf::from("-e"));
+        Some(filter)
+    } else {
+        build_diagnostic_filter(
+            &cli_targets,
+            &files,
+            &ignored_files,
+            ingest_cache_lookup.then_some(&ingest_cache_dirs),
+        )
+    };
 
     let infusion_active = resolved.infusion.activesupport
         || resolved.infusion.activemodel
@@ -1897,6 +2581,8 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         }
         draft.attach_g_backend(backend);
         g_snapshot_warm = true;
+        // Opening G interned every gem symbol; fold before ingest probes them.
+        draft.compact_names();
     }
 
     let mut g_warnings: Vec<String> = Vec::new();
@@ -1908,6 +2594,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         match get_gem_dirs(
             &all_entries,
             rbs_collection_lock_path.as_deref(),
+            &resolver_anchor,
             no_bundler,
             script_active,
             &mut g_warnings,
@@ -2121,20 +2808,6 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     }
 
     let snapshot_timing = std::env::var_os("CREMA_DEBUG_SNAPSHOT_TIMING").is_some_and(|v| v == "1");
-    // Pool size for the parallel phases (ADR-0033): `--threads N`
-    // wins, then `CREMA_THREADS=<n>` (what the perf gate exports so
-    // User time keeps measuring algorithmic cost single-threaded),
-    // then rayon's default (available parallelism). `build_global`
-    // fails only if a pool already exists, which is fine to ignore.
-    let threads = threads.or_else(|| {
-        std::env::var_os("CREMA_THREADS")
-            .and_then(|v| v.to_str().and_then(|v| v.parse::<usize>().ok()))
-    });
-    if let Some(n) = threads {
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global();
-    }
     let d_setup = t_run.elapsed();
     let t_ingest = std::time::Instant::now();
     // Buffer for environment-level diagnostics (parser / inline /
@@ -2145,13 +2818,25 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // Full sig ingest. Existence/type were validated upfront; any
     // load failure here is I/O (unreadable file, bad UTF-8, etc.).
     // Each entry is either a directory (walked recursively) or a
-    // single `.rbs` file.
+    // single `.rbs` file. The files are kept as the user's own sig
+    // files for `validate_decl_namespaces`, which must not walk
+    // library decls.
+    let mut user_sig_files: Vec<PathBuf> = Vec::new();
     for path in &resolved.sig_dirs {
         let result = if path.is_dir() {
             // User sig dirs are rbs `-I` dirs: `_` subdirs are read.
-            draft.load_dir(path, false)
+            // Same stop-at-first-failure shape as `load_dir`.
+            crema::file_finder::each_file(path, false).and_then(|files| {
+                for file in files {
+                    draft.load_file(&file)?;
+                    user_sig_files.push(file);
+                }
+                Ok(())
+            })
         } else {
-            draft.load_file(path)
+            draft
+                .load_file(path)
+                .map(|()| user_sig_files.push(path.clone()))
         };
         if let Err(e) = result {
             eprintln!("warning: failed to load sig {}: {}", path.display(), e);
@@ -2175,33 +2860,36 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     //      and get sorted into `(file, start_byte, code,
     //      message)` order right before the check phase begins
     //      — see `crema::diagnostic::sort_by_canonical_order`.
-    //   2. Per-file check diagnostics stream out as each file
-    //      finishes (Layer 3 loop below), preserving the file-
-    //      completion responsiveness AI agents rely on.
+    //   2. Per-file check diagnostics are rendered by the pool
+    //      thread that checked the file and written by main in walk
+    //      order, each file as soon as it and every file before it
+    //      are done (Layer 3 below) — the responsiveness AI agents
+    //      rely on, without the output order depending on which
+    //      file finishes first.
     // The macro layer boundary (env phase entirely before
     // check phase) is preserved by construction; within the
     // env phase the byte-order sort supersedes the historical
     // "inline parse → build validate" sub-layer emission order.
     let stdout = std::io::stdout();
-    // `"file"` values are displayed cwd-relative (pre-ADR-0029
-    // representation, ADR-0005's jq-filter workflow) even though
-    // the paths are canonical/absolute internally. Canonicalize
-    // the cwd so it string-prefix-matches those canonical paths
-    // (`getcwd` already resolves symlinks on the platforms crema
-    // targets; the extra canonicalize covers the rest).
-    let display_base = std::env::current_dir()
-        .ok()
-        .and_then(|d| d.canonicalize().ok());
+    // `"file"` values (and the fingerprints / baseline rows built from
+    // them) are displayed relative to the crema.toml dir even though
+    // the paths are canonical/absolute internally — see
+    // `output_display_base`.
+    let display_base = output_display_base(&project_root);
     // ADR-0029 determined this filter's view is the whole
     // observable output (diagnostics *and* exit code), so files
     // outside it can skip Layer 3 entirely — kept here (cloned
     // before the emitter takes ownership) to drive that skip
-    // and to suppress the incremental cache write below.
+    // and to keep a filtered run's baseline staleness report quiet.
     let check_filter = diagnostic_filter.clone();
     // Extract mode owns stdout for its own output; the
     // check pipeline's diagnostics still flow through the emitter
     // machinery (same code path, same error exits) but land in a sink.
-    let emitter_out: Box<dyn Write> = if matches!(mode, RunMode::Check) {
+    // `--update-baseline` prints nothing either: its rows go to the
+    // baseline file at the normal end of the run, and an exit-2 path
+    // (which only calls `finish()`) must neither print them nor touch
+    // the file.
+    let emitter_out: Box<dyn Write> = if matches!(mode, RunMode::Check) && !update_baseline {
         Box::new(stdout.lock())
     } else {
         Box::new(std::io::sink())
@@ -2213,7 +2901,11 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     )
     .with_filter(diagnostic_filter)
     .with_display_base(display_base)
-    .with_tamped(tamp);
+    // `--update-baseline` collects the same rows `--tamp` streams; the
+    // writer above is a sink, so only the explicit drain at the normal
+    // end of the run gets them.
+    .with_tamped(tamp || update_baseline)
+    .with_baseline(baseline);
 
     // Read all sources: Layer 3 (below) type-checks every
     // requested file every run.
@@ -2232,14 +2924,12 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // Location keyed on the `-e` pseudo-path.
     //
     // Pass 0 (read + prism parse) and the inline collector run on
-    // the rayon pool (ADR-0033). Every check target's AST is needed
-    // for Layer 3 regardless of warm/cold. Reading scales poorly (a
-    // static split saturates at ~1.4x on APFS and ~1.6x on Linux,
-    // and spreading it over the pool measured slower than one thread
-    // on APFS) and takes about as long as the parallel parse +
-    // collect, so the two are overlapped rather than summed: main
-    // reads in walk order and hands batches to the pool as their
-    // bytes land, so the read hides behind the parse on either OS.
+    // the rayon pool, one read -> parse -> collect task per file
+    // (ADR-0033, ADR-0035). Every check target's AST is needed for
+    // Layer 3 regardless of warm/cold. The read is part of the task
+    // rather than a serial loop on main: where file syscalls are slow
+    // (endpoint security on open / stat) a serial read dominated the
+    // ingest, and spreading it costs little elsewhere.
     // Each pool thread collects against its own `NameTable`:
     // `Symbol` / `TypeName` ids are content-addressed (ADR-0025),
     // so a worker's declarations are valid in main's table once the
@@ -2259,19 +2949,22 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
             eval_path.as_path()
         }
     };
-    // One slot per file: the reading thread fills it, the parse task
-    // borrows it for as long as the AST lives (through the check loop).
+    // One slot per file: the task that reads it fills it, and the AST
+    // borrows it for as long as the AST lives (through the check phase).
+    // The `-e` code is never read, so its slot is filled up front.
     let slots: Vec<std::sync::OnceLock<Arc<[u8]>>> =
         (0..n).map(|_| std::sync::OnceLock::new()).collect();
+    if let Some(code) = &eval_code {
+        let _ = slots[files.len()].set(Arc::clone(code));
+    }
     let units: Vec<crema::inline_parser::SourceFile<'_>> = (0..n)
         .map(|i| crema::inline_parser::SourceFile::intern(path_at(i), draft.names()))
         .collect();
-    // One slot per pool thread, addressed by `current_thread_index`,
-    // plus one at the end for main (which is not a pool thread) —
+    // One slot per pool thread, addressed by `current_thread_index` —
     // each lock is only ever taken by its own thread, so it is
     // uncontended.
     let pool_threads = rayon::current_num_threads();
-    let workers: Vec<std::sync::Mutex<IngestWorker<'_>>> = (0..=pool_threads)
+    let mut workers: Vec<std::sync::Mutex<IngestWorker<'_>>> = (0..pool_threads)
         .map(|_| std::sync::Mutex::new(IngestWorker::default()))
         .collect();
 
@@ -2281,57 +2974,67 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // of the extra CPU a parallel run shows over a single-threaded
     // one is not spawn overhead but the E-cores' slower parse counted
     // in CPU-seconds.
-    //
-    // `in_place_scope` keeps the read loop on main; the pool only
-    // ever runs parse + collect. With a one-thread pool
-    // (`CREMA_THREADS=1`) the batches run inline on main as well
-    // instead of hopping to the lone worker: measured on the steep
-    // workload, AST / declaration memory allocated on a worker and
-    // dropped on main costs the check phase ~3% (mimalloc frees
-    // across threads), and the single-thread path is the perf
-    // gate's and the Steep / Sorbet comparison's yardstick.
     const INGEST_BATCH: usize = 32;
-    let single_thread = pool_threads == 1;
-    let infusion_collect = infusion_active.then_some(InfusionCollectOptions {
-        options: resolved.infusion,
-        inflector: &inflector_owner,
+    debug_assert_eq!(
+        ingest_cache_lookup,
+        matches!(mode, RunMode::Check) && check_filter.is_some(),
+        "the lookup gate restates the diagnostic filter's condition"
+    );
+    // The previous run's listings served the walk; drop them before
+    // the ingest phase (the write-back uses this run's listings).
+    drop(ingest_cache_dirs);
+    let ingest_cache = (ingest_cache_lookup || ingest_cache_write).then_some(IngestCacheInput {
+        lookup: ingest_cache_lookup.then_some(&ingest_cache_records),
+        filter: check_filter.as_ref(),
+        write: ingest_cache_write,
+        verify: snapshot_timing,
+        scope_files: files.len(),
     });
+    let input = IngestInput {
+        slots: &slots,
+        units: &units,
+        inline_mode,
+        infusion: infusion_active.then_some(InfusionCollectOptions {
+            options: resolved.infusion,
+            inflector: &inflector_owner,
+        }),
+        cache: ingest_cache,
+    };
     rayon::in_place_scope(|s| {
-        let mut batch: Vec<(usize, &[u8], crema::inline_parser::SourceFile<'_>)> =
-            Vec::with_capacity(INGEST_BATCH);
-        for (i, unit) in units.iter().enumerate() {
-            let bytes: Arc<[u8]> = match &eval_code {
-                Some(code) if i == files.len() => Arc::clone(code),
-                _ => match std::fs::read(unit.path) {
-                    Ok(bytes) => Arc::from(bytes),
-                    Err(e) => {
-                        eprintln!("error: cannot read {}: {}", unit.path.display(), e);
-                        process::exit(2);
-                    }
-                },
-            };
-            let source: &[u8] = &slots[i].get_or_init(|| bytes)[..];
-            batch.push((i, source, *unit));
-            if batch.len() == INGEST_BATCH || i + 1 == n {
-                let batch = std::mem::replace(&mut batch, Vec::with_capacity(INGEST_BATCH));
-                if single_thread {
-                    run_ingest_batch(&workers, inline_mode, infusion_collect, batch);
-                } else {
-                    let workers = &workers;
-                    s.spawn(move |_| {
-                        run_ingest_batch(workers, inline_mode, infusion_collect, batch)
-                    });
-                }
-            }
+        let workers = &workers;
+        for start in (0..n).step_by(INGEST_BATCH) {
+            let batch = start..(start + INGEST_BATCH).min(n);
+            s.spawn(move |_| run_ingest_batch(workers, input, batch));
         }
     });
+    // Tasks run in no particular order, so a read failure is reported
+    // only once every task is done, and it is the first one in walk
+    // order — the same file a serial read would have stopped at.
+    let first_read_error = workers
+        .iter_mut()
+        .flat_map(|w| {
+            std::mem::take(
+                &mut w
+                    .get_mut()
+                    .expect("ingest worker slot poisoned")
+                    .read_errors,
+            )
+        })
+        .min_by_key(|(i, _)| *i);
+    if let Some((i, e)) = first_read_error {
+        eprintln!("error: cannot read {}: {}", path_at(i).display(), e);
+        process::exit(2);
+    }
 
+    // A file served from the ingest cache has no bytes in memory: the
+    // emitter and the validator fall back to reading the file if a
+    // diagnostic ever needs its text (it never does for a file outside
+    // the filter — see `build_diagnostic_filter`).
     let sources: Vec<(PathBuf, Arc<[u8]>)> = (0..n)
-        .map(|i| {
-            let bytes = slots[i]
+        .filter_map(|i| {
+            slots[i]
                 .get()
-                .expect("every source slot is filled by the read loop");
-            (path_at(i).to_path_buf(), Arc::clone(bytes))
+                .map(|bytes| (path_at(i).to_path_buf(), Arc::clone(bytes)))
         })
         .collect();
     // Nothing is emitted before this point, so registering the
@@ -2341,14 +3044,82 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         emitter.register_source(file.clone(), Arc::clone(source));
     }
     let mut ingested: Vec<Option<IngestedFile<'_>>> = (0..n).map(|_| None).collect();
+    let mut cache_stats = IngestCacheStats::default();
     for worker in workers {
-        let IngestWorker { names, results } =
-            worker.into_inner().expect("ingest worker slot poisoned");
+        let IngestWorker {
+            names,
+            results,
+            cache_stats: worker_stats,
+            ..
+        } = worker.into_inner().expect("ingest worker slot poisoned");
         draft.names().merge(names);
+        cache_stats.add(&worker_stats);
         for (i, result) in results {
             ingested[i] = Some(result);
         }
     }
+    // The workers' tables were merged in above; fold before the passes
+    // that follow read them.
+    draft.compact_names();
+
+    if snapshot_timing && matches!(mode, RunMode::Check) {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let note = match (&ingest_cache_cold_reason, ingest_cache_lookup) {
+            (Some(reason), _) => format!(" cold ({reason})"),
+            (None, false) => " (no lookup: every file is a target)".to_string(),
+            (None, true) => String::new(),
+        };
+        let uncacheable = if cache_stats.uncacheable > 0 {
+            format!(" uncacheable {}", cache_stats.uncacheable)
+        } else {
+            String::new()
+        };
+        // `open` is wall time on main (read + record index); `stat`,
+        // `decode` and `verify` are summed over the workers. `verify`
+        // (reading every hit file back to check its content hash) only
+        // runs under this env, so it inflates the `ingest:` line below
+        // by about the read cost the cache saves.
+        // `dirs`: directories whose listing came from the cache vs.
+        // read again (both are written back).
+        eprintln!(
+            "ingest-cache: hit {} / miss {} (open {:.1}ms, stat {:.1}ms, decode {:.1}ms, verify {:.1}ms) dirs reused {} / walked {}{}{}",
+            cache_stats.hits,
+            cache_stats.misses,
+            ms(d_ingest_cache_open),
+            ms(cache_stats.stat_time),
+            ms(cache_stats.decode_time),
+            ms(cache_stats.verify_time),
+            walked_dirs.reused,
+            walked_dirs.listings.len() - walked_dirs.reused,
+            uncacheable,
+            note
+        );
+    }
+    // Write back the scope files' records (see `ingest_cache_write_back`).
+    // The cache is a lookup by path, so a file left out only misses next
+    // run. Write failures are silent, as for the G snapshot: stderr must
+    // not depend on the cache.
+    if ingest_cache_write {
+        let outcomes = ingested
+            .iter_mut()
+            .enumerate()
+            .take(files.len())
+            .map(|(i, file)| {
+                let file = file.as_mut().expect("every file is ingested exactly once");
+                (
+                    path_at(i),
+                    std::mem::replace(&mut file.cache, IngestCacheOutcome::Off),
+                )
+            });
+        let records = ingest_cache_write_back(outcomes, &mut ingest_cache_records);
+        let contents = crema::ingest_cache::Contents {
+            dirs: std::mem::take(&mut walked_dirs.listings),
+            records,
+        };
+        let bytes = crema::ingest_cache::encode_file(&ingest_cache_key, &contents);
+        let _ = crema::snapshot::write::write_atomic_bytes(&ingest_cache_path, &bytes);
+    }
+    drop(ingest_cache_records);
 
     let mut parsed_sources = Vec::with_capacity(n);
     let mut collected = Vec::with_capacity(n);
@@ -2357,20 +3128,34 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     let mut infusion_collected: Vec<Option<crema::infusion_collector::CollectedSource<'_>>> =
         (0..n).map(|_| None).collect();
     for (i, ingested) in ingested.into_iter().enumerate() {
-        match ingested.expect("every file is ingested exactly once") {
-            IngestedFile::SyntaxError(diag) => env_diags.push(diag),
-            IngestedFile::Parsed {
-                source,
-                ast,
+        let IngestedFile {
+            parsed, payload, ..
+        } = ingested.expect("every file is ingested exactly once");
+        match payload {
+            crema::ingest_cache::IngestPayload::SyntaxError(diag) => env_diags.push(diag),
+            crema::ingest_cache::IngestPayload::Parsed {
                 decls,
                 diags,
                 infusion,
             } => {
+                // A cache hit has neither bytes nor AST: its source is
+                // read on demand if an insert-time diagnostic needs it.
+                let (source, parse_result) = match parsed {
+                    Some((source, ast)) => {
+                        (crema::source_ref::SourceRef::Bytes(source), Some(ast.0))
+                    }
+                    None => (
+                        crema::source_ref::SourceRef::Lazy {
+                            slot: &slots[i],
+                            path: path_at(i),
+                        },
+                        None,
+                    ),
+                };
                 parsed_sources.push(ParsedSource {
-                    file: sources[i].0.as_path(),
+                    file: path_at(i),
                     source,
-                    parse_result: Some(ast.0),
-                    content_hash: None,
+                    parse_result,
                 });
                 collected.push((decls, diags));
                 infusion_collected[i] = infusion;
@@ -2389,26 +3174,16 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // and in walk order, for every file — the eval pseudo-file
     // included (ADR-0029 §5 rework — eval declarations live in the
     // in-memory environment; only snapshot persistence is eval-gated).
-    // Sig mode (`inline = false`) collects for the diagnostics only
-    // and inserts nothing, as `parse_inline_annotations` did.
+    // Sig mode (`inline = false`) ran no collector (see `ingest_file`),
+    // so every file's lists are empty there.
     for (parsed, (decls, mut diags)) in parsed_sources.iter().zip(collected) {
-        if inline_mode {
-            for decl in &decls {
-                draft.insert_ruby_decl(decl, parsed.source, Some(parsed.file), &mut diags);
-            }
+        for decl in &decls {
+            draft.insert_ruby_decl(decl, parsed.source, Some(parsed.file), &mut diags);
         }
         env_diags.extend(diags);
     }
 
     if infusion_active {
-        let infusion_sources: Vec<_> = parsed_sources
-            .iter()
-            .map(|parsed| crema::infusion_collector::SourceUnit {
-                source: parsed.source,
-                parse_result: parsed.ast(),
-                file: Some(parsed.file),
-            })
-            .collect();
         if let Some(config_options) = resolved.config_infusion.as_ref() {
             match crema::infusion_collector::config::load(config_options, &mut draft) {
                 Ok(warnings) => env_diags.extend(warnings),
@@ -2426,14 +3201,13 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
             }
         }
         let schema = if resolved.infusion.activerecord {
-            // Pre-pass: `self.table_name =` lives in the model files and the
-            // schema dumps parse independently of them — collect both up
-            // front; load_all emits the schema declarations once the
-            // post-concern-expansion enum set is known.
-            let (schema, schema_diags) = crema::infusion_collector::activerecord::prepare_schema(
-                &project_root,
-                &infusion_sources,
-            );
+            // The schema dumps parse independently of the Ruby sources
+            // (their `self.table_name =` overrides were collected per file
+            // on the ingest workers); load_collected emits the schema
+            // declarations once the post-concern-expansion enum set is
+            // known.
+            let (schema, schema_diags) =
+                crema::infusion_collector::activerecord::prepare_schema(&project_root);
             env_diags.extend(schema_diags);
             Some(schema)
         } else {
@@ -2465,86 +3239,25 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         );
     }
     let d_ingest = t_ingest.elapsed();
-    // ADR-0032 Decision 1: the incremental scheduler is a
-    // crema.toml opt-in and never active for `-e` (nothing
-    // persists there — same gate as the snapshot writes). Every
-    // cache read/write, the fingerprint pass, and the per-file
-    // content hashing live behind this flag; the default path
-    // pays nothing new.
-    let incremental_active = resolved.incremental.active() && !eval_active;
-    // ADR-0032 Decision 6: shadow-recheck replay-classified
-    // files and treat any divergence as a recording bug —
-    // reported on stderr (never the JSONL stream, which always
-    // carries the fresh side) and failing the run.
-    let verify_active = resolved.incremental.verify() && !eval_active;
-    let incremental_debug = std::env::var_os("CREMA_DEBUG_INCREMENTAL").is_some_and(|v| v == "1");
-    let incremental_cache_path = project_root.join(crema::incremental::INCREMENTAL_CACHE_FILE);
-    let t_incremental = std::time::Instant::now();
-    // Scheduler stage 1: the previous generation off disk. Read
-    // here, before the draft is frozen, because its content
-    // hashes are what the AST release below keys on.
-    let cached_generation = incremental_active.then(|| {
-        // The cache key is the G-snapshot invalidation key
-        // (crema version + lockfile contents + crema.toml
-        // content + sig path set — ADR-0032 Decision 3's G-layer
-        // matching, which also folds in every crema.toml-borne
-        // check setting). Recomputed only when --no-g-snapshot
-        // withheld the one computed above; the two caches stay
-        // independently usable.
-        let key = g_snapshot_key.unwrap_or_else(|| {
-            compute_g_snapshot_key(
-                &resolved.sig_dirs,
-                rbs_collection_lock_path.as_deref(),
-                &project_root,
-                no_bundler,
-            )
-        });
-        crema::incremental::CachedGeneration::load(&incremental_cache_path, key, resolved.inline)
-    });
-    let mut d_incremental_prepare = t_incremental.elapsed();
-
     // AST release: a file's AST is dead once inline collection is
-    // over unless Layer 3 type-checks it. Two kinds of file
-    // provably won't be: one outside the diagnostic filter (the
-    // loop skips it outright), and one whose bytes match the
-    // previous generation (a replay candidate — the loop re-emits
-    // its stored diagnostics). The second is provisional: a probe
-    // hit in `dispose` can still demote it to recheck, in which
-    // case the loop re-parses from `source`. Releasing here, before
-    // env construction, is the point — the footprint peak sits at
-    // the end of `Scheduler::prepare`, and the C-side prism heap
-    // holds these nodes at ~10x the source size, so a large warm
-    // project's peak drops by the whole AST. The two conditions
-    // are independent: a filtered-out file is released whether or
-    // not the scheduler is on, while the replay-candidate release
-    // needs a valid previous generation — so a cold run (no cache),
-    // a run without the scheduler, and verify mode (every file
-    // rechecked) all keep every in-filter AST, and this pass is a
-    // plain hash pre-computation for them. Extract reads every AST,
-    // so it is exempt.
-    let mut dropped_ast_count = 0usize;
-    if matches!(mode, RunMode::Check) {
+    // over unless Layer 3 type-checks it. A file outside the
+    // diagnostic filter provably won't be (the check loop skips it
+    // outright), so its AST is released here, before env
+    // construction: the C-side prism heap holds these nodes at ~10x
+    // the source size, and a single-file check (ADR-0029) would
+    // otherwise carry every other scope file's tree through the
+    // footprint peak. Extract reads every AST, so it is exempt.
+    if matches!(mode, RunMode::Check)
+        && let Some(filter) = &check_filter
+    {
         let mut dead_asts = Vec::new();
         for parsed in &mut parsed_sources {
-            let in_filter = check_filter
-                .as_ref()
-                .is_none_or(|filter| filter.contains(parsed.file));
-            parsed.content_hash = (in_filter && incremental_active)
-                .then(|| crema::incremental::content_hash(parsed.source));
-            let replay_candidate = !verify_active
-                && match (&cached_generation, parsed.content_hash) {
-                    (Some(generation), Some(hash)) => {
-                        generation.content_unchanged(&parsed.file.to_string_lossy(), hash)
-                    }
-                    _ => false,
-                };
-            if (!in_filter || replay_candidate)
+            if !filter.contains(parsed.file)
                 && let Some(ast) = parsed.parse_result.take()
             {
                 dead_asts.push(ast);
             }
         }
-        dropped_ast_count = dead_asts.len();
         drop(dead_asts);
     }
 
@@ -2582,12 +3295,51 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         };
         let d_build_cold = t_build.elapsed();
         let t_defbuild = std::time::Instant::now();
-        let env = DefinitionBuilder::from_environment(Arc::clone(&frozen));
+        // ADR-0036 Decision 4-2: the diagnostics-only env walks (the
+        // defbuild dup scans, every validator sub-check) start from the
+        // filter's files when there is one — their diagnostics for any
+        // other file would be dropped by the emitter's filter anyway,
+        // so under a single-file check they were ~2/5 of the wall spent
+        // before the check phase for nothing. The filter's paths are
+        // canonical, as are the names the ingest interned decls under
+        // (`SourceFile::intern`), and `-e` is both the filter entry and
+        // the eval unit's name, so the lookup is exact: a filter file
+        // the index does not know simply contributes no seed.
+        let scan_scope = match &check_filter {
+            Some(filter) => {
+                let names = frozen.names();
+                frozen.scan_scope_for_files(
+                    filter
+                        .iter()
+                        .filter_map(|path| names.lookup(&path.to_string_lossy())),
+                )
+            }
+            None => crema::environment::ScanScope::Whole,
+        };
+        let env = DefinitionBuilder::from_environment_scoped(Arc::clone(&frozen), &scan_scope);
         let d_defbuild_cold = t_defbuild.elapsed();
 
         let t_validate = std::time::Instant::now();
-        let (_, validate_diags) = validator::full_validate(&env, &source_cache);
+        let (_, validate_diags) = validator::full_validate_scoped(&env, &source_cache, &scan_scope);
         env_diags.extend(validate_diags);
+        // The user's own decls: sig files plus every scope `.rb`
+        // (inline decls; `-e` included), as the names their decls were
+        // interned under. Library sigs are not walked. Under a filter,
+        // only the filter's files: a `.rbs` or non-target `.rb` decl's
+        // namespace diagnostic could never reach the output.
+        let names = env.names();
+        let user_files: Vec<crema::name::Name> = match &check_filter {
+            Some(filter) => filter
+                .iter()
+                .filter_map(|path| names.lookup(&path.to_string_lossy()))
+                .collect(),
+            None => user_sig_files
+                .iter()
+                .filter_map(|path| names.lookup(&path.to_string_lossy()))
+                .chain(units.iter().map(|unit| unit.name))
+                .collect(),
+        };
+        env_diags.extend(validator::validate_decl_namespaces(&env, user_files));
         let d_validate_cold = t_validate.elapsed();
 
         (env, d_build_cold, d_defbuild_cold, d_validate_cold)
@@ -2606,10 +3358,10 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
             run_extract(
                 &env,
                 &sources,
-                &parsed_sources,
-                &resolved,
+                &mut parsed_sources,
                 &project_root,
                 eval_active,
+                snapshot_timing,
             );
             return;
         }
@@ -2618,234 +3370,63 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
 
     let t_check = std::time::Instant::now();
     // Sub-phase accumulators for the check-timing line: time spent in
-    // the `did_you_mean` join and in JSONL emission, so a warm run's
-    // replay cost can be told apart from the type-check proper.
+    // the `did_you_mean` join and in JSONL emission, so their cost can
+    // be told apart from the type-check proper.
     let mut d_join = std::time::Duration::ZERO;
     let mut d_emit = std::time::Duration::ZERO;
-    let mut d_cache_write = std::time::Duration::ZERO;
 
-    // Dev-only trigger for per-file consultation recording
-    // (ADR-0032 Decision 2, axis 3). The real on/off switch is
-    // `crema.toml`'s `incremental` flag (cache_io's territory,
-    // Decision 1); this env var exists only so this axis's own
-    // JSONL-idempotency and perf-overhead checks can turn
-    // recording on without that wiring existing yet. Mirrors the
-    // `CREMA_DEBUG_SNAPSHOT_TIMING` precedent above.
-    let record_consultation =
-        std::env::var_os("CREMA_DEBUG_CONSULTATION_LOG").is_some_and(|v| v == "1");
-    let mut consulted_key_total = 0usize;
-
-    let mut verify_divergent = 0usize;
-    let mut reparsed_ast_count = 0usize;
-    // Scheduler stage 2: fingerprint diff + probes against the
-    // frozen env. This is where the footprint peaks (every
-    // declaration resolves for the fingerprint pass) — hence the
-    // AST release above sits before it, not after.
-    let t_incremental = std::time::Instant::now();
-    let mut scheduler = cached_generation.map(|generation| generation.prepare(env.env_arc()));
-    d_incremental_prepare += t_incremental.elapsed();
-    let mut incremental_files: Vec<crema::incremental::FileEntry> = Vec::new();
-    let mut replayed_count = 0usize;
-    let mut rechecked_count = 0usize;
-
-    // Layer 3 (type check): per-file type checking. Stream each
-    // file's diagnostics out as soon as the file finishes; there
-    // is no shared budget across files. Under the incremental
-    // scheduler each file either replays (stored diagnostics
-    // re-emitted through the same join + emit path a fresh check
-    // takes) or rechecks with consultation recording on — in the
-    // same walk order either way, so the JSONL stream stays
-    // bit-identical to a full check (ADR-0032 Decision 1).
+    // Layer 3 (type check): one job per file, run on the pool
+    // (ADR-0034 Decision 4). Main commits the results in walk order as
+    // the finished prefix grows, so each file's diagnostics still go
+    // out as soon as it and every file before it are done, and the
+    // JSONL stream stays bit-identical to a serial check whatever the
+    // thread count.
+    let mut jobs = Vec::new();
     for parsed in &mut parsed_sources {
         // Files outside the diagnostic filter never reach the
         // output or the exit code (ADR-0029 §3/§5), so their
         // per-file check is unobservable work. Env construction
         // above still saw every scope file — only Layer 3 is
-        // elided. Skipped files also stay out of
-        // `incremental_files`, which is safe because filtered
-        // runs never write the cache (see below).
+        // elided.
         if let Some(filter) = &check_filter
             && !filter.contains(parsed.file)
         {
             continue;
         }
-        let current_hash = parsed.content_hash;
-        if let Some(sched) = scheduler.as_mut() {
-            let hash = current_hash.expect("incremental_active implies hash");
-            let path_str = parsed.file.to_string_lossy();
-            if let Some(entry) = sched.dispose(&path_str, hash) {
-                if verify_active {
-                    let log = ConsultationLog::new();
-                    let fresh = check_source_with_log(
-                        &env,
-                        parsed.file.to_path_buf(),
-                        parsed.source,
-                        parsed.ast(),
-                        CheckOptions {
-                            verbose,
-                            inline: resolved.inline,
-                        },
-                        Some(&log),
-                    );
-                    let entries = log.into_entries();
-                    match crema::incremental::verify_file(&entry, &fresh, &entries) {
-                        Some(div) => {
-                            report_verify_divergence(&path_str, &entry, &fresh, &div);
-                            verify_divergent += 1;
-                            // The fresh entry replaces the diverged
-                            // one in the next generation (counted as
-                            // a recheck so `into_payload` sees the
-                            // cache as dirty): one verify run heals
-                            // the cache.
-                            rechecked_count += 1;
-                            incremental_files.push(crema::incremental::FileEntry {
-                                path: entry.path,
-                                content_hash: hash,
-                                consulted: crema::incremental::project_consulted_entries(&entries),
-                                diagnostics: fresh.clone(),
-                            });
-                        }
-                        None => {
-                            replayed_count += 1;
-                            incremental_files.push(entry);
-                        }
-                    }
-                    // Emit the fresh side either way — identical to
-                    // the stored side when clean, and never the
-                    // forged bytes when diverged, so the JSONL
-                    // contract holds without consulting the verdict.
-                    let mut diagnostics = fresh;
-                    let t_join = std::time::Instant::now();
-                    if resolved.did_you_mean {
-                        join_did_you_mean(&env, &mut diagnostics);
-                    }
-                    d_join += t_join.elapsed();
-                    let t_emit = std::time::Instant::now();
-                    for diag in &diagnostics {
-                        emitter.emit(diag);
-                    }
-                    d_emit += t_emit.elapsed();
-                    continue;
-                }
-                let mut diagnostics = entry.diagnostics.clone();
-                let t_join = std::time::Instant::now();
-                if resolved.did_you_mean {
-                    join_did_you_mean(&env, &mut diagnostics);
-                }
-                d_join += t_join.elapsed();
-                let t_emit = std::time::Instant::now();
-                for diag in &diagnostics {
-                    emitter.emit(diag);
-                }
-                d_emit += t_emit.elapsed();
-                replayed_count += 1;
-                incremental_files.push(entry);
-                continue;
-            }
-        }
-        // A replay candidate demoted to recheck by a probe hit had
-        // its AST released above; the same bytes parse to the same
-        // tree, so re-parsing here is invisible to the output.
-        if parsed.parse_result.is_none() {
-            parsed.parse_result = Some(ruby_prism::parse(parsed.source));
-            reparsed_ast_count += 1;
-        }
-        let log = (incremental_active || record_consultation).then(ConsultationLog::new);
-        let mut diagnostics = check_source_with_log(
-            &env,
-            parsed.file.to_path_buf(),
-            parsed.source,
-            parsed.ast(),
-            CheckOptions {
-                verbose,
-                inline: resolved.inline,
-            },
-            log.as_ref(),
-        );
-        if let Some(log) = log {
-            let entries = log.into_entries();
-            if record_consultation {
-                consulted_key_total += entries.len();
-            }
-            if incremental_active {
-                rechecked_count += 1;
-                // Persisted pre-join: `did_you_mean` is a
-                // computed column recomputed against the live
-                // env at every emission (Decision 5a), so the
-                // stored fact must not carry it.
-                incremental_files.push(crema::incremental::FileEntry {
-                    path: parsed.file.to_string_lossy().into_owned(),
-                    content_hash: current_hash.expect("incremental_active implies hash"),
-                    consulted: crema::incremental::project_consulted_entries(&entries),
-                    diagnostics: diagnostics.clone(),
-                });
-            }
-        }
-        // ADR-0032 Decision 5a: check only records the fact that a
-        // constant failed to resolve (name + candidate scope);
-        // `did_you_mean` is a computed column joined against the
-        // env in scope here, right before emission — the same
-        // join a cached/replayed diagnostic would go through.
-        let t_join = std::time::Instant::now();
-        if resolved.did_you_mean {
-            join_did_you_mean(&env, &mut diagnostics);
-        }
-        d_join += t_join.elapsed();
-        let t_emit = std::time::Instant::now();
-        for diag in &diagnostics {
-            emitter.emit(diag);
-        }
-        d_emit += t_emit.elapsed();
+        jobs.push(CheckJob {
+            file: parsed.file,
+            source: parsed.source.bytes(),
+            ast: SendParseResult(
+                parsed
+                    .parse_result
+                    .take()
+                    .expect("an in-filter file keeps its AST until its check job"),
+            ),
+        });
     }
-
-    if let Some(sched) = scheduler {
-        // Invariant: only a full-view run advances the cache
-        // generation. A filtered run skipped some files above;
-        // persisting a fresh fingerprint table next to their
-        // stale entries would make the next bare run see an
-        // empty diff and replay outdated diagnostics.
-        let partial = check_filter.is_some();
-        let payload = if partial {
-            None
-        } else {
-            sched.into_payload(incremental_files, rechecked_count)
-        };
-        let wrote = payload.is_some();
-        let t_cache_write = std::time::Instant::now();
-        if let Some((key, payload)) = payload
-            && let Err(e) = crema::incremental::write_cache(&incremental_cache_path, &key, &payload)
-        {
-            eprintln!("warning: failed to write incremental cache: {e}");
-        }
-        d_cache_write = t_cache_write.elapsed();
-        if incremental_debug {
-            eprintln!("ast: {dropped_ast_count} dropped, {reparsed_ast_count} reparsed");
-            eprintln!(
-                "incremental: {replayed_count} replayed, {rechecked_count} rechecked, \
-                     prepare {:.3}ms, cache {}",
-                d_incremental_prepare.as_secs_f64() * 1000.0,
-                if wrote {
-                    "written"
-                } else if partial {
-                    "skipped (partial run)"
-                } else {
-                    "unchanged"
-                },
-            );
-        }
-    }
-
-    if record_consultation {
-        eprintln!(
-            "consultation-log: {consulted_key_total} keys recorded across {} files",
-            parsed_sources.len()
-        );
-    }
+    let (renderer, committer) = emitter.split();
+    let context = CheckContext {
+        env: &env,
+        renderer,
+        did_you_mean: resolved.did_you_mean,
+    };
+    run_in_walk_order(
+        jobs,
+        |job| run_check_job(context, job),
+        |outcome| {
+            let t_commit = std::time::Instant::now();
+            for rendered in outcome.rendered {
+                committer.commit(rendered);
+            }
+            d_emit += outcome.d_render + t_commit.elapsed();
+            d_join += outcome.d_join;
+        },
+    );
 
     if snapshot_timing {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         eprintln!(
-            "check-timing: total {:.1}ms setup {:.1}ms ingest {:.1}ms build {:.1}ms defbuild {:.1}ms validate {:.1}ms check {:.1}ms (join {:.1}ms emit {:.1}ms) cache-write {:.1}ms",
+            "check-timing: total {:.1}ms setup {:.1}ms ingest {:.1}ms build {:.1}ms defbuild {:.1}ms validate {:.1}ms check {:.1}ms (join {:.1}ms emit {:.1}ms)",
             ms(t_run.elapsed()),
             ms(d_setup),
             ms(d_ingest),
@@ -2854,8 +3435,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
             ms(d_validate),
             ms(t_check.elapsed()),
             ms(d_join),
-            ms(d_emit),
-            ms(d_cache_write)
+            ms(d_emit)
         );
         if let Some(backend) = env.env().g_backend() {
             eprintln!(
@@ -2866,40 +3446,118 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     }
 
     let had_any_error = emitter.had_any_error();
+    if update_baseline {
+        let path = baseline_path
+            .as_ref()
+            .expect("--update-baseline was gated on a resolved baseline path");
+        if let Err(err) = write_baseline(path, emitter.take_tamp_lines()) {
+            eprintln!("error: cannot write baseline {}: {}", path.display(), err);
+            process::exit(2);
+        }
+    } else if emitter.stale_baseline_count() > 0 && check_filter.is_none() {
+        // A filtered run never sees the rest of the scope, so its
+        // unmatched rows say nothing about staleness.
+        eprintln!(
+            "baseline: {} entries no longer reported; run `crema check --update-baseline` to drop them",
+            emitter.stale_baseline_count()
+        );
+    }
     emitter.finish();
     drop(emitter);
 
-    // A verify divergence is a crema bug, not a project
-    // diagnostic — it fails the run even when the JSONL stream
-    // is clean, so automated dogfooding cannot miss it.
-    if had_any_error || verify_divergent > 0 {
+    // `--update-baseline` records the diagnostics instead of failing
+    // on them.
+    if had_any_error && !update_baseline {
         process::exit(1);
     }
 }
 
-/// One check target parsed by Pass 0 (shared by the check loop and the
-/// extract loop).
-struct ParsedSource<'a> {
-    file: &'a Path,
-    source: &'a [u8],
-    /// `None` once the AST has been released ahead of the check loop
-    /// (a content-unchanged or filtered-out file — see the release
-    /// pre-pass in `run_check`); a recheck re-parses it on demand. Every reader after that point goes
-    /// through `ast()`, so a read-after-release is a loud panic rather
-    /// than a silently skipped file.
-    parse_result: Option<ruby_prism::ParseResult<'a>>,
-    /// xxh3 of `source`, computed once in the release pre-pass for
-    /// every file the incremental scheduler will classify; `None`
-    /// otherwise (scheduler off, or file outside the check filter).
-    content_hash: Option<u64>,
+/// Read a baseline file into remaining-absorb counts keyed by the
+/// canonical tamp row. Each line must be exactly a
+/// `{file, code, fingerprint}` object; anything else names its line
+/// number so a hand edit or a merge conflict marker is caught, not
+/// silently treated as "no such diagnostic".
+fn load_baseline(path: &Path) -> Result<HashMap<String, usize>, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Row {
+        file: String,
+        code: String,
+        fingerprint: String,
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "error: baseline file not found: {}\n  run `crema check --update-baseline` to create it",
+                path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "error: cannot read baseline {}: {}",
+                path.display(),
+                e
+            ));
+        }
+    };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (idx, line) in content.lines().enumerate() {
+        let row: Row = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "error: malformed baseline row at {}:{}: {}",
+                path.display(),
+                idx + 1,
+                e
+            )
+        })?;
+        *counts
+            .entry(crema::diagnostic::render_tamp_line(
+                &row.file,
+                &row.code,
+                &row.fingerprint,
+            ))
+            .or_insert(0) += 1;
+    }
+    Ok(counts)
 }
 
-impl<'a> ParsedSource<'a> {
-    fn ast(&self) -> &ruby_prism::ParseResult<'a> {
-        self.parse_result
-            .as_ref()
-            .expect("AST read after it was released ahead of the check loop")
+/// Write the sorted tamp rows as the baseline file. An empty run
+/// still writes the (empty) file so `baseline = true` never trips its
+/// own missing-file error afterwards.
+fn write_baseline(path: &Path, lines: Vec<String>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
+    let mut content = String::new();
+    for line in lines {
+        content.push_str(&line);
+        content.push('\n');
+    }
+    std::fs::write(path, content)
+}
+
+/// Stack size of the pool threads that main spawns: the usual size of
+/// the main thread's own stack. The checker recurses on expression
+/// depth, and any pool thread may pick up any file, so with a smaller
+/// stack (Rust's default for spawned threads is 2MB) an input that
+/// checks fine on one thread would overflow on several. Fixed on
+/// purpose: it is a correctness bound, not a tuning knob.
+const POOL_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// One check target parsed by Pass 0 (shared by the check phase and the
+/// extract check pass).
+struct ParsedSource<'a> {
+    file: &'a Path,
+    source: crema::source_ref::SourceRef<'a>,
+    /// `None` once the AST has been released ahead of the check phase
+    /// (a filtered-out file — see the release pre-pass in `run_check`)
+    /// or moved into the file's check or extract job. Every reader
+    /// `take()`s it with an `expect`, so a read-after-release is a loud
+    /// panic rather than a silently skipped file.
+    parse_result: Option<ruby_prism::ParseResult<'a>>,
 }
 
 /// A prism `ParseResult` that may be moved off the thread that parsed it.
@@ -2907,40 +3565,109 @@ impl<'a> ParsedSource<'a> {
 /// `ParseResult` holds `NonNull` pointers into the C parser and node
 /// tree, which makes it `!Send` by default. Everything those pointers
 /// reach is heap-owned by the result itself (freed in its `Drop`); prism
-/// keeps no thread-local or global parser state. The parallel ingest
-/// moves each result exactly once — a worker parses, main takes over as
-/// the sole owner for infusion / the release pre-pass / the check loop —
-/// so the move is sound. `Sync` is deliberately not claimed: nothing
-/// shares an AST across threads. If a later ADR makes check workers
-/// re-parse their own files, this wrapper goes away with the handoff.
+/// keeps no thread-local or global parser state. A result changes
+/// threads twice, each time by move: the ingest worker that parsed it
+/// hands it to main (infusion, the release pre-pass), and main hands it
+/// to the check job that reads it and then frees it. There is one owner
+/// at any time, so the moves are sound. `Sync` is deliberately not
+/// claimed: nothing shares an AST across threads.
 struct SendParseResult<'a>(ruby_prism::ParseResult<'a>);
 
 // SAFETY: see the type doc — heap-only state, single owner at a time,
-// moved (never shared) across the worker → main boundary.
+// moved (never shared) across the worker → main → worker boundaries.
 unsafe impl Send for SendParseResult<'_> {}
 
 /// What one parallel-ingest worker produces for one check target.
-enum IngestedFile<'a> {
-    /// Prism reported an error: one `Ruby::SyntaxError`, and the file
-    /// takes no further part in the run (no inline collection, no
-    /// type check; see `ingest_file`).
-    SyntaxError(crema::diagnostic::Diagnostic),
-    Parsed {
-        source: &'a [u8],
-        ast: SendParseResult<'a>,
-        /// Top-level declarations the inline collector found, to be
-        /// inserted into the draft on main in walk order.
-        decls: Vec<crema::ast::ruby::declarations::Declaration>,
-        /// Collection-time diagnostics (annotation syntax errors and
-        /// the like); insert-time diagnostics are appended on main.
-        diags: Vec<crema::diagnostic::Diagnostic>,
-        /// The rails infusion collect half for this file, walked on the
-        /// same worker right after the inline collector so the AST is
-        /// walked twice on the worker rather than once there and once
-        /// on main. `None` when no infusion is active (the collector is
-        /// not built at all).
-        infusion: Option<crema::infusion_collector::CollectedSource<'a>>,
-    },
+struct IngestedFile<'a> {
+    /// The bytes and AST of a file parsed this run. `None` for a file
+    /// served from the ingest cache (never read) and for a file prism
+    /// rejected (no AST to keep).
+    parsed: Option<(&'a [u8], SendParseResult<'a>)>,
+    /// The collect output: the inline collector's declarations and
+    /// diagnostics (insert-time diagnostics are appended on main) and
+    /// the rails infusion collect half, walked on the same worker right
+    /// after the inline collector so the AST is walked twice there
+    /// rather than once there and once on main. A prism error is one
+    /// `Ruby::SyntaxError` and the file takes no further part in the
+    /// run (see `ingest_file`).
+    payload: crema::ingest_cache::IngestPayload<'a>,
+    cache: IngestCacheOutcome,
+}
+
+/// The records to write back for the scope files `outcomes` lists in
+/// walk order: a hit's stored record (taken out of `stored`), a miss's
+/// freshly encoded one. A file with neither (uncacheable, or a stat
+/// that failed under the read) is left out and misses next run; only
+/// it pays for that. Stored records of files no longer in scope are
+/// never taken, so a deleted file drops out of the cache.
+fn ingest_cache_write_back<'p>(
+    outcomes: impl IntoIterator<Item = (&'p Path, IngestCacheOutcome)>,
+    stored: &mut FxHashMap<String, crema::ingest_cache::Record>,
+) -> Vec<crema::ingest_cache::Record> {
+    outcomes
+        .into_iter()
+        .filter_map(|(path, outcome)| match outcome {
+            IngestCacheOutcome::Hit => stored.remove(path.to_string_lossy().as_ref()),
+            IngestCacheOutcome::Miss(record) => record,
+            IngestCacheOutcome::Off => None,
+        })
+        .collect()
+}
+
+/// How the ingest cache saw one file.
+enum IngestCacheOutcome {
+    /// Served from the cache; its record is reused for the write-back.
+    Hit,
+    /// Parsed this run. `Some` carries the record to write back; `None`
+    /// when the run is not writing, the file could not be stat'ed, or
+    /// its payload could not be encoded (uncacheable).
+    Miss(Option<crema::ingest_cache::Record>),
+    /// Not a cache subject (the `-e` pseudo-file, or no cache active).
+    Off,
+}
+
+/// The ingest cache's inputs to every ingest task.
+#[derive(Clone, Copy)]
+struct IngestCacheInput<'a> {
+    /// Records read from the cache file, by canonical path. `None` when
+    /// this run looks nothing up (no diagnostic filter).
+    lookup: Option<&'a FxHashMap<String, crema::ingest_cache::Record>>,
+    /// Files in here are check targets and are always parsed.
+    filter: Option<&'a HashSet<PathBuf>>,
+    /// Encode a record for every parsed file, for the write-back.
+    write: bool,
+    /// `CREMA_DEBUG_SNAPSHOT_TIMING=1`: read hit files back and report
+    /// a content-hash mismatch on stderr.
+    verify: bool,
+    /// Walk indices at or past this are not scope files (`-e`).
+    scope_files: usize,
+}
+
+/// Hit / miss counts and the time the lookup itself took, summed over
+/// the workers that did it.
+#[derive(Default)]
+struct IngestCacheStats {
+    hits: usize,
+    misses: usize,
+    /// Parsed files whose payload could not be encoded (a `Name` other
+    /// than the file's own): never cached, re-parsed every run. Zero
+    /// unless a collector starts stamping foreign names; the debug line
+    /// is the only place a release build reports it.
+    uncacheable: usize,
+    stat_time: std::time::Duration,
+    decode_time: std::time::Duration,
+    verify_time: std::time::Duration,
+}
+
+impl IngestCacheStats {
+    fn add(&mut self, other: &IngestCacheStats) {
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.uncacheable += other.uncacheable;
+        self.stat_time += other.stat_time;
+        self.decode_time += other.decode_time;
+        self.verify_time += other.verify_time;
+    }
 }
 
 /// What the infusion collect half needs per file, shared read-only by
@@ -2951,11 +3678,29 @@ struct InfusionCollectOptions<'a> {
     inflector: &'a crema::infusion_collector::Inflector,
 }
 
+/// What every ingest task reads, indexed by walk index. `slots[i]` is
+/// filled by the task that reads file `i` (or up front for `-e`).
+#[derive(Clone, Copy)]
+struct IngestInput<'a, 'c> {
+    slots: &'a [std::sync::OnceLock<Arc<[u8]>>],
+    units: &'a [crema::inline_parser::SourceFile<'a>],
+    inline_mode: bool,
+    infusion: Option<InfusionCollectOptions<'a>>,
+    /// `None` when neither reading nor writing the ingest cache. Its
+    /// own lifetime: the records are borrowed only for the pool's
+    /// duration, while `'a` (the sources and ASTs) outlives the write-back
+    /// that consumes them.
+    cache: Option<IngestCacheInput<'c>>,
+}
+
 /// One pool thread's share of the ingest: the `NameTable` it collects
-/// against and the files it finished, tagged with their walk index.
+/// against, the files it finished and the files it could not read,
+/// each tagged with their walk index.
 struct IngestWorker<'a> {
     names: crema::name::NameTable,
     results: Vec<(usize, IngestedFile<'a>)>,
+    read_errors: Vec<(usize, std::io::Error)>,
+    cache_stats: IngestCacheStats,
 }
 
 impl Default for IngestWorker<'_> {
@@ -2963,30 +3708,145 @@ impl Default for IngestWorker<'_> {
         IngestWorker {
             names: crema::name::NameTable::new(),
             results: Vec::new(),
+            read_errors: Vec::new(),
+            cache_stats: IngestCacheStats::default(),
         }
     }
 }
 
-/// Run `ingest_file` over one batch on the calling thread's own
-/// [`IngestWorker`] slot — its pool index, or the trailing slot when
-/// the caller is main (not a pool thread).
+/// Read and `ingest_file` the files `batch` (walk indices) on the
+/// calling pool thread's own [`IngestWorker`] slot. A file that cannot
+/// be read is recorded rather than reported: which task fails first
+/// depends on scheduling, the report must not.
 fn run_ingest_batch<'a>(
     workers: &[std::sync::Mutex<IngestWorker<'a>>],
-    inline_mode: bool,
-    infusion: Option<InfusionCollectOptions<'a>>,
-    batch: Vec<(usize, &'a [u8], crema::inline_parser::SourceFile<'a>)>,
+    input: IngestInput<'a, '_>,
+    batch: std::ops::Range<usize>,
 ) {
-    let idx = rayon::current_thread_index().unwrap_or(workers.len() - 1);
+    let idx = rayon::current_thread_index().expect("ingest tasks run on pool threads");
     let mut worker = workers[idx].lock().expect("ingest worker slot poisoned");
-    for (i, source, unit) in batch {
-        let result = ingest_file(i, source, unit, &worker.names, inline_mode, infusion);
-        worker.results.push((i, result));
+    let IngestInput {
+        slots,
+        units,
+        inline_mode,
+        infusion,
+        cache,
+    } = input;
+    for i in batch {
+        let unit = units[i];
+        let cache = cache.filter(|c| i < c.scope_files);
+        // The stat is taken before the read so a write that lands
+        // between the two leaves a record the next run misses on,
+        // rather than a stale parse filed under the new mtime.
+        let stat = cache.and_then(|_| {
+            let t = std::time::Instant::now();
+            let stat = std::fs::metadata(unit.path)
+                .ok()
+                .map(|m| crema::ingest_cache::FileStat::of(&m));
+            worker.cache_stats.stat_time += t.elapsed();
+            stat
+        });
+        if let Some(c) = cache
+            && let Some(lookup) = c.lookup
+            && !c.filter.is_some_and(|f| f.contains(unit.path))
+            && let Some(record) = lookup.get(unit.path.to_string_lossy().as_ref())
+            && stat == Some(record.stat)
+        {
+            let t = std::time::Instant::now();
+            let decoded = crema::ingest_cache::decode_payload(record, &worker.names, unit.name);
+            worker.cache_stats.decode_time += t.elapsed();
+            if let Some(mut payload) = decoded {
+                if let crema::ingest_cache::IngestPayload::Parsed {
+                    infusion: Some(collected),
+                    ..
+                } = &mut payload
+                {
+                    collected.rebind(
+                        i,
+                        crema::source_ref::SourceRef::Lazy {
+                            slot: &slots[i],
+                            path: unit.path,
+                        },
+                        Some(unit.path),
+                    );
+                }
+                if c.verify {
+                    let t = std::time::Instant::now();
+                    if let Ok(bytes) = std::fs::read(unit.path)
+                        && xxhash_rust::xxh3::xxh3_64(&bytes) != record.content_hash
+                    {
+                        eprintln!(
+                            "ingest-cache: verify mismatch for {} (same mtime and size, different content)",
+                            unit.path.display()
+                        );
+                    }
+                    worker.cache_stats.verify_time += t.elapsed();
+                }
+                worker.cache_stats.hits += 1;
+                worker.results.push((
+                    i,
+                    IngestedFile {
+                        parsed: None,
+                        payload,
+                        cache: IngestCacheOutcome::Hit,
+                    },
+                ));
+                continue;
+            }
+        }
+        let source: &'a [u8] = match slots[i].get() {
+            Some(bytes) => bytes,
+            None => match std::fs::read(unit.path) {
+                Ok(bytes) => slots[i].get_or_init(|| Arc::from(bytes)),
+                Err(e) => {
+                    worker.read_errors.push((i, e));
+                    continue;
+                }
+            },
+        };
+        let (parsed, payload) = ingest_file(i, source, unit, &worker.names, inline_mode, infusion);
+        let cache = match cache {
+            Some(c) => {
+                worker.cache_stats.misses += 1;
+                let record = if c.write {
+                    stat.and_then(|stat| {
+                        let encoded =
+                            crema::ingest_cache::encode_payload(&worker.names, unit.name, &payload);
+                        if encoded.is_none() {
+                            worker.cache_stats.uncacheable += 1;
+                        }
+                        let encoded = encoded?;
+                        Some(crema::ingest_cache::Record {
+                            path: unit.path.to_string_lossy().into_owned(),
+                            stat,
+                            content_hash: xxhash_rust::xxh3::xxh3_64(source),
+                            self_name: encoded.self_name,
+                            strings: encoded.strings,
+                            payload: encoded.payload,
+                        })
+                    })
+                } else {
+                    None
+                };
+                IngestCacheOutcome::Miss(record)
+            }
+            None => IngestCacheOutcome::Off,
+        };
+        worker.results.push((
+            i,
+            IngestedFile {
+                parsed,
+                payload,
+                cache,
+            },
+        ));
     }
 }
 
-/// Parse one check target and run the inline collector — and, when an
-/// infusion is active, the infusion collector — on it, against the
-/// worker's own `names` (ADR-0033). Pure with respect to the draft.
+/// Parse one check target and run the inline collector (inline mode
+/// only) — and, when an infusion is active, the infusion collector — on
+/// it, against the worker's own `names` (ADR-0033). Pure with respect
+/// to the draft.
 /// `index` is the file's walk index; it is the `source_index` the
 /// infusion insert half resolves concern files through.
 fn ingest_file<'a>(
@@ -2996,7 +3856,10 @@ fn ingest_file<'a>(
     names: &crema::name::NameTable,
     inline_mode: bool,
     infusion: Option<InfusionCollectOptions<'a>>,
-) -> IngestedFile<'a> {
+) -> (
+    Option<(&'a [u8], SendParseResult<'a>)>,
+    crema::ingest_cache::IngestPayload<'a>,
+) {
     let parse_result = ruby_prism::parse(source);
 
     // Prism returns an AST even when the source is syntactically
@@ -3018,19 +3881,24 @@ fn ingest_file<'a>(
             offset,
             first_err.location().end_offset(),
         );
-        return IngestedFile::SyntaxError(crema::diagnostic::Diagnostic::at(
-            location,
-            DiagnosticKind::SyntaxError { message },
-        ));
+        return (
+            None,
+            crema::ingest_cache::IngestPayload::SyntaxError(crema::diagnostic::Diagnostic::at(
+                location,
+                DiagnosticKind::SyntaxError { message },
+            )),
+        );
     }
 
-    let (decls, diags) = crema::inline_parser::collect_inline_declarations(
-        source,
-        &parse_result,
-        Some(file),
-        names,
-        inline_mode,
-    );
+    // Sig mode reads declarations from `sig/` only (ADR-0027: the
+    // inline class), so the collector — and every diagnostic it would
+    // push — does not run. The checker still reads standard annotations
+    // (`expr #: T`, `foo #: [T]`) from comments on its own.
+    let (decls, diags) = if inline_mode {
+        crema::inline_parser::collect_inline_declarations(source, &parse_result, Some(file), names)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let infusion = infusion.map(|infusion| {
         crema::infusion_collector::collect_source(
             names,
@@ -3041,15 +3909,210 @@ fn ingest_file<'a>(
             &parse_result,
             infusion.options,
             infusion.inflector,
+            inline_mode,
         )
     });
-    IngestedFile::Parsed {
-        source,
-        ast: SendParseResult(parse_result),
-        decls,
-        diags,
-        infusion,
+    (
+        Some((source, SendParseResult(parse_result))),
+        crema::ingest_cache::IngestPayload::Parsed {
+            decls,
+            diags,
+            infusion,
+        },
+    )
+}
+
+/// One file's share of the check phase. Built on main in walk order,
+/// run on whichever pool thread picks it up.
+struct CheckJob<'a> {
+    file: &'a Path,
+    source: &'a [u8],
+    /// The job owns the AST and frees it as soon as the file's check
+    /// is over.
+    ast: SendParseResult<'a>,
+}
+
+/// One `crema extract` file: what the check job needs, plus the AST it
+/// owns and frees (same ownership as `CheckJob`).
+struct ExtractJob<'a> {
+    file: &'a Path,
+    source: &'a [u8],
+    ast: SendParseResult<'a>,
+}
+
+/// What an extract job hands back to main: the file's records, ready
+/// to drop into its `FileRecord`. Nothing here touched shared state.
+struct ExtractOutcome<'a> {
+    file: &'a Path,
+    method_call: Vec<crema::extract::MethodCallRecord>,
+    implements: Vec<crema::extract::ImplementsRecord>,
+    constant: Vec<crema::extract::ConstantRecord>,
+    consulted: Vec<String>,
+}
+
+/// Runs the site-collecting check on one file with consultation
+/// recording on. The log is per file and lives inside the job, so
+/// nothing is shared across threads but `env`.
+fn run_extract_job<'a>(env: &DefinitionBuilder, job: ExtractJob<'a>) -> ExtractOutcome<'a> {
+    let ExtractJob { file, source, ast } = job;
+    let log = crema::definition_builder::ConsultationLog::new();
+    let (method_call, implements, constant, signature_types) =
+        crema::type_checker::check_source_extract(
+            env,
+            file.to_path_buf(),
+            source,
+            &ast.0,
+            Some(&log),
+        );
+    // Freed here, on the thread that read it.
+    drop(ast);
+    let consulted = crema::extract::consulted_symbols(
+        &log.into_entries(),
+        &signature_types,
+        &constant,
+        env.env().names(),
+    );
+    ExtractOutcome {
+        file,
+        method_call,
+        implements,
+        constant,
+        consulted,
     }
+}
+
+/// What every check job reads.
+#[derive(Clone, Copy)]
+struct CheckContext<'a> {
+    env: &'a DefinitionBuilder,
+    renderer: &'a DiagnosticRenderer,
+    did_you_mean: bool,
+}
+
+/// What a check job hands back to main. Nothing here has touched the
+/// run's ordered state (baseline counts, exit flag, the output): main
+/// applies it in walk order.
+struct CheckOutcome {
+    rendered: Vec<RenderedDiagnostic>,
+    d_join: std::time::Duration,
+    d_render: std::time::Duration,
+}
+
+/// Check one file and render its diagnostics.
+fn run_check_job(context: CheckContext<'_>, job: CheckJob<'_>) -> CheckOutcome {
+    let CheckJob { file, source, ast } = job;
+    let mut diagnostics = check_source(context.env, file.to_path_buf(), source, &ast.0);
+    // Freed here, on the thread that checked it, rather than kept
+    // until every file is done.
+    drop(ast);
+    // ADR-0032 Decision 5a: check only records the fact that a
+    // constant failed to resolve (name + candidate scope);
+    // `did_you_mean` is a computed column joined against the
+    // env in scope here, right before rendering.
+    let t_join = std::time::Instant::now();
+    if context.did_you_mean {
+        join_did_you_mean(context.env, &mut diagnostics);
+    }
+    let d_join = t_join.elapsed();
+    let t_render = std::time::Instant::now();
+    let rendered = diagnostics
+        .iter()
+        .filter_map(|diag| context.renderer.render(diag))
+        .collect();
+    CheckOutcome {
+        rendered,
+        d_join,
+        d_render: t_render.elapsed(),
+    }
+}
+
+/// Run `work` on every job on the rayon pool and hand the results to
+/// `commit` on the calling thread, one at a time, in job order.
+///
+/// Jobs are queued first-in first-out, and while the next result in
+/// order is not in yet the caller runs queued jobs itself. In a
+/// one-thread pool the caller is the only thread (ADR-0035), so the
+/// run alternates "work i, commit i" like a serial loop; in a larger
+/// pool the finished prefix is committed while later jobs still run.
+///
+/// A panic in `work` or `commit` propagates out of this call, with the
+/// outcome a serial loop would leave behind: when job `i` panics, every
+/// result before `i` is committed and nothing from `i` on is; jobs
+/// after `i` that have not started are skipped. When `commit` panics,
+/// every job that has not started is skipped.
+fn run_in_walk_order<J: Send, R: Send>(
+    jobs: Vec<J>,
+    work: impl Fn(J) -> R + Sync,
+    mut commit: impl FnMut(R),
+) {
+    /// Lowers `first_panic` to `index` when a panic unwinds through
+    /// the scope holding it.
+    struct RecordPanic<'a> {
+        first_panic: &'a AtomicUsize,
+        index: usize,
+    }
+    impl Drop for RecordPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.first_panic.fetch_min(self.index, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let total = jobs.len();
+    // The lowest index of a job that panicked; jobs after it are not
+    // worth running.
+    let first_panic = AtomicUsize::new(usize::MAX);
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, R)>();
+    rayon::in_place_scope_fifo(|scope| {
+        let (work, first_panic) = (&work, &first_panic);
+        // A panic in `commit` below: no job is worth running any more.
+        let _record = RecordPanic {
+            first_panic,
+            index: 0,
+        };
+        for (index, job) in jobs.into_iter().enumerate() {
+            let tx = tx.clone();
+            scope.spawn_fifo(move |_| {
+                if index > first_panic.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _record = RecordPanic { first_panic, index };
+                // The receiver outlives the scope, so the send cannot fail.
+                let _ = tx.send((index, work(job)));
+            });
+        }
+        // From here on only the jobs hold a sender: when the last one is
+        // gone, a `recv` for a result that never came fails instead of
+        // blocking.
+        drop(tx);
+        let mut arrived: Vec<Option<R>> = (0..total).map(|_| None).collect();
+        let mut next = 0;
+        while next < total {
+            for (index, result) in rx.try_iter() {
+                arrived[index] = Some(result);
+            }
+            while let Some(result) = arrived.get_mut(next).and_then(Option::take) {
+                commit(result);
+                next += 1;
+            }
+            if next == total {
+                break;
+            }
+            // Waiting alone would stall a one-thread pool: run a queued
+            // job here. Only when none is left to run (the remaining ones
+            // are on other threads) block until the next result arrives.
+            if matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                continue;
+            }
+            match rx.recv() {
+                Ok((index, result)) => arrived[index] = Some(result),
+                // Every job is over and a result is missing: a job
+                // panicked. The scope re-raises that panic on the way out.
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// The per-file phase of `crema extract` (invoked from `run_check`
@@ -3061,23 +4124,21 @@ fn ingest_file<'a>(
 /// In `-e` mode (`eval_active`) the document is narrowed to the `-e`
 /// pseudo-file.
 ///
-/// Every file is checked fresh — the incremental cache is neither read
-/// nor narrowed here. Extract is opt-in and allowed to be slower than
-/// `crema check`; recording costs exist only on this path.
+/// Extract is opt-in and allowed to be slower than `crema check`;
+/// recording costs exist only on this path.
 fn run_extract(
     env: &DefinitionBuilder,
     sources: &[(PathBuf, Arc<[u8]>)],
-    parsed_sources: &[ParsedSource<'_>],
-    resolved: &crema::config::ResolvedConfig,
+    parsed_sources: &mut [ParsedSource<'_>],
     project_root: &Path,
     eval_active: bool,
+    timing: bool,
 ) {
-    // Same cwd-relative display rule as the diagnostic emitter; `root`
-    // records the base so the document stays
+    let t_extract = std::time::Instant::now();
+    // Same crema.toml-dir-relative display rule as the diagnostic
+    // emitter; `root` records the base so the document stays
     // self-describing wherever it is consumed.
-    let display_base = std::env::current_dir()
-        .ok()
-        .and_then(|d| d.canonicalize().ok());
+    let display_base = output_display_base(project_root);
     let display = |path: &Path| -> String {
         display_base
             .as_deref()
@@ -3105,41 +4166,65 @@ fn run_extract(
         if eval_active && file != eval_file {
             continue;
         }
-        let mut record = crema::extract::FileRecord {
-            content_hash: format!("{:016x}", crema::incremental::content_hash(bytes)),
-            ..Default::default()
-        };
-        if let Some(parsed) = parsed_sources.iter().find(|p| p.file == file) {
-            let log = crema::definition_builder::ConsultationLog::new();
-            let (method_call, implements, constant, signature_types) =
-                crema::type_checker::check_source_extract(
-                    env,
-                    parsed.file.to_path_buf(),
-                    parsed.source,
-                    parsed.ast(),
-                    CheckOptions {
-                        verbose: false,
-                        inline: resolved.inline,
-                    },
-                    Some(&log),
-                );
-            record.method_call = method_call;
-            record.implements = implements;
-            record.consulted = crema::extract::consulted_symbols(
-                &log.into_entries(),
-                &signature_types,
-                &constant,
-                env.env().names(),
-            );
-            record.constant = constant;
-        }
-        files.insert(display(file), record);
+        files.insert(
+            display(file),
+            crema::extract::FileRecord {
+                content_hash: format!("{:016x}", crema::extract::content_hash(bytes)),
+                ..Default::default()
+            },
+        );
     }
+
+    // Check pass: one job per parsed file on the pool, the same shape
+    // as `crema check`'s Layer 3 (ADR-0034 Decision 4). Each job owns
+    // its AST and frees it once its records are collected; the
+    // definitions pass below reads source bytes only. Main folds the
+    // outcomes into `files` in walk order — the map is keyed by path,
+    // so the document would come out the same in any order, but walk
+    // order keeps the fold's cost profile identical to a serial loop.
+    let mut jobs = Vec::new();
+    for parsed in parsed_sources.iter_mut() {
+        if eval_active && parsed.file != eval_file {
+            continue;
+        }
+        jobs.push(ExtractJob {
+            file: parsed.file,
+            source: parsed.source.bytes(),
+            ast: SendParseResult(
+                parsed
+                    .parse_result
+                    .take()
+                    .expect("extract keeps every AST until its check job"),
+            ),
+        });
+    }
+    run_in_walk_order(
+        jobs,
+        |job| run_extract_job(env, job),
+        |outcome| {
+            // Every parsed file is a scope file, so its entry was made
+            // above; a miss would mean `parsed_sources` outgrew
+            // `sources`, and a hash-less entry is the loud form of it.
+            let record = files.entry(display(outcome.file)).or_default();
+            record.method_call = outcome.method_call;
+            record.implements = outcome.implements;
+            record.consulted = outcome.consulted;
+            record.constant = outcome.constant;
+        },
+    );
+    let d_check = t_extract.elapsed();
 
     // Definitions pass: every file that contributed declarations
     // (`path_index` = A-layer only, so gem/core files never appear).
     // Check targets reuse their in-memory bytes; sig files are read
     // back from disk for hash computation.
+    // Path -> in-memory bytes, built once: a linear scan per index
+    // entry would be quadratic in the scope size (12,040 files on
+    // gitlab cost ~9s that way).
+    let source_by_path: FxHashMap<&Path, &[u8]> = sources
+        .iter()
+        .map(|(file, bytes)| (file.as_path(), &bytes[..]))
+        .collect();
     let names = env.env().names();
     for file_name in env.env().path_index_files() {
         let path_string = names.resolve(file_name);
@@ -3147,16 +4232,15 @@ fn run_extract(
         if eval_active && path != eval_file {
             continue;
         }
-        let source: std::borrow::Cow<'_, [u8]> =
-            match parsed_sources.iter().find(|p| p.file == path) {
-                Some(parsed) => std::borrow::Cow::Borrowed(parsed.source),
-                None => match std::fs::read(path) {
-                    Ok(bytes) => std::borrow::Cow::Owned(bytes),
-                    // Unreadable index entries (file-less test sources,
-                    // files deleted mid-run) contribute no definitions.
-                    Err(_) => continue,
-                },
-            };
+        let source: std::borrow::Cow<'_, [u8]> = match source_by_path.get(path) {
+            Some(bytes) => std::borrow::Cow::Borrowed(bytes),
+            None => match std::fs::read(path) {
+                Ok(bytes) => std::borrow::Cow::Owned(bytes),
+                // Unreadable index entries (file-less test sources,
+                // files deleted mid-run) contribute no definitions.
+                Err(_) => continue,
+            },
+        };
         let definitions = crema::extract::file_definitions(env, file_name);
         if definitions.is_empty() {
             continue;
@@ -3164,11 +4248,12 @@ fn run_extract(
         let entry = files
             .entry(display(path))
             .or_insert_with(|| crema::extract::FileRecord {
-                content_hash: format!("{:016x}", crema::incremental::content_hash(&source)),
+                content_hash: format!("{:016x}", crema::extract::content_hash(&source)),
                 ..Default::default()
             });
         entry.definitions = definitions;
     }
+    let d_definitions = t_extract.elapsed() - d_check;
 
     let root = display_base
         .as_deref()
@@ -3180,7 +4265,9 @@ fn run_extract(
         root,
         files,
     };
+    let t_serialize = std::time::Instant::now();
     let bytes = serde_json::to_vec(&output).expect("extract document serialize is infallible");
+    let d_serialize = t_serialize.elapsed();
     // stdout carries the document itself and nothing else (no summary
     // line), in every mode: nothing is persisted, and a zero-config
     // `-e` run never creates `.crema/`. A consumer closing the pipe
@@ -3191,6 +4278,18 @@ fn run_extract(
     {
         eprintln!("error: failed to write extract document: {err}");
         process::exit(2);
+    }
+    if timing {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        eprintln!(
+            "extract-timing: total {:.1}ms check {:.1}ms definitions {:.1}ms serialize {:.1}ms write {:.1}ms ({} bytes)",
+            ms(t_extract.elapsed()),
+            ms(d_check),
+            ms(d_definitions),
+            ms(d_serialize),
+            ms(t_extract.elapsed() - d_check - d_definitions - d_serialize),
+            bytes.len(),
+        );
     }
 }
 
@@ -3274,12 +4373,13 @@ fn main() {
             script,
             sig_dirs,
             add_sig_dirs,
-            verbose,
             inline,
             collection,
             no_g_snapshot,
             refresh_g_snapshot,
             tamp,
+            update_baseline,
+            no_baseline,
             threads,
         } => run_check(
             cli_config.as_deref(),
@@ -3290,12 +4390,13 @@ fn main() {
                 script,
                 sig_dirs,
                 add_sig_dirs,
-                verbose,
                 inline,
                 collection,
                 no_g_snapshot,
                 refresh_g_snapshot,
                 tamp,
+                update_baseline,
+                no_baseline,
                 threads,
             },
             RunMode::Check,
@@ -3309,12 +4410,13 @@ fn main() {
                 script: None,
                 sig_dirs: Vec::new(),
                 add_sig_dirs: Vec::new(),
-                verbose: false,
                 inline: None,
                 collection: None,
                 no_g_snapshot: false,
                 refresh_g_snapshot: false,
                 tamp: false,
+                update_baseline: false,
+                no_baseline: false,
                 threads,
             },
             RunMode::Extract,

@@ -19,8 +19,8 @@
 //! follows ADR-0024:
 //!   - cache key is structural (value-based identity), so the same
 //!     expression at condition site and body site shares an entry
-//!   - invalidation walks the key's syntax tree looking for an lvar
-//!     read of the assigned name; the assigned value is irrelevant
+//!   - invalidation drops keys whose chain is rooted at an lvar read of
+//!     the assigned name; the assigned value is irrelevant
 //!   - branch confluence keeps only keys present in BOTH arms, with
 //!     types unioned via [`crate::types::union_of`]
 //!
@@ -29,6 +29,8 @@
 //!     method sends with no arguments and no block. Instance variables are
 //!     deliberately absent — they need separate invalidation rules and
 //!     belong to a follow-up todo (`mid_pure_narrowing_extension`).
+
+use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
@@ -43,14 +45,17 @@ use crate::types::{Ty, union_of};
 /// `c.phone` written in a condition position equals the same `c.phone`
 /// written inside the if body, so the narrowed type propagates.
 ///
-/// The recursive `Send` variant naturally encodes chains: `a.b.c` is
-/// `Send(Send(Lvar(a), b), c)`. There is no depth bound at this layer.
+/// Keys are hash-consed in a [`PureKeyTable`]: the table hands out one
+/// id per distinct shape ([`PureNode`]), so equality and hashing compare
+/// the id and copying a key copies two words, however deep the chain.
+/// Chains are encoded through the parent's key: `a.b.c` is
+/// `Send(key of a.b, c)`. There is no depth bound at this layer.
 /// Constant singleton receivers use the resolved absolute type name, so
-/// `RBS.logger_output` is `Send(ConstPath(::RBS), logger_output)`.
+/// `RBS.logger_output` is `Send(key of ConstPath(::RBS), logger_output)`.
 ///
-/// `Lvar(Name)` uses the lvar interner; `Send`'s method-name slot uses
-/// the `Symbol` interner — these are different namespaces in crema even
-/// though both wrap the same backing `Spur` (see `src/name.rs`).
+/// `root` is the chain's base, recorded at intern time, so lvar and
+/// constant invalidation read it off the key without the table. It is a
+/// function of the shape, hence of `id`, and stays out of `Eq` / `Hash`.
 ///
 /// `SelfRef` is the normalized base for self-rooted calls. Both implicit
 /// self (`(send nil :path)`) and explicit `self.path` (`(send (self) :path)`)
@@ -58,39 +63,112 @@ use crate::types::{Ty, union_of};
 /// entry. Steep keys on raw AST nodes and keeps them separate; crema's
 /// `PureKey` is a normalized structural form, so folding self into one
 /// base is consistent with this layer (ADR-0024).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum PureKey {
+#[derive(Debug, Clone, Copy)]
+pub struct PureKey {
+    id: u32,
+    root: PureRoot,
+}
+
+impl PartialEq for PureKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for PureKey {}
+
+impl std::hash::Hash for PureKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+/// The base a [`PureKey`]'s chain starts from, as far as invalidation
+/// needs to know it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PureRoot {
+    Lvar(Name),
+    SelfRef,
+    ConstPath,
+}
+
+/// One link of a pure expression: a base, or a send on an already
+/// interned receiver key.
+///
+/// `Lvar(Name)` uses the lvar interner; `Send`'s method-name slot uses
+/// the `Symbol` interner — these are different namespaces in crema even
+/// though both wrap the same backing `Spur` (see `src/name.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PureNode {
     Lvar(Name),
     SelfRef,
     ConstPath(TypeName),
-    Send(Box<PureKey>, Symbol),
+    Send(PureKey, Symbol),
     /// Safe-navigation call (`recv&.m`). Kept distinct from `Send` because
     /// the csend value is nil-widened; Steep separates them for free by
     /// keying on the AST node (`(send ...)` vs `(csend ...)`).
-    CSend(Box<PureKey>, Symbol),
+    CSend(PureKey, Symbol),
+}
+
+/// Hash-consing table for [`PureKey`]. One per checker (one file against
+/// one env): keys only live in that checker's pure-call cache, narrows
+/// and overlays, so ids never cross files or threads. Interning takes
+/// `&self` because key construction runs on the read-only inference path.
+#[derive(Debug, Default)]
+pub struct PureKeyTable {
+    inner: RefCell<PureKeyTableInner>,
+}
+
+#[derive(Debug, Default)]
+struct PureKeyTableInner {
+    ids: FxHashMap<PureNode, PureKey>,
+    nodes: Vec<PureNode>,
+}
+
+impl PureKeyTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The key of `node`, the same key every time for the same node.
+    pub fn intern(&self, node: PureNode) -> PureKey {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(&key) = inner.ids.get(&node) {
+            return key;
+        }
+        let root = match node {
+            PureNode::Lvar(name) => PureRoot::Lvar(name),
+            PureNode::SelfRef => PureRoot::SelfRef,
+            PureNode::ConstPath(_) => PureRoot::ConstPath,
+            PureNode::Send(recv, _) | PureNode::CSend(recv, _) => recv.root,
+        };
+        let id = u32::try_from(inner.nodes.len()).expect("pure key table overflow");
+        let key = PureKey { id, root };
+        inner.nodes.push(node);
+        inner.ids.insert(node, key);
+        key
+    }
+
+    /// The node `key` was interned from.
+    pub fn node(&self, key: PureKey) -> PureNode {
+        self.inner.borrow().nodes[key.id as usize]
+    }
 }
 
 impl PureKey {
-    /// True iff this key's syntax tree contains a `Lvar(name)` somewhere.
-    /// Used by [`PureCallEnv::invalidate_by_lvar`] to find entries whose
-    /// receiver chain references the reassigned variable. `SelfRef` never
+    /// True iff this key's chain is rooted at `Lvar(name)` — the only
+    /// place an lvar can appear in a key. Used by
+    /// [`PureCallEnv::invalidate_by_lvar`] to find entries whose receiver
+    /// chain references the reassigned variable. `SelfRef` never
     /// references an lvar, so a self-rooted entry is never dropped by lvar
     /// reassignment (self is invariant within a method body; block-entry
     /// self change is out of Phase 1 scope).
     pub fn contains_lvar(&self, name: Name) -> bool {
-        match self {
-            PureKey::Lvar(n) => *n == name,
-            PureKey::SelfRef | PureKey::ConstPath(_) => false,
-            PureKey::Send(recv, _) | PureKey::CSend(recv, _) => recv.contains_lvar(name),
-        }
+        self.root == PureRoot::Lvar(name)
     }
 
     pub fn contains_const_path(&self) -> bool {
-        match self {
-            PureKey::ConstPath(_) => true,
-            PureKey::Lvar(_) | PureKey::SelfRef => false,
-            PureKey::Send(recv, _) | PureKey::CSend(recv, _) => recv.contains_const_path(),
-        }
+        self.root == PureRoot::ConstPath
     }
 }
 
@@ -160,7 +238,7 @@ impl PureCallEnv {
         let mut joined = FxHashMap::default();
         for (key, lhs_ty) in &self.entries {
             if let Some(&rhs_ty) = other.entries.get(key) {
-                joined.insert(key.clone(), union_of(*lhs_ty, rhs_ty, env.types()));
+                joined.insert(*key, union_of(*lhs_ty, rhs_ty, env.types()));
             }
         }
         Self { entries: joined }

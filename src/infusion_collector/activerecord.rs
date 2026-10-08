@@ -23,7 +23,7 @@ use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::environment::draft::EnvironmentDraft;
 use crate::infusion_collector::inflector::Inflector;
 use crate::infusion_collector::pipeline::{
-    EnumLiteral, InfusionCall, InfusionScopeParams, SourceUnit, push_def,
+    EnumLiteral, InfusionCall, InfusionScopeParams, push_def,
 };
 use crate::inline_parser::{prism_location_range, push_class_abs_path};
 use crate::name::NameTable;
@@ -32,7 +32,7 @@ use crate::type_name::TypeName;
 const PROVIDER: &str = "activerecord";
 
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActiveRecordAssociation {
     pub(crate) owner: TypeName,
     pub(crate) kind: ActiveRecordAssociationKind,
@@ -41,13 +41,13 @@ pub(crate) struct ActiveRecordAssociation {
     pub(crate) polymorphic: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ActiveRecordAssociationTargetName {
     Absolute(TypeName),
     Relative(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ActiveRecordAssociationKind {
     BelongsTo,
     HasOne,
@@ -58,7 +58,7 @@ pub(crate) enum ActiveRecordAssociationKind {
 /// synthesis pass so `<Model>::GeneratedRelationMethods` mirrors the scope
 /// with the same typed signature as the model's singleton def (orthoses
 /// scope.rb writes the identical definition string on both sides).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActiveRecordScope {
     pub(crate) owner: TypeName,
     pub(crate) name: String,
@@ -114,7 +114,7 @@ pub(crate) fn enum_scopes_from_call(
 /// The `def self.<names>` enum mapping, carried to AR synthesis so
 /// `GeneratedRelationMethods` mirrors it typed (the untyped sweep only
 /// collects `TypeAnnotations::None` defs and no longer sees it).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActiveRecordEnumMapping {
     pub(crate) owner: TypeName,
     /// Pluralized mapping-method name (`statuses` for `enum :status`).
@@ -127,7 +127,7 @@ pub(crate) struct ActiveRecordEnumMapping {
 
 /// The mapping's value-type verdict, computed at collection where the
 /// literals live (synthesis only converts it to a `Type`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum EnumMappingValue {
     Integer,
     String,
@@ -286,57 +286,61 @@ fn schema_paths(project_root: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// `self.table_name = "..."` declarations collected from model class bodies,
-/// keyed by table name. Values are absolute model paths (`::Admin::User`) in
-/// source order — several models may legally share one table in Rails, and
-/// each of them gets the table's columns.
+/// `self.table_name = "..."` / `= :...` declarations collected from model
+/// class bodies, keyed by table name. Values are absolute model paths
+/// (`::Admin::User`) in source order — several models may legally share
+/// one table in Rails, and each of them gets the table's columns.
 #[derive(Default)]
 pub struct TableNameOverrides {
     by_table: FxHashMap<String, Vec<String>>,
 }
 
-/// Model-file facts the schema pass needs before it runs, gathered by
-/// [`collect_table_name_overrides`]'s walk: the table-name overrides.
-/// Enum names are NOT collected here — a concern's `included do enum ...`
-/// only surfaces after concern expansion, so the same-named-column
-/// suppression set is built from the post-expansion
-/// [`ActiveRecordEnumMapping`]s instead (see [`emit_schema`]).
-#[derive(Default)]
-pub struct ArModelPrepass {
-    pub(crate) table_names: TableNameOverrides,
+/// Scan one parsed Ruby file for `self.table_name = <string or symbol
+/// literal>` in class bodies (Rails' `table_name=` does `value.to_s`, so a
+/// symbol names its table just as a string does), returning
+/// `(absolute model path, table)` in source order. Runs per file inside
+/// the infusion collect (on the ingest worker), so the main thread needs
+/// no AST for it. Only statements directly in a class body count — a
+/// `table_name=` inside a method or a conditional only takes effect at
+/// runtime, which is outside the deterministic-input boundary infusion
+/// stays within. A non-literal value (an interpolated string or symbol,
+/// any other expression) is reported as `InfusionProviderSkipped` instead
+/// of guessed at.
+pub(crate) fn collect_table_name_assignments(
+    root: &Node<'_>,
+    file: Option<&Path>,
+    source: &[u8],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<(String, String)> {
+    let mut assignments = Vec::new();
+    let mut stack = Vec::new();
+    collect_overrides_in_body(
+        root,
+        &mut stack,
+        false,
+        file,
+        source,
+        &mut assignments,
+        diagnostics,
+    );
+    assignments
 }
 
-/// Pre-pass over the parsed Ruby sources, run inside [`prepare_schema`]:
-/// collect `self.table_name = <string literal>` from class bodies. Only
-/// statements directly in a class body count — a `table_name=` inside a
-/// method or a conditional only takes effect at runtime, which is outside
-/// the deterministic-input boundary infusion stays within. A non-literal
-/// value is reported as `InfusionProviderSkipped` instead of guessed at.
-pub fn collect_table_name_overrides(sources: &[SourceUnit]) -> (ArModelPrepass, Vec<Diagnostic>) {
-    let mut assignments: Vec<(String, String)> = Vec::new();
-    let mut diagnostics = Vec::new();
-    for unit in sources {
-        let mut stack = Vec::new();
-        collect_overrides_in_body(
-            &unit.parse_result.node(),
-            &mut stack,
-            false,
-            unit.file,
-            unit.source,
-            &mut assignments,
-            &mut diagnostics,
-        );
-    }
+/// Build the overrides from every file's assignments, chained in walk
+/// order (the order the files run at load time).
+pub(crate) fn table_name_overrides<'a>(
+    assignments: impl Iterator<Item = &'a (String, String)> + Clone,
+) -> TableNameOverrides {
     // Ruby reassignment semantics: only a model's last `table_name =` is in
     // effect at runtime, so earlier assignments must not also claim their
     // tables. Resolve last-write-wins per model first, then group by table
     // in assignment order to keep declaration order deterministic.
     let mut final_table: FxHashMap<&str, &str> = FxHashMap::default();
-    for (model, table) in &assignments {
+    for (model, table) in assignments.clone() {
         final_table.insert(model, table);
     }
     let mut overrides = TableNameOverrides::default();
-    for (model, table) in &assignments {
+    for (model, table) in assignments {
         if final_table.get(model.as_str()) != Some(&table.as_str()) {
             continue;
         }
@@ -345,12 +349,7 @@ pub fn collect_table_name_overrides(sources: &[SourceUnit]) -> (ArModelPrepass, 
             models.push(model.clone());
         }
     }
-    (
-        ArModelPrepass {
-            table_names: overrides,
-        },
-        diagnostics,
-    )
+    overrides
 }
 
 fn collect_overrides_in_body(
@@ -417,7 +416,7 @@ fn collect_overrides_in_body(
             let Some(model) = stack.last() else {
                 continue;
             };
-            match first_string_arg(&call) {
+            match string_or_symbol_arg(&call, 0) {
                 Some(table) => {
                     assignments.push((model.clone(), table));
                 }
@@ -428,7 +427,8 @@ fn collect_overrides_in_body(
                         kind: DiagnosticKind::InfusionProviderSkipped {
                             provider: PROVIDER.to_string(),
                             subject: format!("{}.table_name", model),
-                            reason: "table_name assignment is not a string literal".to_string(),
+                            reason: "table_name assignment is not a string or symbol literal"
+                                .to_string(),
                         },
                         location: Diagnostic::location_for_byte_range(
                             file.map(|p| p.to_path_buf()).unwrap_or_default(),
@@ -456,18 +456,15 @@ pub struct ParsedSchemaFile {
 /// from the Ruby sources, but the enum suppression set that emission
 /// consumes only exists post-expansion.
 pub struct PreparsedSchema {
-    pub(crate) prepass: ArModelPrepass,
     pub(crate) files: Vec<ParsedSchemaFile>,
 }
 
-/// Parse the schema dumps and the model-file prepass facts. Runs before
-/// `load_all`; the result is handed to `load_all_with_schema`, which emits
-/// the declarations once the post-expansion enum set is known.
-pub fn prepare_schema(
-    project_root: &Path,
-    sources: &[SourceUnit],
-) -> (PreparsedSchema, Vec<Diagnostic>) {
-    let (prepass, mut diagnostics) = collect_table_name_overrides(sources);
+/// Parse the schema dumps. Runs before `load_all`; the result is handed
+/// to `load_all_with_schema`, which emits the declarations once the
+/// post-expansion enum set and every file's `table_name` overrides are
+/// known.
+pub fn prepare_schema(project_root: &Path) -> (PreparsedSchema, Vec<Diagnostic>) {
+    let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     let mut seen_tables = FxHashSet::default();
     for schema_path in schema_paths(project_root) {
@@ -480,7 +477,7 @@ pub fn prepare_schema(
             files.push(file);
         }
     }
-    (PreparsedSchema { prepass, files }, diagnostics)
+    (PreparsedSchema { files }, diagnostics)
 }
 
 /// Synthesize and insert the schema-derived declarations. `enums_by_attr`
@@ -493,6 +490,7 @@ pub fn prepare_schema(
 /// column.
 pub(crate) fn emit_schema(
     schema: &PreparsedSchema,
+    table_names: &TableNameOverrides,
     draft: &mut EnvironmentDraft,
     inflector: &Inflector,
     enums_by_attr: &FxHashMap<TypeName, FxHashSet<String>>,
@@ -505,12 +503,17 @@ pub(crate) fn emit_schema(
             &file.source,
             &file.tables,
             inflector,
-            &schema.prepass,
+            table_names,
             enums_by_attr,
             diagnostics,
         );
         for declaration in &declarations {
-            draft.insert_ruby_decl(declaration, &file.source, Some(&file.path), diagnostics);
+            draft.insert_ruby_decl(
+                declaration,
+                file.source.as_slice().into(),
+                Some(&file.path),
+                diagnostics,
+            );
         }
     }
 }
@@ -707,7 +710,7 @@ fn schema_declarations(
     source: &[u8],
     tables: &[SchemaTable],
     inflector: &Inflector,
-    prepass: &ArModelPrepass,
+    table_names: &TableNameOverrides,
     enums_by_attr: &FxHashMap<TypeName, FxHashSet<String>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Declaration> {
@@ -717,7 +720,7 @@ fn schema_declarations(
         // to the declaring model(s) and the inflection-derived class (which
         // no real model backs) is not synthesized at all.
         let model_absolutes: Vec<String> =
-            if let Some(models) = prepass.table_names.by_table.get(&table.name) {
+            if let Some(models) = table_names.by_table.get(&table.name) {
                 models.clone()
             } else if let Some(model_name) = model_name_for_table(&table.name, inflector) {
                 vec![format!("::{}", model_name)]

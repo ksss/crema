@@ -59,7 +59,7 @@ pub enum DuplicateSource {
 /// where crema still needs this interned-file + byte-range shape, such as
 /// ast/ruby nodes, source registration, and inline Ruby diagnostic plumbing.
 /// The rbs Rust port path (`ast/`) uses file-less [`LocationRange`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RubyLocation {
     pub file: Name,
     pub start_byte: u32,
@@ -78,7 +78,7 @@ pub struct RubyLocation {
 /// ^^^           name
 ///    ^^^^^^^^^^ args
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AliasLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -93,7 +93,7 @@ pub struct AliasLocation {
 /// ^^^           name
 ///    ^^^^^^^^^^ args
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClassInstanceLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -104,7 +104,7 @@ pub struct ClassInstanceLocation {
 /// singleton(::Foo)
 ///           ^^^^^  name
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClassSingletonLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -119,7 +119,7 @@ pub struct ClassSingletonLocation {
 /// ^^^^           name
 ///     ^^^^^^^^^^ args
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -130,7 +130,7 @@ pub struct InterfaceLocation {
 /// String name
 ///        ^^^^ name
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FunctionParamLocation {
     pub range: LocationRange,
     pub name_range: Option<LocationRange>,
@@ -144,7 +144,7 @@ pub struct FunctionParamLocation {
 /// ^^^                      type_params
 ///     ^^^^^^^^^^^^^^^^^^^  type
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MethodTypeLocation {
     pub range: LocationRange,
     pub type_range: LocationRange,
@@ -163,7 +163,7 @@ pub struct MethodTypeLocation {
 ///                              ^^^^^               lower_bound
 ///                                      ^^^^^^^^    default
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TypeParamLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -182,7 +182,7 @@ pub struct TypeParamLocation {
 /// ^^^^^         name
 ///      ^^^^^^^^ args
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClassSuperLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -202,7 +202,7 @@ pub struct ClassSuperLocation {
 ///              ^            lt
 ///                       ^^^ end
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClassDeclarationLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -217,7 +217,7 @@ pub struct ClassDeclarationLocation {
 /// ^^^^^         name
 ///      ^^^^^^^^ args
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ModuleSelfLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -238,7 +238,7 @@ pub struct ModuleSelfLocation {
 ///                 ^^^^^^^^^^^     self_types
 ///                             ^^^ end
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ModuleDeclarationLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -261,7 +261,7 @@ pub struct ModuleDeclarationLocation {
 ///               ^^^^^^     type_params
 ///                      ^^^ end
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct InterfaceDeclarationLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -277,7 +277,7 @@ pub struct InterfaceDeclarationLocation {
 ///         ^^^                     type_params
 ///             ^                   eq
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TypeAliasDeclarationLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -291,7 +291,7 @@ pub struct TypeAliasDeclarationLocation {
 /// ^^^^^^^         name
 ///        ^        colon
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ConstantDeclarationLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -303,7 +303,7 @@ pub struct ConstantDeclarationLocation {
 /// ^^^^^         name
 ///      ^        colon
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GlobalDeclarationLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -320,7 +320,7 @@ pub struct GlobalDeclarationLocation {
 /// class Foo = Bar
 /// ^^^^^              keyword
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AliasDeclarationLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -341,7 +341,7 @@ pub struct AliasDeclarationLocation {
 ///                  ^^^                     name
 ///                                    ^^^   overloading
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MethodDefinitionLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -361,7 +361,7 @@ pub struct MethodDefinitionLocation {
 ///      ^^^^                    name
 ///          ^                   colon
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VariableMemberLocation {
     pub range: LocationRange,
     pub name_range: LocationRange,
@@ -379,7 +379,7 @@ pub struct VariableMemberLocation {
 ///         ^^^^^          name
 ///              ^^^^^^^^  args
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MixinMemberLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -402,7 +402,7 @@ pub struct MixinMemberLocation {
 ///                                 ^^^^             ivar_name
 ///                                       ^          colon
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AttributeMemberLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -427,7 +427,7 @@ pub struct AttributeMemberLocation {
 ///                ^^^^^       old_kind
 ///                     ^^^    old_name
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AliasMemberLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -441,7 +441,7 @@ pub struct AliasMemberLocation {
 /// use Foo
 /// ^^^       keyword
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UseDirectiveLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,
@@ -455,7 +455,7 @@ pub struct UseDirectiveLocation {
 ///          ^^    keyword
 ///             ^  new_name
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UseSingleClauseLocation {
     pub range: LocationRange,
     pub type_name_range: LocationRange,
@@ -468,7 +468,7 @@ pub struct UseSingleClauseLocation {
 /// ^^^^^^^^^^    namespace
 ///           ^   star
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UseWildcardClauseLocation {
     pub range: LocationRange,
     pub namespace_range: LocationRange,
@@ -481,7 +481,7 @@ pub struct UseWildcardClauseLocation {
 ///                     ^         colon
 ///                       ^^^^^   value
 /// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ResolveTypeNamesDirectiveLocation {
     pub range: LocationRange,
     pub keyword_range: LocationRange,

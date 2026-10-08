@@ -18,7 +18,7 @@ use crate::name::Symbol;
 /// Defaults to `Invariant` when source has neither `in` nor `out`.
 /// Distinct from [`crate::type_param::Variance`] (resolved side) so
 /// the AST layer stays free of `crate::types` dependencies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Variance {
     Invariant,
     Covariant,
@@ -27,7 +27,7 @@ pub enum Variance {
 
 /// Unresolved type parameter. Mirrors `RBS::AST::TypeParam` and
 /// structurally parallels rbs Rust `ast::TypeParam`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypeParam {
     pub name: Symbol,
     pub variance: Variance,

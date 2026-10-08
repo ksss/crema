@@ -32,13 +32,13 @@ use crate::rbs_raw::Parser as RbsParser;
 
 
 /// Mirrors `RBS::AST::Ruby::Members::MethodTypeAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MethodTypeAnnotation {
     pub type_annotations: TypeAnnotations,
 }
 
 /// The classification of annotations found on a method.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TypeAnnotations {
     /// At least one explicit method-type annotation (`#: ...` or
     /// `# @rbs (T) -> U`). Stored in source order.
@@ -56,7 +56,7 @@ pub enum TypeAnnotations {
 
 /// Explicit method-type shape — either a single `#:` assertion or a
 /// `# @rbs (…) -> …` possibly with `|`-separated overloads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum ExplicitAnnotation {
     /// `#: (T) -> U`
@@ -73,7 +73,7 @@ pub enum ExplicitAnnotation {
 /// was supplied and the slot falls back to untyped when resolved).
 /// This preserves arity so the resolver can build a `Function` whose
 /// slot count matches the def's formal parameter list.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DocStyle {
     /// Mirrors `RBS::AST::Ruby::Members::MethodTypeAnnotation::DocStyle#return_type_annotation`.
     pub return_type_annotation: Option<Box<ReturnTypeAnnotation>>,
@@ -93,7 +93,7 @@ pub struct DocStyle {
 /// A non-rest parameter slot in [`DocStyle`].
 ///
 /// Mirrors rbs's `Array[Annotations::ParamTypeAnnotation | Symbol]` element type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum PositionalEntry {
     /// `@rbs foo: Integer` — the annotation object is preserved so
@@ -113,7 +113,7 @@ pub enum PositionalEntry {
 /// - `Some(Annotated(_))` — annotation matched (rbs `annotation`)
 /// - `Some(ByName(_))` — named rest param, no matching annotation (rbs `Symbol`)
 /// - `Some(Unnamed)` — anonymous rest param (`*`), no annotation (rbs `true`)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum SplatRestEntry {
     Annotated(SplatParamTypeAnnotation),
@@ -124,7 +124,7 @@ pub enum SplatRestEntry {
 /// A rest-keyword parameter slot in [`DocStyle`].
 ///
 /// Mirrors rbs's `rest_keywords: Annotations::DoubleSplatParamTypeAnnotation | Symbol | true | nil`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum DoubleSplatRestEntry {
     Annotated(DoubleSplatParamTypeAnnotation),
@@ -135,7 +135,7 @@ pub enum DoubleSplatRestEntry {
 /// A block parameter slot in [`DocStyle`].
 ///
 /// Mirrors rbs's `block: Annotations::BlockParamTypeAnnotation | Symbol | true | nil`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum BlockEntry {
     Annotated(BlockParamTypeAnnotation),
@@ -657,7 +657,7 @@ fn prism_name_to_string(name: &[u8]) -> String {
 /// Nesting is represented by wrapping a [`Declaration`] in
 /// [`Member::Declaration`] so that tree walks can recurse through
 /// declarations without switching representation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum Member {
     /// A nested `class` / `module` / `CONST =` declaration.
@@ -711,7 +711,7 @@ impl Member {
 /// the rbs-visible accessors derived from that node (`location` and
 /// `name_location`) while keeping `method_type` as the already-built
 /// [`MethodTypeAnnotation`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DefMember {
     pub name: String,
     pub kind: MethodKind,
@@ -745,11 +745,9 @@ pub struct DefMember {
 /// parameter positionally so the definition builder can index into the
 /// resolved `MethodType` (whose positional params carry no names).
 ///
-/// Deliberately location-free: the struct is hashed into the incremental
-/// fingerprint (ADR-0032) so that adding/removing/reordering eligible
-/// assignments invalidates dependents, and a byte range would make pure
-/// code motion perturb the fingerprint spuriously.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Deliberately location-free: equality and hashing compare the facts
+/// themselves, so pure code motion leaves the value unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct InitializeIvarParamPair {
     /// Ivar name including the `@` sigil.
     pub ivar_name: String,
@@ -759,14 +757,14 @@ pub struct InitializeIvarParamPair {
 /// Positional reference into an `initialize` method type's parameter
 /// lists. Only the Sorbet-inferable kinds are representable —
 /// rest / block / post params are deliberately out of scope.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum InitializeParamRef {
     RequiredPositional(usize),
     OptionalPositional(usize),
     Keyword(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DefMemberOrigin {
     Real,
     SyntheticConcernIncluded,
@@ -792,7 +790,7 @@ pub enum DefMemberOrigin {
 /// surrounding whitespace); `None` when the attr has no annotation and
 /// should fall back to untyped. `annotation_range` is populated only
 /// when `type_text.is_some()` and attaches diagnostics on parse failure.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttributeMember {
     pub location: PrismByteRange,
     pub name_nodes: Vec<AttributeNameNode>,
@@ -823,26 +821,26 @@ impl AttributeMember {
 }
 
 /// Owned view of the Prism symbol nodes stored in rbs's `name_nodes`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttributeNameNode {
     pub name: String,
     pub location: PrismByteRange,
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::AttrReaderMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttrReaderMember {
     pub attribute: AttributeMember,
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::AttrWriterMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttrWriterMember {
     pub attribute: AttributeMember,
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::AttrAccessorMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttrAccessorMember {
     pub attribute: AttributeMember,
 }
@@ -854,7 +852,7 @@ pub struct AttrAccessorMember {
 /// `module_name` is the module name as written in the Ruby source
 /// (`"Helper"`, `"Foo::Bar"`, `"::Abs::M"`); resolving it against the
 /// enclosing class's scope is the resolver's job.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MixinMember {
     pub module_name: String,
     pub location: PrismByteRange,
@@ -863,31 +861,31 @@ pub struct MixinMember {
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::IncludeMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IncludeMember {
     pub mixin: MixinMember,
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::ExtendMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExtendMember {
     pub mixin: MixinMember,
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::PrependMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PrependMember {
     pub mixin: MixinMember,
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::InstanceVariableMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InstanceVariableMember {
     pub annotation: InstanceVariableAnnotation,
 }
 
 /// Mirrors `RBS::AST::Ruby::Members::ModuleSelfMember`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModuleSelfMember {
     pub annotation: ModuleSelfAnnotation,
 }

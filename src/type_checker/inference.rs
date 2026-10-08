@@ -43,17 +43,18 @@ fn literal_cannot_narrow(
         _ => false,
     }
 }
+use crate::narrowing::partition_union;
 use crate::types::{
     self, Function, FunctionType, Literal, RecordKey, Ty, Type, TypeTable, Visibility,
-    partition_falsy, partition_truthy, union_of, union_of_many,
+    cmp_by_content, partition_truthy, union_of, union_of_many,
 };
 
-use super::calls::{BlockParamShape, LiteralAccessResult, ResolvedCall};
+use super::calls::{BlockParamShape, LiteralAccessResult, OwnKey, ResolvedCall};
 use super::cond_env::{CondEnv, Scrutinee};
 use super::visitor::{and_write_value_ty, or_write_value_ty};
-use super::{ArgSpan, CallArguments, CallTarget, TypeChecker};
+use super::{CallArguments, CallTarget, TypeChecker};
 use crate::context::{ScopeKind, ScopeSnapshot};
-use crate::pure_call_env::PureKey;
+use crate::pure_call_env::{PureKey, PureNode};
 
 /// One arm's after-state for [`TypeChecker::join_arms_with_divergence`]:
 /// the scope snapshot taken at the join point and the body's last
@@ -192,41 +193,32 @@ impl<'env> TypeChecker<'env> {
         match node {
             Node::CallNode { .. } => {
                 if let Some(call) = node.as_call_node() {
-                    // Pure-call cache fast path. If a structurally
-                    // equivalent send was previously typed in the same
-                    // lvar scope (and its lvar dependencies have not
-                    // been reassigned), reuse the cached / narrowed
-                    // type without re-resolving overloads. The cache is
+                    // Pure-call cache. If a structurally equivalent send
+                    // was previously typed in the same lvar scope (and
+                    // its lvar dependencies have not been reassigned),
+                    // its value is the cached / narrowed type instead of
+                    // a fresh return-type inference. The cache is
                     // populated by the writeback below; analyze_condition
                     // updates it with the narrowed branch type via
                     // `with_cond_narrowing` / `with_cond_branch`.
-                    if let Some(key) = self.try_pure_key(&call.as_node())
-                        && let Some(ty) = self
-                            .lookup_pure_overlay(&key)
-                            .or_else(|| self.ctx.pure_call_env().get(&key))
-                    {
-                        return ty;
+                    //
+                    // A hit still walks the call, as `walk_argument_call`
+                    // and the receiver walk do: this occurrence is its own
+                    // extract site, and an early return would drop its
+                    // record (and its receiver's).
+                    let key = self.try_pure_key(&call.as_node());
+                    let cached = self.pure_call_cached(key.as_ref());
+                    let resolved = self.resolve_call_in_check(&call, OwnKey::Built(key));
+                    let ret = self.check_call_and_infer(&call, hint, &resolved, cached);
+                    if cached.is_none() {
+                        self.maybe_cache_pure_call(&call, key, &resolved, ret);
                     }
-                    let resolved = ResolvedCall::resolve(self, &call);
-                    self.check_call(&call, hint, &resolved);
-                    let ret = self.infer_call_return_type(&call, hint, &resolved);
-                    self.maybe_cache_pure_call(&call, &resolved, ret);
                     // Extract occurrence, with the type this arm just
                     // computed. Recording happens at the walk entries —
                     // not inside `check_call` — because only the entry
                     // knows whether the check produced a value for the
                     // site (here: yes).
-                    if let Some(target) = resolved.target.as_ref() {
-                        self.record_extract_call(
-                            call.location().start_offset(),
-                            call.location().end_offset(),
-                            target,
-                            resolved.receiver_ty,
-                            Some(ret),
-                        );
-                    } else {
-                        self.record_extract_call_no_target(&call, resolved.receiver_ty, Some(ret));
-                    }
+                    self.record_extract_call_site(&call, &resolved, Some(ret));
                     ret
                 } else {
                     Ty::UNTYPED
@@ -259,9 +251,11 @@ impl<'env> TypeChecker<'env> {
             Node::UnlessNode { .. } => self.check_unless_node(node, hint),
             Node::CaseNode { .. } => self.check_case_node(node, hint),
             Node::CaseMatchNode { .. } => self.check_case_match_node(node, hint),
-            Node::WhileNode { .. } => self.check_while_node(node),
-            Node::UntilNode { .. } => self.check_until_node(node),
-            Node::ForNode { .. } => self.check_for_node(node, hint),
+            // A `next` inside a loop continues the loop and carries no
+            // expected type (Steep `BreakContext.new(.., next_type: nil)`).
+            Node::WhileNode { .. } => self.with_next_hint(None, |c| c.check_while_node(node)),
+            Node::UntilNode { .. } => self.with_next_hint(None, |c| c.check_until_node(node)),
+            Node::ForNode { .. } => self.with_next_hint(None, |c| c.check_for_node(node, hint)),
             Node::RescueModifierNode { .. } => self.check_rescue_modifier_node(node, hint),
             Node::ParenthesesNode { .. } => {
                 if let Some(par) = node.as_parentheses_node() {
@@ -667,7 +661,27 @@ impl<'env> TypeChecker<'env> {
             // (`type_construction.rb:1943`). The `visit` call still
             // fires the declared-return-type subtype check for return
             // and any side-effect diagnostics for break/next.
-            Node::ReturnNode { .. } | Node::BreakNode { .. } | Node::NextNode { .. } => {
+            //
+            // A single `next` value is typed under the expected return
+            // type of the block / lambda it exits (Steep `when :next`
+            // `check(value, next_type)`). Only the hint is carried: a
+            // mismatched value is not reported (no BreakTypeMismatch).
+            Node::NextNode { .. } => {
+                let first = node
+                    .as_next_node()
+                    .and_then(|n| n.arguments())
+                    .map(|a| a.arguments().iter().collect::<Vec<_>>())
+                    .filter(|args| args.len() == 1)
+                    .and_then(|mut args| args.pop());
+                match (first, self.next_hint) {
+                    (Some(value), Some(next_hint)) => {
+                        self.check_node(&value, Some(next_hint));
+                    }
+                    _ => self.visit(node),
+                }
+                Ty::BOTTOM
+            }
+            Node::ReturnNode { .. } | Node::BreakNode { .. } => {
                 self.visit(node);
                 Ty::BOTTOM
             }
@@ -730,6 +744,13 @@ impl<'env> TypeChecker<'env> {
             // visitor.rs).
             Node::ForwardingSuperNode { .. } => {
                 self.emit_unexpected_super_if_unresolvable(node);
+                // `super { ... }`: block params bind against the target's
+                // block type and the body is checked + walked, before the
+                // extract record below consumes the block-check error flag
+                // (same order as the SuperNode arm).
+                if let Some(fwd) = node.as_forwarding_super_node() {
+                    self.check_forwarding_super_block(&fwd);
+                }
                 let ret = self.infer_type(node, hint);
                 // `require_rbs_decl` mirrors the emission gate above: a
                 // bare super inside an RBS-undeclared def was never
@@ -794,8 +815,17 @@ impl<'env> TypeChecker<'env> {
     /// `is_statement_assertion_eligible`: assignment forms and
     /// declarations have their own assertion pipelines and are skipped.
     pub(super) fn apply_statement_assertion_gate<'pr>(&mut self, stmt: &Node<'pr>, natural: Ty) {
+        if let Some(asserted) = self.statement_assertion(stmt) {
+            self.emit_statement_false_assertion(stmt, natural, asserted);
+        }
+    }
+
+    /// The resolved trailing `#: T` of a gate-eligible statement, or
+    /// `None` when the statement is not an assertion site or the
+    /// annotation does not resolve (UnknownTypeName is emitted here).
+    fn statement_assertion<'pr>(&mut self, stmt: &Node<'pr>) -> Option<Ty> {
         if !is_statement_assertion_eligible(stmt) {
-            return;
+            return None;
         }
         // Skip receiverless calls that the inline-declaration parser
         // (`inline_parser::collect_attr_call` /
@@ -804,14 +834,12 @@ impl<'env> TypeChecker<'env> {
         // / mixin type, not an expression assertion — Steep parses
         // them as declaration nodes, never as a CallNode + assertion.
         if is_inline_declaration_call_stmt(stmt) {
-            return;
+            return None;
         }
-        let Some(asserted) = self.lookup_trailing_assertion(
-            stmt.location().start_offset(),
-            stmt.location().end_offset(),
-        ) else {
-            return;
-        };
+        self.lookup_trailing_assertion(stmt.location().start_offset(), stmt.location().end_offset())
+    }
+
+    fn emit_statement_false_assertion<'pr>(&mut self, stmt: &Node<'pr>, natural: Ty, asserted: Ty) {
         let position = self.offset_to_location(stmt.location().start_offset());
         self.emit_false_assertion_if_incompatible(natural, asserted, position);
     }
@@ -1083,9 +1111,9 @@ impl<'env> TypeChecker<'env> {
         let value_ty = self.infer_type(value, None);
         let widened = self.widen_literal_to_base(value_ty);
         if is_or {
-            or_write_value_ty(read_ty, widened, self.env.types())
+            or_write_value_ty(read_ty, widened, self.env)
         } else {
-            and_write_value_ty(read_ty, widened, self.env.types())
+            and_write_value_ty(read_ty, widened, self.env)
         }
     }
 
@@ -1120,9 +1148,9 @@ impl<'env> TypeChecker<'env> {
         let value_ty = self.infer_type(value, None);
         let widened = self.widen_literal_to_base(value_ty);
         if is_or {
-            or_write_value_ty(read_ty, widened, self.env.types())
+            or_write_value_ty(read_ty, widened, self.env)
         } else {
-            and_write_value_ty(read_ty, widened, self.env.types())
+            and_write_value_ty(read_ty, widened, self.env)
         }
     }
 
@@ -1157,18 +1185,17 @@ impl<'env> TypeChecker<'env> {
     /// `Type::Union(...)` directly without absorption) while adding
     /// widening + dedup that the OLD path lacked.
     ///
-    /// Literal widening is gated on `elem_hint`: a literal member is
-    /// widened only when its base class still fits the hint
-    /// (`1` under `Integer` → `Integer`, Steep hover parity). When the
-    /// base class does not fit but the literal itself does (`:c` under
-    /// `:c | :u`), the literal is kept so the outer gate passes via
-    /// `Array[unchecked out Elem]` covariance. Steep `try_array_type`
-    /// synthesizes `Array[:c | :u]` here (`test_literal_type` returns
-    /// `unwrap(hint)`); crema keeps the narrower `:c`, the same
-    /// deliberate deviation `literal_expression_type` documents, and the
-    /// subtype outcome is identical either way. A literal that fits
-    /// neither way (`:z` under `:c | :u`) widens as before and lets the
-    /// outer gate report the mismatch.
+    /// Literal widening is gated on `elem_hint`. A literal written in
+    /// the array already arrives as `unwrap(elem_hint)` when the hint
+    /// admits it (`literal_expression_type`, Steep `try_array_type`
+    /// giving `Array[:c | :u]`); a literal-typed member that reaches
+    /// here some other way (a call returning `:c`) is widened only when
+    /// its base class still fits the hint (`1` under `Integer` →
+    /// `Integer`). When the base class does not fit but the literal
+    /// itself does (`:c` under `:c | :u`), the literal is kept so the
+    /// outer gate passes via `Array[unchecked out Elem]` covariance. A
+    /// literal that fits neither way (`:z` under `:c | :u`) widens and
+    /// lets the outer gate report the mismatch.
     fn fold_hint_element_union(&self, raw: &[Ty], elem_hint: Ty) -> Ty {
         let mut members: Vec<Ty> = Vec::with_capacity(raw.len());
         let mut seen: FxHashSet<Ty> = FxHashSet::default();
@@ -1190,7 +1217,7 @@ impl<'env> TypeChecker<'env> {
                 }
             }
         }
-        members.sort();
+        members.sort_by(|&a, &b| cmp_by_content(a, b, self.env.types()));
         match members.len() {
             0 => Ty::BOTTOM,
             1 => members[0],
@@ -1367,7 +1394,7 @@ impl<'env> TypeChecker<'env> {
                 }
             }
         }
-        out.sort();
+        out.sort_by(|&a, &b| cmp_by_content(a, b, self.env.types()));
         match out.len() {
             0 => Ty::BOTTOM,
             1 => out[0],
@@ -1414,6 +1441,16 @@ impl<'env> TypeChecker<'env> {
     /// Build `Hash[K, V]`. Single source for the Hash `ClassInstance`
     /// shape so `hash_untyped_untyped` and the no-hint synthesis path
     /// agree on the name source (`builtins().hash`).
+    /// The declared type of the instance variable `name` at `self`, the
+    /// hint Steep types an ivar write's RHS under.
+    fn declared_ivar_type(&self, name: &[u8]) -> Option<Ty> {
+        let var_sym = self
+            .env
+            .names()
+            .intern_symbol(&String::from_utf8_lossy(name));
+        resolve_ivar_at_self(self, var_sym)
+    }
+
     pub(super) fn hash_instance(&self, key_ty: Ty, value_ty: Ty) -> Ty {
         let name = self.env.names().builtins().hash;
         self.env.types().intern(Type::ClassInstance {
@@ -1429,18 +1466,86 @@ impl<'env> TypeChecker<'env> {
     /// and is read-only). Avoids duplicating the record-pick logic.
     fn check_hash_node<'pr>(&mut self, node: &Node<'pr>, hint: Option<Ty>) -> Ty {
         if let Some(elements) = hash_or_keyword_hash_elements(node) {
-            for elem in elements.iter() {
+            let element_hints = hint.map(|h| self.hash_element_hints(&elements, h));
+            for (i, elem) in elements.iter().enumerate() {
+                let (key_hint, value_hint) = element_hints
+                    .as_ref()
+                    .map_or((None, None), |hints| hints[i]);
                 if let Some(assoc) = elem.as_assoc_node() {
-                    self.check_node(&assoc.key(), None);
-                    self.check_node(&assoc.value(), None);
+                    self.check_node(&assoc.key(), key_hint);
+                    self.check_node(&assoc.value(), value_hint);
                 } else if let Some(splat) = elem.as_assoc_splat_node()
                     && let Some(value) = splat.value()
                 {
-                    self.check_node(&value, None);
+                    self.check_node(&value, value_hint);
                 }
             }
         }
         self.infer_type(node, hint)
+    }
+
+    /// The `(key, value)` hint each element of a hash literal is typed
+    /// under, picked by the rules of [`synthesize_hash_literal_with_hint`]
+    /// so the walk types the elements as the read-only synthesis does:
+    /// a committed Record candidate hands each value its field type (no
+    /// hint for a key the record lacks); otherwise the first `Hash[K, V]`
+    /// candidate hands `K` / `V` to a pair and `Hash[K, V]` to a `**`
+    /// splat; otherwise no hint. A splat's slot carries its hint in the
+    /// value position.
+    fn hash_element_hints<'pr>(
+        &self,
+        elements: &[Node<'pr>],
+        hint: Ty,
+    ) -> Vec<(Option<Ty>, Option<Ty>)> {
+        let candidates = self.expand_hint_candidates(hint);
+        if let Some(record_hint) = self.pick_record_hint_from_candidates(elements, &candidates)
+            && let Type::Record { fields } = self
+                .env
+                .types()
+                .resolve(definition_builder::expand_alias(self.env, record_hint))
+        {
+            // `synthesize_hash_as_record` commits only when every element
+            // is a pair with a literal key.
+            let keys: Option<Vec<RecordKey>> = elements
+                .iter()
+                .map(|e| {
+                    e.as_assoc_node()
+                        .and_then(|a| record_key_from_literal_node(&a.key()))
+                })
+                .collect();
+            if let Some(keys) = keys {
+                return keys
+                    .iter()
+                    .map(|k| {
+                        let field = fields.iter().find(|(f, _, _)| f == k).map(|(_, ty, _)| *ty);
+                        (None, field)
+                    })
+                    .collect();
+            }
+        }
+        let hash_name = self.env.names().builtins().hash;
+        let kv = candidates.into_iter().find_map(|c| {
+            match self
+                .env
+                .types()
+                .resolve(definition_builder::expand_alias(self.env, c))
+            {
+                Type::ClassInstance { name, args } if *name == hash_name && args.len() == 2 => {
+                    Some((args[0], args[1]))
+                }
+                _ => None,
+            }
+        });
+        elements
+            .iter()
+            .map(|e| match kv {
+                Some((k, v)) if e.as_assoc_node().is_some() => (Some(k), Some(v)),
+                Some((k, v)) if e.as_assoc_splat_node().is_some() => {
+                    (None, Some(self.hash_instance(k, v)))
+                }
+                _ => (None, None),
+            })
+            .collect()
     }
 
     /// `check_node`'s RangeNode branch: walk each present bound via
@@ -1498,6 +1603,10 @@ impl<'env> TypeChecker<'env> {
                     && let Some(stmts) = embedded.statements()
                 {
                     self.check_node(&stmts.as_node(), None);
+                } else if part.as_interpolated_string_node().is_some() {
+                    // Adjacent literals (`"a" "#{x}"`, `\`-continued
+                    // strings) nest an interpolated string as a part.
+                    self.check_node(&part, None);
                 }
             }
         }
@@ -1782,7 +1891,7 @@ impl<'env> TypeChecker<'env> {
                 (Some((s, _)), Some(target), _) => {
                     let truthy_ty =
                         crate::narrowing::narrow(iter_falsy_ty.unwrap(), target, self.env);
-                    CondEnv::single(s.clone(), truthy_ty)
+                    CondEnv::single(*s, truthy_ty)
                 }
                 (_, _, Some((truthy, _))) => truthy.clone(),
                 _ => CondEnv::empty(),
@@ -1806,9 +1915,7 @@ impl<'env> TypeChecker<'env> {
                 self.ctx.restore_scopes(base.clone());
                 match s {
                     Scrutinee::Lvar(name) => self.ctx.set_local_variable(*name, next_falsy),
-                    Scrutinee::Pure(key) => {
-                        self.ctx.pure_call_env_mut().set(key.clone(), next_falsy)
-                    }
+                    Scrutinee::Pure(key) => self.ctx.pure_call_env_mut().set(*key, next_falsy),
                 }
                 iter_base = self.ctx.snapshot_scopes();
             } else if let Some((_, falsy)) = predicate_less_condition_narrow {
@@ -2064,7 +2171,7 @@ impl<'env> TypeChecker<'env> {
                 crate::narrowing::narrow(iter_falsy_ty.expect("target implies ty"), t, self.env)
             });
             let cond_env = match (scrutinee.as_ref(), truthy_ty) {
-                (Some((s, _)), Some(ty)) => CondEnv::single(s.clone(), ty),
+                (Some((s, _)), Some(ty)) => CondEnv::single(*s, ty),
                 _ => CondEnv::empty(),
             };
             let outcome = self.with_branch_outcome(&iter_base, &cond_env, |c| {
@@ -2093,7 +2200,7 @@ impl<'env> TypeChecker<'env> {
                     self.ctx.restore_scopes(base.clone());
                     match s {
                         Scrutinee::Lvar(name) => self.ctx.set_local_variable(*name, next),
-                        Scrutinee::Pure(key) => self.ctx.pure_call_env_mut().set(key.clone(), next),
+                        Scrutinee::Pure(key) => self.ctx.pure_call_env_mut().set(*key, next),
                     }
                     iter_base = self.ctx.snapshot_scopes();
                 }
@@ -2292,6 +2399,14 @@ impl<'env> TypeChecker<'env> {
     /// fix for the bug where `infer_type`'s StatementsNode arm passed
     /// `None` to the last expression, silently dropping the hint for
     /// any `begin ... end #: T` chain.
+    ///
+    /// The list's type is sticky-bot, after Steep's `Pair#+`
+    /// (`type_construction.rb`): once a statement evaluates to
+    /// `Ty::BOTTOM` the list stays `Ty::BOTTOM`, but the statements after
+    /// it are still walked (in the pre-divergence env) and diagnosed.
+    /// Callers that judge divergence (`join_arms_with_divergence`, the
+    /// rescue filter, or / and) see a `return; puts "dead"` arm as
+    /// diverging even though its last walked statement is `nil`.
     fn check_statements_with_hint<'pr>(
         &mut self,
         stmts: &ruby_prism::StatementsNode<'pr>,
@@ -2318,37 +2433,47 @@ impl<'env> TypeChecker<'env> {
         let suppress_parens_routed =
             std::mem::replace(&mut self.suppress_parens_routed_last_assertion, false);
         let last_idx = body.len() - 1;
-        let mut last_ty = Ty::NIL;
+        let mut list_ty = Ty::NIL;
         for (i, stmt) in body.iter().enumerate() {
             let is_last = i == last_idx;
-            let stmt_hint = if is_last { hint } else { None };
-            last_ty = self.check_node(stmt, stmt_hint);
-            // Statement-position trailing `#: T` gate. Steep parity
+            // Statement-position trailing `#: T`. Steep parity
             // (`type_construction.rb` `:assertion`): any value-position
             // expression at statement position is an assertion site, not
-            // just lvar / multi assignment. Assignment forms and
-            // declarations are handled by their own pipelines and are
-            // filtered out via `is_statement_assertion_eligible`, so
-            // `z = x #: String` fires exactly once (via
-            // `visit_local_variable_write_node`) and `def foo #: T`
-            // never reaches this gate.
-            if !(is_last && (suppress_last || suppress_parens_routed)) {
-                self.apply_statement_assertion_gate(stmt, last_ty);
-            }
-            // Divergence cutoff. Mirrors Steep's TypeConstruction#synthesize
-            // (`type_construction.rb:1218` `unless break_type.is_a?(AST::Types::Bot)`
-            // and parallel sites): once a stmt evaluates to `Ty::BOTTOM`
-            // (return/raise/break/next, or any enclosing form whose arms
-            // all diverge), the remaining stmts are dead code. Walking
-            // them would emit false diagnostics under the pre-divergence
-            // scope - the narrowing dropped by the divergent arm never
-            // gets a chance to run if we keep evaluating dead stmts in
-            // base env.
-            if last_ty == Ty::BOTTOM {
-                break;
+            // just lvar / multi assignment. The asserted type hints the
+            // statement, the natural type is gated against it in both
+            // directions, and the asserted type becomes the statement's
+            // value even when the gate fires (`add_typing(node, type:
+            // type)`) — so an if / case / begin arm's tail assertion is
+            // the arm's value. Assignment forms and declarations are
+            // handled by their own pipelines and are filtered out via
+            // `is_statement_assertion_eligible`, so `z = x #: String`
+            // fires exactly once (via `visit_local_variable_write_node`)
+            // and `def foo #: T` never reaches this gate. A suppressed
+            // last statement belongs to its owner (`check_return_type`
+            // or the lvasgn), which already hinted, gated and overrode.
+            let asserted = if is_last && (suppress_last || suppress_parens_routed) {
+                None
+            } else {
+                self.statement_assertion(stmt)
+            };
+            let stmt_hint = match asserted {
+                Some(asserted) => Some(asserted),
+                None if is_last => hint,
+                None => None,
+            };
+            let natural = self.check_node(stmt, stmt_hint);
+            let stmt_ty = match asserted {
+                Some(asserted) => {
+                    self.emit_statement_false_assertion(stmt, natural, asserted);
+                    asserted
+                }
+                None => natural,
+            };
+            if list_ty != Ty::BOTTOM {
+                list_ty = stmt_ty;
             }
         }
-        last_ty
+        list_ty
     }
 
     /// `check_node`'s IfNode branch (covers both `if` statements and
@@ -2492,10 +2617,11 @@ impl<'env> TypeChecker<'env> {
     /// - `LocalVariableWriteNode` — `unless x = expr; ...` style. The
     ///   write is routed through `visit_local_variable_write_node` by
     ///   `check_node` before this function runs, so the lvar is already
-    ///   bound to the RHS type and the narrowing is identical to the
-    ///   bare-read case. RHS-recursive narrowing (`unless x = y.nil?`
-    ///   narrowing `y`, per Steep's `logic_type_interpreter.rb:105`)
-    ///   is intentionally not implemented; the scrutinee is `x` alone.
+    ///   bound to the RHS type and `x` narrows as in the bare-read case.
+    ///   The RHS is also analyzed as a condition and `x`'s split is
+    ///   layered on top (`if (x = m&.foo)` narrows `m` too), per Steep's
+    ///   `logic_type_interpreter.rb:105`. Special lvars (`_` etc.)
+    ///   narrow nothing.
     /// - `x.nil?` — both sides via `narrowing::{narrow, subtract}`
     /// - `x.is_a?(C)` / `x.kind_of?(C)` — both sides against the
     ///   instance type derived from a Class/Module literal arg
@@ -2532,7 +2658,26 @@ impl<'env> TypeChecker<'env> {
             // later read of `x`, so name-only lookup matches the binding
             // the surrounding statement will actually see — depth need not
             // be threaded through.
-            return self.lvar_bare_narrow_by_name(write.name().as_slice());
+            let name = write.name().as_slice();
+            if super::is_special_lvar_name(name) {
+                return (CondEnv::empty(), CondEnv::empty());
+            }
+            // Steep `when :lvasgn`: narrow by the rhs as a condition, then
+            // layer the target's own split on top so the write wins when
+            // the rhs mentions the target (`m = !m`). Unlike Steep, the
+            // write has already run, so the rhs is read against
+            // post-write bindings: an rhs entry on the target (or on a
+            // pure call through it) is a subtype of the *new* value's
+            // type. The target layer replaces it unless that layer is
+            // empty on a side — the new value is never falsy (that side
+            // is unreachable) or always truthy, which needs a `||` whose
+            // `join_branch` already drops one-sided target entries.
+            let (rhs_truthy, rhs_falsy) = self.analyze_condition(&write.value());
+            let (truthy, falsy) = self.lvar_bare_narrow_by_name(name);
+            return (
+                rhs_truthy.merge_sequential(truthy),
+                rhs_falsy.merge_sequential(falsy),
+            );
         }
         if let Some(mp) = node.as_match_predicate_node() {
             // `x in pat` — same membership split as `is_a?` / `===`,
@@ -2979,7 +3124,7 @@ impl<'env> TypeChecker<'env> {
         let truthy_ty = crate::narrowing::subtract(current, nil_or_false, self.env);
         let falsy_ty = crate::narrowing::narrow(current, nil_or_false, self.env);
         let truthy = if truthy_ty != current && truthy_ty != Ty::BOTTOM {
-            CondEnv::single(scrutinee.clone(), truthy_ty)
+            CondEnv::single(scrutinee, truthy_ty)
         } else {
             CondEnv::empty()
         };
@@ -3000,7 +3145,7 @@ impl<'env> TypeChecker<'env> {
         let truthy_ty = crate::narrowing::narrow(current, target, self.env);
         let falsy_ty = crate::narrowing::subtract(current, target, self.env);
         (
-            CondEnv::single(scrutinee.clone(), truthy_ty),
+            CondEnv::single(scrutinee, truthy_ty),
             CondEnv::single(scrutinee, falsy_ty),
         )
     }
@@ -3016,14 +3161,14 @@ impl<'env> TypeChecker<'env> {
         if let Some(lvar) = node.as_local_variable_read_node() {
             let name_str = String::from_utf8_lossy(lvar.name().as_slice());
             let name = self.checker_names().intern(&name_str);
-            return Some(PureKey::Lvar(name));
+            return Some(self.pure_keys().intern(PureNode::Lvar(name)));
         }
         if node.as_self_node().is_some() {
-            return Some(PureKey::SelfRef);
+            return Some(self.pure_keys().intern(PureNode::SelfRef));
         }
         if let Some(constant) = node.as_constant_read_node() {
             let name = String::from_utf8_lossy(constant.name().as_slice());
-            let ty = self.try_resolve_constant_read(&name, node)?.ty;
+            let ty = self.try_resolve_constant_read(&name)?.ty;
             return self.const_singleton_key(ty);
         }
         if let Some(path) = node.as_constant_path_node() {
@@ -3039,23 +3184,50 @@ impl<'env> TypeChecker<'env> {
             // SelfNode arm above. Both normalize to `Send(SelfRef, _)`.
             let recv_key = match call.receiver() {
                 Some(receiver) => self.try_pure_key(&receiver)?,
-                None => PureKey::SelfRef,
+                None => self.pure_keys().intern(PureNode::SelfRef),
             };
             let method_str = String::from_utf8_lossy(call.name().as_slice());
             let method = self.env.names().intern_symbol(&method_str);
-            let recv_key = Box::new(recv_key);
-            return Some(if call.is_safe_navigation() {
-                PureKey::CSend(recv_key, method)
+            return Some(self.pure_keys().intern(if call.is_safe_navigation() {
+                PureNode::CSend(recv_key, method)
             } else {
-                PureKey::Send(recv_key, method)
-            });
+                PureNode::Send(recv_key, method)
+            }));
         }
         None
     }
 
+    /// `try_pure_key` of `call`'s receiver when that receiver is itself a
+    /// call (the only receivers resolved under a handed-down key), from
+    /// `call`'s own key when the caller built one. A no-argument,
+    /// no-block call's key is `Send(receiver key, m)`, so the receiver's
+    /// key is read off it, and `None` there means the receiver has none
+    /// either. A call with arguments or a block never has a key, so its
+    /// receiver's key is built fresh — the walk down from there stops at
+    /// the next such call, keeping the whole chain linear.
+    pub(super) fn receiver_pure_key<'pr>(
+        &self,
+        call: &CallNode<'pr>,
+        own_key: OwnKey,
+    ) -> Option<PureKey> {
+        let receiver = call.receiver()?;
+        receiver.as_call_node()?;
+        match own_key {
+            OwnKey::Built(own) if call.arguments().is_none() && call.block().is_none() => {
+                match self.pure_keys().node(own?) {
+                    PureNode::Send(recv, _) | PureNode::CSend(recv, _) => Some(recv),
+                    _ => unreachable!("a call's pure key is a send"),
+                }
+            }
+            _ => self.try_pure_key(&receiver),
+        }
+    }
+
     fn const_singleton_key(&self, ty: Ty) -> Option<PureKey> {
         match self.env.types().resolve(ty) {
-            Type::ClassSingleton { name } => Some(PureKey::ConstPath(*name)),
+            Type::ClassSingleton { name } => {
+                Some(self.pure_keys().intern(PureNode::ConstPath(*name)))
+            }
             _ => None,
         }
     }
@@ -3080,20 +3252,26 @@ impl<'env> TypeChecker<'env> {
     ///    outer narrow then would be unsound, because re-calling the
     ///    receiver could yield a different value and invalidate the
     ///    cached narrow at the outer link.
+    ///
+    /// `key` is the call's `try_pure_key`, built for the lookup that
+    /// preceded the check.
     fn maybe_cache_pure_call<'pr>(
         &mut self,
         call: &CallNode<'pr>,
+        key: Option<PureKey>,
         resolved: &ResolvedCall,
         ret: Ty,
     ) {
-        let Some(key) = self.try_pure_key(&call.as_node()) else {
+        let Some(key) = key else {
             return;
         };
-        if let PureKey::Send(recv_key, _) | PureKey::CSend(recv_key, _) = &key {
-            let receiver_pure = match recv_key.as_ref() {
-                PureKey::Lvar(_) | PureKey::SelfRef | PureKey::ConstPath(_) => true,
-                PureKey::Send(_, _) | PureKey::CSend(_, _) => {
-                    self.ctx.pure_call_env().get(recv_key.as_ref()).is_some()
+        if let PureNode::Send(recv_key, _) | PureNode::CSend(recv_key, _) =
+            self.pure_keys().node(key)
+        {
+            let receiver_pure = match self.pure_keys().node(recv_key) {
+                PureNode::Lvar(_) | PureNode::SelfRef | PureNode::ConstPath(_) => true,
+                PureNode::Send(_, _) | PureNode::CSend(_, _) => {
+                    self.ctx.pure_call_env().get(&recv_key).is_some()
                 }
             };
             if !receiver_pure {
@@ -3150,7 +3328,7 @@ impl<'env> TypeChecker<'env> {
         {
             return false;
         }
-        let resolved = ResolvedCall::resolve(self, &call);
+        let resolved = ResolvedCall::resolve(self, &call, OwnKey::Unbuilt);
         let Some(target) = resolved.target.as_ref() else {
             return false;
         };
@@ -3354,13 +3532,9 @@ impl<'env> TypeChecker<'env> {
     /// ordinary `check_no_method` path reports it, so this function just
     /// declines to narrow (`None`) rather than duplicating that gate.
     ///
-    /// `-> bool` and `-> untyped` returns are placed on *both* sides
-    /// directly instead of through `partition_truthy`/`partition_falsy`:
-    /// those helpers' default arm treats an undecomposed `Type::Bool` as
-    /// falsy-impossible, which is correct for the value-splitting
-    /// `&&`/`||` call sites they were built for but wrong here — a
-    /// `bool`-returning member truly can go either way, and Steep's
-    /// measured behavior is to leave the union whole rather than guess.
+    /// Each member's return is split with `partition_union` exactly as
+    /// Steep does, so a `-> bool` / `-> untyped` / `-> top` return lands
+    /// on *both* sides and that member stays in both narrowed unions.
     ///
     /// Returns `None` (instead of an all-empty pair) when neither side
     /// narrows anything, so the caller can fall through to the bare
@@ -3394,19 +3568,11 @@ impl<'env> TypeChecker<'env> {
                 Some(call),
                 None,
             );
-            let (truthy_possible, falsy_possible) =
-                if ret.is_untyped() || matches!(types.resolve(ret), Type::Bool) {
-                    (true, true)
-                } else {
-                    (
-                        partition_truthy(ret, types).is_some(),
-                        partition_falsy(ret, types).is_some(),
-                    )
-                };
-            if truthy_possible {
+            let (truthy_side, falsy_side) = partition_union(ret, self.env);
+            if truthy_side.is_some() {
                 truthy_members.push(c.receiver_type);
             }
-            if falsy_possible {
+            if falsy_side.is_some() {
                 falsy_members.push(c.receiver_type);
             }
         }
@@ -3418,7 +3584,7 @@ impl<'env> TypeChecker<'env> {
             return None;
         }
         let truthy = if truthy_hit {
-            CondEnv::single(scrutinee.clone(), truthy_ty)
+            CondEnv::single(scrutinee, truthy_ty)
         } else {
             CondEnv::empty()
         };
@@ -3527,8 +3693,7 @@ impl<'env> TypeChecker<'env> {
     fn class_literal_target<'pr>(&self, node: &Node<'pr>) -> Option<Ty> {
         let resolved_ty = if let Some(cr) = node.as_constant_read_node() {
             let name_str = String::from_utf8_lossy(cr.name().as_slice()).to_string();
-            let generic = cr.as_node();
-            self.try_resolve_constant_read(&name_str, &generic)?.ty
+            self.try_resolve_constant_read(&name_str)?.ty
         } else if let Some(path) = node.as_constant_path_node() {
             match self.resolve_constant_path_outcome(&path) {
                 ConstantPathOutcome::Walked {
@@ -3648,7 +3813,7 @@ impl<'env> TypeChecker<'env> {
             }
             Scrutinee::Pure(key) => {
                 let mut overlay = FxHashMap::default();
-                overlay.insert(key.clone(), ty);
+                overlay.insert(*key, ty);
                 self.with_pure_overlay(overlay, |checker| checker.infer_type(node, hint))
             }
         }
@@ -3807,7 +3972,7 @@ impl<'env> TypeChecker<'env> {
     /// Value type vs env join are computed separately: the env join still
     /// threads the full `left_ty` (preserving the post-or env shape from
     /// before the value-type modeling), while the value type is
-    /// `partition_truthy(left) | right_value` so a nilable left contributes
+    /// `truthy_partition(left) | right_value` so a nilable left contributes
     /// only its truthy partition. Falls to `Ty::BOTTOM` when both arms
     /// diverge — matching how nested guard clauses propagate
     /// (`if x.nil?; raise "a" or raise "b"; end`).
@@ -3871,17 +4036,18 @@ impl<'env> TypeChecker<'env> {
         if left_ty == Ty::BOTTOM {
             // Left diverged (`raise "a" or 42`): the right operand is
             // unreachable. Surface `Ty::BOTTOM` so the surrounding stmt
-            // list cuts off at this expression instead of evaluating the
+            // list diverges at this expression instead of evaluating the
             // right arm and joining a live env back into the post scope.
             return Ty::BOTTOM;
         }
-        let right_hint = partition_truthy(left_ty, self.env.types());
+        let (left_truthy, left_falsy) = partition_union(left_ty, self.env);
+        let right_hint = left_truthy;
         let (truthy, falsy) = self.analyze_condition(&left);
 
         // Env join still threads the full `left_ty` through arm_truthy
         // so the post-or env mirrors Steep's "both operands evaluated"
         // shape. The value-type union is computed separately so the
-        // truthy-arm contribution can use `partition_truthy(left_ty)`
+        // truthy-arm contribution can use the left's truthy partition
         // without affecting BOTTOM-driven env adoption in
         // `join_arms_with_divergence`.
         let base = self.ctx.snapshot_scopes();
@@ -3901,19 +4067,16 @@ impl<'env> TypeChecker<'env> {
         // Value type: truthy partition of left ∪ right's synthesized type.
         // Statically-falsy left collapses arm_truthy to BOTTOM (drops via
         // union_of); divergent right keeps the truthy partition alone.
-        // Statically-truthy left (`partition_falsy` empty) makes the right
+        // Statically-truthy left (falsy partition empty) makes the right
         // arm unreachable too — Steep folds to the left's truthy partition
         // alone (type_construction.rb:1820-1828) even though the right is
-        // still walked above for its side-effect diagnostics.
+        // still walked above for its side-effect diagnostics. A left whose
+        // truthiness is unknown (`bool`, `untyped`, `top`) has a non-empty
+        // falsy partition, so the right is kept.
         //
-        // `narrowing::subtract` (not `partition_truthy`) computes the
-        // truthy partition: `subtract` expands `Type::Alias` before
-        // comparing (`partition_truthy` deliberately stays `TypeTable`-only
-        // and never expands aliases) and decomposes an undecomposed
-        // `Type::Bool` against a literal target, neither of which
-        // `partition_truthy` does. `narrowing::subtract` is the same
-        // substrate the ordinary bare-lvar narrow path
-        // (`bare_truthy_falsy_env`) uses and handles both shapes correctly.
+        // The truthy value itself comes from `narrowing::subtract`, the
+        // same substrate the bare-lvar narrow path (`bare_truthy_falsy_env`)
+        // uses, so `x = y or raise` binds the type that narrow would plant.
         let types = self.env.types();
         let false_ty = types.intern(Type::Literal(Literal::Bool(false)));
         let nil_or_false = union_of(Ty::NIL, false_ty, types);
@@ -3944,10 +4107,38 @@ impl<'env> TypeChecker<'env> {
             let name = self.checker_names().intern(&name_str);
             self.ctx.set_local_variable(name, truthy_value);
         }
-        if right_diverged || partition_falsy(left_ty, self.env.types()).is_none() {
+        if right_diverged || left_falsy.is_none() {
             return truthy_value;
         }
-        union_of(truthy_value, right_value_ty, self.env.types())
+        if left_truthy.is_none() {
+            // Statically-falsy left: Steep's `left_truthy.unreachable` arm
+            // types the expression as the right alone, without the
+            // both-arms `bool` collapse.
+            return right_value_ty;
+        }
+        self.join_reachable_logic_arms(truthy_value, right_value_ty)
+    }
+
+    /// Value of an `&&` / `||` whose two arms are both reachable: the
+    /// union of the left's surviving partition and the right's value,
+    /// collapsed to `bool` when that union is a subtype of `bool` (and not
+    /// `untyped`). Steep's `:and` / `:or` arms (type_construction.rb) do
+    /// this after `union_type`, which is why `cond && true` is `bool`
+    /// rather than `bool | true` — `Union.build` itself never absorbs a
+    /// literal. A statically folded `&&` / `||` keeps the surviving arm's
+    /// own type and must not come through here, and a diverging right
+    /// (`x || raise`) leaves the left side as is — Steep's
+    /// both-right-sides-unreachable arm, which skips the collapse.
+    fn join_reachable_logic_arms(&self, left_side: Ty, right: Ty) -> Ty {
+        if right == Ty::BOTTOM {
+            return left_side;
+        }
+        let joined = union_of(left_side, right, self.env.types());
+        if !joined.is_untyped() && self.subtyper().check(joined, Ty::BOOL) {
+            Ty::BOOL
+        } else {
+            joined
+        }
     }
 
     /// `check_node`'s AndNode branch: `a && b` — both operands receive
@@ -3972,7 +4163,7 @@ impl<'env> TypeChecker<'env> {
         if left_ty == Ty::BOTTOM {
             // Left diverged (`raise "a" and foo`): same dead-code
             // shape as `check_or_node`. Skip the right arm and let the
-            // stmt-list cutoff swallow whatever follows.
+            // stmt list stay BOTTOM for whatever follows.
             return Ty::BOTTOM;
         }
         let (truthy, falsy) = self.analyze_condition(&left);
@@ -3996,36 +4187,51 @@ impl<'env> TypeChecker<'env> {
         if left_diverged && right_diverged {
             return env_join_ty; // BOTTOM
         }
-        // Statically-falsy left (`partition_truthy` empty) makes the right
+        // Statically-falsy left (truthy partition empty) makes the right
         // arm unreachable too — Steep folds to the left's falsy partition
         // alone (type_construction.rb:1879-1886) even though the right is
         // still walked above for its side-effect diagnostics.
-        let falsy_value = partition_falsy(left_ty, self.env.types()).unwrap_or(Ty::BOTTOM);
-        if right_diverged || partition_truthy(left_ty, self.env.types()).is_none() {
+        let (left_truthy, left_falsy) = partition_union(left_ty, self.env);
+        let Some(falsy_value) = left_falsy else {
+            // Statically-truthy left: Steep's `left_falsy.unreachable` arm
+            // types the expression as the right alone.
+            return if right_diverged {
+                Ty::BOTTOM
+            } else {
+                right_value_ty
+            };
+        };
+        if right_diverged || left_truthy.is_none() {
             return falsy_value;
         }
-        union_of(right_value_ty, falsy_value, self.env.types())
+        self.join_reachable_logic_arms(falsy_value, right_value_ty)
     }
 
-    /// Type of a literal expression (`1` / `"s"` / `:a`). Steep
-    /// `test_literal_type` (`type_construction.rb`, `:int` / `:sym` /
-    /// `:str` arms): the literal type survives only under a hint that is
-    /// not untyped and admits it (`g(:a)` against `(:a | :b)`, `def
-    /// src; 1; end` against `-> (1 | 2 | 3)`); everywhere else the
-    /// expression is class-typed (`r = 1` binds `::Integer`, `f(1)`
-    /// reports `::Integer`). Steep returns `unwrap(hint)` in the keep
-    /// case; crema keeps the literal itself, because the tuple / record
-    /// index specializers (`calls.rs` `record_key_specialization`) read
-    /// the key from the argument's type — `lit <: hint` either way, so
-    /// subtype outcomes are identical. The synthesized type itself is
-    /// narrower than Steep's (`:a` where Steep has `:a | :b`), which
-    /// shows in displayed / propagated types, e.g. a mismatching tuple
-    /// argument prints `[1, ::Integer]` where Steep prints
-    /// `[::Integer, ::Integer]`.
+    /// Type of a literal expression (`1` / `"s"` / `:a` / `true` /
+    /// `false`). Steep `test_literal_type` (`type_construction.rb`,
+    /// `:int` / `:sym` / `:str` arms): under a hint that is not untyped
+    /// and admits the literal, the expression takes the hint's type with
+    /// `nil` removed (`unwrap(hint)`: `"s"` under `String | Integer` is
+    /// `String | Integer`, under `String?` is `String`); the literal type
+    /// survives only when the hint itself is a literal (`g(:a)` against
+    /// `(:a | :b)` gives `:a | :b`). Everywhere else the expression is
+    /// class-typed (`r = 1` binds `::Integer`). `true` / `false` follow
+    /// Steep's `:true, :false` arm, which also ignores a `top` hint.
+    ///
+    /// The admission check keeps free type variables: Steep checks with
+    /// empty constraints, so `42` does not fit the `U` of `[U] (U) -> U`
+    /// and stays `::Integer` for `U` to be inferred from.
     fn literal_expression_type(&self, lit: Literal, hint: Option<Ty>) -> Ty {
+        let ignores_top = matches!(lit, Literal::Bool(_));
         let literal_ty = self.env.types().intern(Type::Literal(lit));
         match hint {
-            Some(h) if !h.is_untyped() && self.subtyper().check(literal_ty, h) => literal_ty,
+            Some(h)
+                if !h.is_untyped()
+                    && (h != Ty::TOP || !ignores_top)
+                    && self.subtyper_preserving().check(literal_ty, h) =>
+            {
+                self.unwrap_optional(h)
+            }
             _ => self.widen_literal_to_base(literal_ty),
         }
     }
@@ -4105,8 +4311,9 @@ impl<'env> TypeChecker<'env> {
             // re-driving the side effects.
             Node::SingletonClassNode { .. } => Ty::NIL,
             Node::NilNode { .. } => Ty::NIL,
-            // Steep's `:true, :false` arm: keep the literal only under a
-            // hint that accepts it; otherwise `bool`. The third case
+            // Steep's `:true, :false` arm: `unwrap(hint)` under a hint
+            // that accepts the literal and is neither untyped nor `top`;
+            // otherwise `bool`. The third case
             // (condition context keeps the literal) is applied by the
             // `&&` / `||` arms via `condition_bool_literal`, since a
             // condition flag is not threaded through `check_node`.
@@ -4425,19 +4632,7 @@ impl<'env> TypeChecker<'env> {
             Node::SelfNode { .. } => self.self_receiver_type(),
             Node::CallNode { .. } => {
                 if let Some(call) = node.as_call_node() {
-                    // Same cache short-circuit as check_node's CallNode
-                    // arm. `infer_type` is `&self`, so it never writes to
-                    // the cache; it only reads what an earlier check_node
-                    // pass already stored.
-                    if let Some(key) = self.try_pure_key(&call.as_node())
-                        && let Some(ty) = self
-                            .lookup_pure_overlay(&key)
-                            .or_else(|| self.ctx.pure_call_env().get(&key))
-                    {
-                        return ty;
-                    }
-                    let resolved = ResolvedCall::resolve(self, &call);
-                    self.infer_call_return_type(&call, hint, &resolved)
+                    self.infer_call(&call, hint, self.try_pure_key(node))
                 } else {
                     Ty::UNTYPED
                 }
@@ -4502,7 +4697,7 @@ impl<'env> TypeChecker<'env> {
             Node::ConstantReadNode { .. } => {
                 if let Some(constant) = node.as_constant_read_node() {
                     let name_str = String::from_utf8_lossy(constant.name().as_slice()).to_string();
-                    self.resolve_constant_read(&name_str, node)
+                    self.resolve_constant_read(&name_str)
                 } else {
                     Ty::UNTYPED
                 }
@@ -4876,12 +5071,16 @@ impl<'env> TypeChecker<'env> {
                 let left = or.left();
                 let left_ty = self.infer_type(&left, None);
                 let left_ty = self.condition_bool_literal(&left).unwrap_or(left_ty);
-                let right_hint = partition_truthy(left_ty, self.env.types());
+                let (left_truthy, left_falsy) = partition_union(left_ty, self.env);
                 let right = or.right();
-                let right_ty = self.infer_type(&right, right_hint);
+                let right_ty = self.infer_type(&right, left_truthy);
                 let right_ty = self.condition_bool_literal(&right).unwrap_or(right_ty);
-                let arm_truthy = partition_truthy(left_ty, self.env.types()).unwrap_or(Ty::BOTTOM);
-                union_of(arm_truthy, right_ty, self.env.types())
+                match (left_truthy, left_falsy) {
+                    (Some(truthy), Some(_)) => self.join_reachable_logic_arms(truthy, right_ty),
+                    (truthy, _) => {
+                        union_of(truthy.unwrap_or(Ty::BOTTOM), right_ty, self.env.types())
+                    }
+                }
             }
             Node::AndNode { .. } => {
                 let and = match node.as_and_node() {
@@ -4894,8 +5093,11 @@ impl<'env> TypeChecker<'env> {
                 let right = and.right();
                 let right_ty = self.infer_type(&right, hint);
                 let right_ty = self.condition_bool_literal(&right).unwrap_or(right_ty);
-                let arm_falsy = partition_falsy(left_ty, self.env.types()).unwrap_or(Ty::BOTTOM);
-                union_of(arm_falsy, right_ty, self.env.types())
+                let (left_truthy, left_falsy) = partition_union(left_ty, self.env);
+                match (left_truthy, left_falsy) {
+                    (Some(_), Some(falsy)) => self.join_reachable_logic_arms(falsy, right_ty),
+                    (_, falsy) => union_of(falsy.unwrap_or(Ty::BOTTOM), right_ty, self.env.types()),
+                }
             }
             // `yield`'s value is the current method's block return type
             // (`ctx.method_type().block`, the same source
@@ -4933,9 +5135,14 @@ impl<'env> TypeChecker<'env> {
             // checks (subtype gate against the declared type, Unknown*
             // emission) fire via `check_node` / the Visit override and
             // are not duplicated here.
+            //
+            // The RHS is typed under the ivar's declared type, not the hint
+            // around the write: Steep `ivasgn` synthesizes it with
+            // `hint: context.type_env[name]` (`type_construction.rb:836`),
+            // as `check_instance_variable_write` does in the walk.
             Node::InstanceVariableWriteNode { .. } => node
                 .as_instance_variable_write_node()
-                .map(|w| self.infer_type(&w.value(), hint))
+                .map(|w| self.infer_type(&w.value(), self.declared_ivar_type(w.name().as_slice())))
                 .unwrap_or(Ty::UNTYPED),
             // ivar `||=` / `&&=` / `+=` in value position. The Steep
             // `or_asgn` / `op_asgn` desugar (`type_construction.rb`
@@ -5889,28 +6096,29 @@ impl<'env> TypeChecker<'env> {
                     self.collect_call_site_bindings(overload, arguments, bindings);
 
                 // Phase B (ADR-0012, hint-driven instantiation): the context
-                // hint (e.g. a trailing `#:` assertion on the call expression)
-                // is the caller's stated intent. Unify it against the
-                // overload's return type and let the resulting bindings
-                // override the seed-derived ones for *method-level* type
-                // params only — receiver-side bindings retain their
-                // precedence over the call site.
-                //
-                // The override is direct (not via `Constraints::add_upper`)
-                // because by this point `collect_call_site_bindings` has
-                // already bound those params from the seed args, so the
-                // Constraints unbound-only path would skip them.
-                //
-                // Subtype gate: only override when the hint and seed agree
-                // (one is a subtype of the other). When they conflict
-                // (e.g. `Animal` from arg vs `Dog` from hint with no
-                // subtype relation), keep the seed binding so the existing
-                // argument-vs-param check downstream still surfaces a
-                // mismatch. A dedicated `Ruby::UnsatisfiableConstraint`
-                // diagnostic lives in a separate todo and will replace this
-                // silent fallback with a proper report.
-                if let Some(hint_ty) = hint {
-                    let call_offset = call.map(|c| c.location().start_offset());
+                // hint (a trailing `#:` assertion, the truthy left side of
+                // `||`, a method's declared return type, ...) feeds the
+                // method-level type params only where Steep's
+                // `try_method_type` lets it: see `hint_drives_instantiation`.
+                // Otherwise the hint is dropped silently and the seed-derived
+                // bindings stand, so a hint that merely disagrees with the
+                // arguments neither rewrites the result type nor reports
+                // `UnsatisfiableConstraint`.
+                if let Some(hint_ty) = hint
+                    && self.hint_drives_instantiation(
+                        overload,
+                        hint_ty,
+                        call.is_some_and(|c| super::calls::CallSite::Call(c).has_block_literal()),
+                        receiver_type,
+                        bindings,
+                    )
+                {
+                    // The override always applies; the report comes only
+                    // from the check walk typing this very call, so a
+                    // read-only re-inference of it doesn't repeat it.
+                    let call_offset = call
+                        .filter(|c| self.check_walk_types_call(c))
+                        .map(|c| c.location().start_offset());
                     self.apply_hint_override(overload, hint_ty, &mut local_bindings, call_offset);
                 }
 
@@ -5923,6 +6131,7 @@ impl<'env> TypeChecker<'env> {
                     self.augment_bindings_with_block_body(
                         super::calls::CallSite::Call(call),
                         overload,
+                        receiver_type,
                         &mut local_bindings,
                     );
                 }
@@ -6069,6 +6278,7 @@ impl<'env> TypeChecker<'env> {
         &self,
         call: super::calls::CallSite<'_, 'pr>,
         overload: &crate::types::MethodType,
+        receiver_type: Ty,
         local_bindings: &mut FxHashMap<crate::type_param::TypeVarKey, Ty>,
     ) {
         let Some(block_arg) = call.block() else {
@@ -6089,9 +6299,15 @@ impl<'env> TypeChecker<'env> {
             return;
         }
 
-        // Substitute block param types with current bindings so the overlay
-        // binds block names to concrete types (e.g. `T -> Integer`).
-        let subst = Substitution::from_mapping(local_bindings.clone());
+        // Resolve the block the way the walk does (`resolve_block_for_overload`):
+        // current bindings plus the receiver, so block params bind concrete
+        // types (`T -> Integer`) and `self` / `instance` / `class` in the
+        // block type mean the receiver, not the enclosing self. The return
+        // type stays on the unsubstituted `expected_block` so the unbound
+        // `X` is still a `TypeVariable` when unified below.
+        let resolved_block = self
+            .substitution_for_call_receiver(receiver_type, local_bindings.clone())
+            .apply_block(expected_block, self.env.types());
 
         // `&:sym` block pass: no block body to infer — Symbol#to_proc
         // semantics resolve the symbol's method on the substituted one-arg
@@ -6102,10 +6318,9 @@ impl<'env> TypeChecker<'env> {
             let Some((name, _)) = super::calls::block_pass_symbol(&block_arg) else {
                 return;
             };
-            let Some(param_ty) = super::calls::symbol_to_proc_one_arg_param(expected_block) else {
+            let Some(param_ty) = super::calls::symbol_to_proc_one_arg_param(&resolved_block) else {
                 return;
             };
-            let param_ty = subst.apply(param_ty, self.env.types());
             let sym = self.env.names().intern_symbol(&name);
             let super::calls::SymbolToProcResolution::Resolved(ret) =
                 self.symbol_to_proc_return_type(param_ty, sym)
@@ -6120,15 +6335,6 @@ impl<'env> TypeChecker<'env> {
             return;
         };
         let Some(body) = block.body() else { return };
-
-        let expected_params: Vec<Ty> = expected_block
-            .flat_positionals()
-            .iter()
-            .map(|&p| subst.apply(p, self.env.types()))
-            .collect();
-        let expected_rest = expected_block
-            .rest_positional()
-            .map(|p| subst.apply(p, self.env.types()));
 
         // Build overlay by walking the block's AST parameter list and pairing
         // each required param with the corresponding substituted expected type.
@@ -6147,7 +6353,7 @@ impl<'env> TypeChecker<'env> {
                     rest_present: params.rest().is_some(),
                 };
                 let (param_types, rest_ty) =
-                    self.block_param_types(&expected_params, expected_rest, shape);
+                    self.unresolved_or_block_param_types(Some(&resolved_block), shape);
                 for (index, param) in requireds.iter().enumerate() {
                     if let Some(required) = param.as_required_parameter_node()
                         && let Some(Some(expected_type)) = param_types.get(index).copied()
@@ -6183,9 +6389,8 @@ impl<'env> TypeChecker<'env> {
                 // the block-param binding paths from drifting again (this bug
                 // was exactly that drift — augment lacked the arm). UNTYPED when
                 // the block yields nothing mirrors `setup_block_scope`.
-                let (param_types, _) = self.block_param_types(
-                    &expected_params,
-                    expected_rest,
+                let (param_types, _) = self.unresolved_or_block_param_types(
+                    Some(&resolved_block),
                     BlockParamShape::requireds(1),
                 );
                 let it_ty = param_types
@@ -6201,9 +6406,8 @@ impl<'env> TypeChecker<'env> {
                 // count, so `block_param_types` gives `|x|` semantics at 1 and
                 // auto-splat at >= 2 with no new rule.
                 let count = numbered.maximum() as usize;
-                let (param_types, _) = self.block_param_types(
-                    &expected_params,
-                    expected_rest,
+                let (param_types, _) = self.unresolved_or_block_param_types(
+                    Some(&resolved_block),
                     BlockParamShape::requireds(count),
                 );
                 for index in 0..count {
@@ -6218,9 +6422,21 @@ impl<'env> TypeChecker<'env> {
             }
         }
 
-        // Infer the block body under the overlay. The overlay is popped
-        // unconditionally by `with_overlay` — no state leaks.
-        let body_ty = self.with_overlay(overlay, |checker| checker.infer_type(&body, None));
+        // Infer the block body under the overlay and the block's
+        // `[self: T]` (the walk sets it in `setup_block_scope`). Both are
+        // popped unconditionally by their helpers — no state leaks. Under a
+        // `[self: T]` the opaque `SELF_TYPE` in the body type means `T`, so
+        // it is frozen before the override is popped; outside, it would be
+        // read as the enclosing self.
+        let rebinds_self = resolved_block.self_type.is_some();
+        let body_ty = self.with_readonly_self(resolved_block.self_type, |checker| {
+            let ty = checker.with_overlay(overlay, |checker| checker.infer_type(&body, None));
+            if rebinds_self {
+                checker.freeze_self_type_for_lvar_binding(ty)
+            } else {
+                ty
+            }
+        });
         self.bind_unbound_from_block_return(expected_block, body_ty, unbound, local_bindings);
     }
 
@@ -6264,38 +6480,64 @@ impl<'env> TypeChecker<'env> {
         }
     }
 
-    /// Structural unification of a parameter type against an argument type,
-    /// collecting bindings for unbound `TypeVariable`s found on the param
-    /// side. Corresponds to the inverse of `substitute_type_vars`: the
-    /// latter applies known bindings, the former produces them.
+    /// Whether the call-site hint takes part in instantiating `overload`'s
+    /// method-level type params. Port of the gate in Steep's
+    /// `TypeConstruction#try_method_type` (`if block_params` →
+    /// `if method_type.block` → `if hint && !fvs.empty?` →
+    /// `check_relation(sub_type: return_type, super_type: hint)`):
     ///
-    /// Does not fail or mutate outside `bindings`; when structures do not
-    /// line up (different class names, mismatched arities, Union on either
-    /// side, etc.) the call is a no-op, leaving argument type-checking to
-    /// the subtype checker.
-    /// Phase B (ADR-0012): override `bindings` for `overload`'s method-level
-    /// type params with the bindings produced by unifying its return type
-    /// against `hint_ty`. Three-case gate per param, modelling Steep's
-    /// `seed <: U <: hint` constraint solver:
+    /// - the call passes a block literal and the overload accepts a block;
+    /// - the overload has method-level type params (Steep's `fvs` of the
+    ///   return type; params absent from the return type bind nothing when
+    ///   unified against the hint, so the narrower check is not repeated);
+    /// - the return type, with the receiver's type args substituted and the
+    ///   method-level params left free, is a subtype of the hint.
     ///
-    /// 1. `hint_val` is itself `untyped` → no-op. An `untyped` hint
-    ///    carries no narrowing information, and the gradual `<: untyped`
-    ///    rule would otherwise pass any seed through and silently erase
-    ///    diagnostics that the seed-bound binding would have produced.
-    /// 2. seed is unbound, or seed's structure transitively contains
-    ///    `untyped` (e.g. `Array[untyped]` from an empty array literal) →
-    ///    override. The seed has no concrete commitment; the hint is the
-    ///    only source of intent, matching Steep's choice of `U = hint`
-    ///    when the lower bound is `bot`/`untyped`.
-    /// 3. both seed and hint are concrete → keep the seed. Steep's
-    ///    solver picks the lower bound as `U`'s assigned type; widening
-    ///    to the hint would silently mask specific-type errors. Genuine
-    ///    conflicts (`Animal` seed vs `Dog` hint with no gradual hole)
-    ///    fall through to the downstream argument-vs-param check.
+    /// The last check sees the whole return type, so a receiver-fixed member
+    /// that cannot meet the hint (`V = String` in `V | X` against `Integer`)
+    /// drops the hint even though `X` alone could take it.
+    pub(super) fn hint_drives_instantiation(
+        &self,
+        overload: &crate::types::MethodType,
+        hint_ty: Ty,
+        call_has_block_literal: bool,
+        receiver_type: Ty,
+        recv_bindings: &FxHashMap<crate::type_param::TypeVarKey, Ty>,
+    ) -> bool {
+        if !call_has_block_literal || overload.block.is_none() || overload.type_params.is_empty() {
+            return false;
+        }
+        // Free method-level params are left as `TypeVariable`, which the
+        // default subtyper matches as a wildcard — the counterpart of
+        // Steep's constraint-collecting `check_relation` succeeding with the
+        // params still unknown.
+        let mut recv_only = recv_bindings.clone();
+        for p in &overload.type_params {
+            recv_only.remove(&p.name);
+        }
+        let return_ty = self
+            .substitution_for_call_receiver(receiver_type, recv_only)
+            .apply(overload.return_type(), self.env.types());
+        self.subtyper().check(return_ty, hint_ty)
+    }
+
+    /// Phase B (ADR-0012): unify `overload`'s return type against
+    /// `hint_ty` and fold the result into `bindings` for its method-level
+    /// type params. Callers run this only when
+    /// [`Self::hint_drives_instantiation`] holds. Per param, with `seed` the
+    /// argument-derived binding (Steep's lower bound) and the hint binding
+    /// as the upper bound:
     ///
-    /// A dedicated `Ruby::UnsatisfiableConstraint` diagnostic (separate
-    /// todo) will eventually report case-3 conflicts directly.
-    /// Phase B (ADR-0012) hint override with conflict detection.
+    /// 1. hint is `untyped` → no-op. The gradual `<: untyped` rule would
+    ///    pass any seed and erase diagnostics the seed would have produced.
+    /// 2. seed unbound → take the hint (Steep: lower bound `bot`).
+    /// 3. seed and hint unrelated in both directions → report
+    ///    `Ruby::UnsatisfiableConstraint` (Steep's `apply_solution`) and
+    ///    take the hint so later inference follows the stated type.
+    /// 4. compatible and seed transitively contains `untyped`
+    ///    (`Array[untyped]` from `[]`) → take the hint.
+    /// 5. compatible and seed concrete → keep the seed; widening to the
+    ///    hint would mask errors in the body.
     ///
     /// `call_offset`: byte offset of the call expression start, used to
     /// position the `UnsatisfiableConstraint` diagnostic. `None` suppresses
@@ -6346,7 +6588,7 @@ impl<'env> TypeChecker<'env> {
                         if let Some(offset) = call_offset {
                             use crate::diagnostic::{Diagnostic, DiagnosticKind};
                             let position = self.offset_to_location(offset);
-                            let type_param_str = self.env.names().resolve(name.raw);
+                            let type_param_str = self.env.names().resolve(name.raw).to_string();
                             self.push_diagnostic(Diagnostic {
                                 scope: None,
                                 location: position,
@@ -6467,7 +6709,10 @@ impl<'env> TypeChecker<'env> {
         // otherwise recurse forever. Counts every unify frame (a type
         // expression's own nesting rarely exceeds ~10); one interface hop
         // costs about two frames, so 32 keeps the interface path at the 16
-        // hops its former dedicated cap allowed.
+        // hops its former dedicated cap allowed. Like the subtype abort
+        // limit, a cache hit (`interface_unify_cache`) does not recurse, so
+        // reaching this cap depends on cache state (read from code, not
+        // reproduced); accepted (ADR-0034).
         const MAX_UNIFY_DEPTH: u32 = 32;
         if self.unify_depth.get() >= MAX_UNIFY_DEPTH {
             self.unify_depth_cap_hit.set(true);
@@ -6519,6 +6764,8 @@ impl<'env> TypeChecker<'env> {
         // `Array[Integer] | Array[String]` binds `U = Integer | String`;
         // `Array[U]?` against `Array[Integer] | nil` lets the `nil` member
         // fall into the `Optional` arm's `Nil` case and contribute nothing.
+        // `T?` is a union in Steep, so it splits into `T` and `nil` too:
+        // `nil | U` against `Integer?` binds `U = Integer`.
         // Runs before the Record-on-param early return so a record param
         // sees each member, and before widening (which never yields a
         // union) so each member is widened on its own re-entry. A bare
@@ -6527,13 +6774,21 @@ impl<'env> TypeChecker<'env> {
         // same flattened result, while decomposing it re-interned the
         // union on every call (`push_flat_union_members` / `intern` in
         // `sample` self-time).
-        if !matches!(param_t, Type::TypeVariable { .. })
-            && let Type::Union(a_members) = types_tbl.resolve(arg)
-        {
-            for &m in a_members.iter() {
-                self.unify_into_bindings(param, m, bindings, mode);
+        if !matches!(param_t, Type::TypeVariable { .. }) {
+            match types_tbl.resolve(arg) {
+                Type::Union(a_members) => {
+                    for &m in a_members.iter() {
+                        self.unify_into_bindings(param, m, bindings, mode);
+                    }
+                    return;
+                }
+                Type::Optional(a_inner) => {
+                    self.unify_into_bindings(param, *a_inner, bindings, mode);
+                    self.unify_into_bindings(param, Ty::NIL, bindings, mode);
+                    return;
+                }
+                _ => {}
             }
-            return;
         }
 
         // Record-on-param: unify field-wise without widening arg → Hash,
@@ -6597,33 +6852,38 @@ impl<'env> TypeChecker<'env> {
                     }
                 }
             }
-            // Param-side union: every member is unified against the arg and
-            // the leaves merge through `union_merge_bindings`. Steep's
-            // sup-side `Any` rule instead takes the first member (in
-            // declaration order) that passes the subtype check, which can
-            // differ when two members bind the same var to different types
-            // (`Array[U] | _SizeX[U]` against `Array[String]`: Steep binds
-            // `String`, this arm binds `String | Integer`). unify is a
-            // binding extractor with no subtype check, so the merge is the
-            // order-independent over-approximation chosen deliberately
-            // (todo 2026-09-25 unify_type_var_through_alias_and_union).
-            Type::Union(p_members) => {
-                for &m in p_members.iter() {
-                    self.unify_into_bindings(m, arg_widened, bindings, mode);
+            // Arg unification checks `arg <: param`, so a param union is
+            // the sup side: Steep's `Any`. Hint unification checks
+            // `return <: hint`, so the same union is the sub side: Steep's
+            // `All`, and every member's bindings are merged (`String | X`
+            // against a `String` hint must still give `X` the hint).
+            // The unwidened arg goes to `Any`: `false` must hold at a
+            // `false` member, not reach it as `FalseClass`. Each member's
+            // own unify re-widens.
+            Type::Union(p_members) => match mode {
+                UnifyMode::WidenLeaves => {
+                    self.unify_param_union(p_members, arg, bindings, mode);
                 }
-            }
+                UnifyMode::KeepShape => {
+                    for &m in p_members.iter() {
+                        self.unify_into_bindings(m, arg_widened, bindings, mode);
+                    }
+                }
+            },
+            // An `Optional` arg was split by the arg-side union rule above,
+            // so only its members reach here.
             Type::Optional(p_inner) => match types_tbl.resolve(arg_widened) {
-                Type::Optional(a_inner) => {
-                    self.unify_into_bindings(*p_inner, *a_inner, bindings, mode);
-                }
                 Type::Nil => {}
                 _ => {
                     // e.g. `String?` param receiving a `::String` arg.
                     self.unify_into_bindings(*p_inner, arg_widened, bindings, mode);
                 }
             },
+            // Matched against the unwidened `arg`: `arg_widened` turns a
+            // tuple into `Array[...]`, which never matches here. Each member
+            // still widens on its own re-entry (`:a` binds as `Symbol`).
             Type::Tuple(p_members) => {
-                if let Type::Tuple(a_members) = types_tbl.resolve(arg_widened)
+                if let Type::Tuple(a_members) = types_tbl.resolve(arg)
                     && p_members.len() == a_members.len()
                 {
                     for (&p, &a) in p_members.iter().zip(a_members.iter()) {
@@ -6673,10 +6933,16 @@ impl<'env> TypeChecker<'env> {
                 // through type-var leaf merges, so running it against a
                 // fresh map and merging the delta is equivalent to running
                 // it in place.
+                //
+                // Passes the unwidened `arg`: a tuple / record / literal
+                // keeps itself as `self` in the widened class's methods
+                // (see `unify_interface_into_bindings`), so two tuples that
+                // widen to the same `Array[...]` bind differently and must
+                // not share a memo entry.
                 let key = (
                     *iface_name,
                     iface_args.clone(),
-                    arg_widened,
+                    arg,
                     matches!(mode, UnifyMode::WidenLeaves),
                 );
                 let delta = match self.env.cached_interface_unify(&key) {
@@ -6684,33 +6950,101 @@ impl<'env> TypeChecker<'env> {
                     None => {
                         let mut fresh = FxHashMap::default();
                         let outer_hit = self.unify_depth_cap_hit.replace(false);
+                        self.env.begin_capture();
                         self.unify_interface_into_bindings(
                             *iface_name,
                             iface_args,
-                            arg_widened,
+                            arg,
                             &mut fresh,
                             mode,
                         );
+                        let consultations = self.env.end_capture();
                         let hit = self.unify_depth_cap_hit.get();
                         self.unify_depth_cap_hit.set(outer_hit || hit);
                         let d: Vec<_> = fresh.into_iter().collect();
                         // A result truncated by the depth cap depends on
                         // the caller's depth, so it must not be shared.
                         if !hit {
-                            self.env.store_interface_unify(key, d.clone());
+                            self.env
+                                .store_interface_unify(key, d.clone(), consultations);
                         }
                         d
                     }
                 };
-                for (k, v) in delta {
-                    let merged = match bindings.get(&k).copied() {
-                        Some(existing) => self.union_merge_bindings(existing, v),
-                        None => v,
-                    };
-                    bindings.insert(k, merged);
-                }
+                self.merge_bindings(bindings, delta);
             }
             _ => {}
+        }
+    }
+
+    /// Param-side union, ported from Steep's sup-side `Any` rule
+    /// (`subtyping/check.rb`): members are tried in `hole_path` order and
+    /// the first one that holds decides the bindings (`Any#add` skips the
+    /// rest once one succeeds). Var-free members come first, then members
+    /// whose shortest path to a type var is longer (`Array[U]` before a
+    /// bare `U`); ties keep declaration order, as Steep was measured to.
+    /// That is what lets `nil | false | U` drop `nil` (the `nil` member
+    /// holds before `U` sees it) and `Array[U] | U` take the element type.
+    ///
+    /// A var-free member holds when the arg is its subtype. A member with
+    /// a type var holds when the arg is a subtype of the member with the
+    /// bindings it produced substituted in; type vars it left unbound stay
+    /// wildcards in the check. When no member holds the call is ill-typed
+    /// either way; every member's bindings are merged so `U` still has a
+    /// value and the argument check downstream reports the mismatch.
+    fn unify_param_union(
+        &self,
+        p_members: &[Ty],
+        arg: Ty,
+        bindings: &mut FxHashMap<crate::type_param::TypeVarKey, Ty>,
+        mode: UnifyMode,
+    ) {
+        let types_tbl = self.env.types();
+        let mut ordered: Vec<(Option<usize>, Ty)> = p_members
+            .iter()
+            .map(|&m| (crate::types::hole_path_len(m, types_tbl), m))
+            .collect();
+        // A union without type vars binds nothing.
+        if ordered.iter().all(|(path, _)| path.is_none()) {
+            return;
+        }
+        ordered.sort_by_key(|(path, _)| path.map_or(0, |n| usize::MAX - n));
+
+        let subtyper = self.subtyper();
+        for &(path, member) in &ordered {
+            if path.is_none() {
+                if subtyper.check(arg, member) {
+                    return;
+                }
+                continue;
+            }
+            let mut fresh = FxHashMap::default();
+            self.unify_into_bindings(member, arg, &mut fresh, mode);
+            let substituted = crate::substitution::Substitution::from_mapping(fresh.clone())
+                .apply(member, types_tbl);
+            if subtyper.check(arg, substituted) {
+                self.merge_bindings(bindings, fresh);
+                return;
+            }
+        }
+        for &(path, member) in &ordered {
+            if path.is_some() {
+                self.unify_into_bindings(member, arg, bindings, mode);
+            }
+        }
+    }
+
+    fn merge_bindings(
+        &self,
+        bindings: &mut FxHashMap<crate::type_param::TypeVarKey, Ty>,
+        delta: impl IntoIterator<Item = (crate::type_param::TypeVarKey, Ty)>,
+    ) {
+        for (k, v) in delta {
+            let merged = match bindings.get(&k).copied() {
+                Some(existing) => self.union_merge_bindings(existing, v),
+                None => v,
+            };
+            bindings.insert(k, merged);
         }
     }
 
@@ -6778,6 +7112,23 @@ impl<'env> TypeChecker<'env> {
                     false,
                     false,
                 ),
+                // Structural types dispatch through the class they widen
+                // to; `arg` itself stays the `self` substituted below
+                // (`check_interface_conformance` makes the same split).
+                Type::Literal(_) | Type::Tuple(_) | Type::Record { .. } => {
+                    let widened = match types_tbl.resolve(arg) {
+                        Type::Literal(lit) => self
+                            .env
+                            .class_instance_type(*lit.class_typename(self.env.names().builtins())),
+                        Type::Tuple(members) => self.widen_tuple_to_array(members),
+                        Type::Record { fields } => self.widen_record_to_hash(fields),
+                        _ => return,
+                    };
+                    let Type::ClassInstance { name, args } = types_tbl.resolve(widened) else {
+                        return;
+                    };
+                    (*name, args.clone(), false, false)
+                }
                 // No method-dispatch shape to unify against -- best-effort,
                 // no binding.
                 _ => return,
@@ -7509,7 +7860,7 @@ impl<'env> TypeChecker<'env> {
     ///   object). Falls back to `UNTYPED` if that class is not loaded (e.g.,
     ///   tests without core RBS).
     pub(super) fn current_self_type(&self) -> Ty {
-        if let Some(override_ty) = self.lambda_self_stack.borrow().last().copied() {
+        if let Some(override_ty) = self.readonly_self_stack.borrow().last().copied() {
             return override_ty;
         }
         if let Some(override_ty) = self.ctx.current_self_type_override() {
@@ -7518,19 +7869,21 @@ impl<'env> TypeChecker<'env> {
         self.lexical_self_type()
     }
 
-    /// Run `f` with a hinted lambda's `[self: T]` in effect for the read-only
-    /// walk (`lambda_literal_type` is `&self`, so it cannot push the
-    /// `Context` override the side-effecting `check_lambda_node` uses).
-    /// `SELF_TYPE` is concretized like the block path does. The stack is
+    /// Run `f` with a `[self: T]` in effect for a read-only walk: a hinted
+    /// lambda's (`lambda_literal_type`) or a block's whose body is inferred
+    /// for its value (`augment_bindings_with_block_body`). Both are `&self`,
+    /// so they cannot push the `Context` override the side-effecting
+    /// `check_lambda_node` / `setup_block_scope` use. `SELF_TYPE` is
+    /// concretized like `setup_block_scope` does. The stack is
     /// innermost-wins and popped unconditionally, mirroring `with_overlay`.
-    fn with_lambda_self<R>(&self, self_type: Option<Ty>, f: impl FnOnce(&Self) -> R) -> R {
+    fn with_readonly_self<R>(&self, self_type: Option<Ty>, f: impl FnOnce(&Self) -> R) -> R {
         let Some(self_type) = self_type else {
             return f(self);
         };
         let concrete = self.concrete_self_for_lookup(self_type);
-        self.lambda_self_stack.borrow_mut().push(concrete);
+        self.readonly_self_stack.borrow_mut().push(concrete);
         let result = f(self);
-        self.lambda_self_stack.borrow_mut().pop();
+        self.readonly_self_stack.borrow_mut().pop();
         result
     }
 
@@ -7553,6 +7906,19 @@ impl<'env> TypeChecker<'env> {
     }
 
     pub(super) fn lexical_self_type(&self) -> Ty {
+        let class = self.ctx.current_class_typename().copied();
+        let singleton =
+            class.is_some() && (self.ctx.method_name().is_none() || self.ctx.is_singleton_method());
+        let key = (class, singleton);
+        if let Some(&ty) = self.lexical_self_memo.borrow().get(&key) {
+            return ty;
+        }
+        let ty = self.compute_lexical_self_type();
+        self.lexical_self_memo.borrow_mut().insert(key, ty);
+        ty
+    }
+
+    fn compute_lexical_self_type(&self) -> Ty {
         let Some(name) = self.ctx.current_class_typename() else {
             return self.env.class_instance_type(
                 self.env
@@ -7564,9 +7930,9 @@ impl<'env> TypeChecker<'env> {
         // re-parses a path string per reference. The legacy guard is kept:
         // a name RBS never declared in any category still yields `untyped`
         // self. The old guard checked this via a `Name` (String) intern
-        // lookup, which happened to hit whenever `build_lowering_maps`
-        // (definition/type_lowering.rs) had pre-interned the qualified path
-        // — that walk covers `class_decls`, `interface_decls`,
+        // lookup, which happened to hit whenever the (since removed)
+        // `Name`-keyed lowering table had pre-interned the qualified path
+        // — that walk covered `class_decls`, `interface_decls`,
         // `type_alias_decls`, `constant_decls` and `class_alias_decls`.
         // Checking those five id-keyed maps directly reproduces the same
         // "declared somewhere" semantics without the String round-trip; a
@@ -7726,6 +8092,9 @@ impl<'env> TypeChecker<'env> {
         if let Some(lambda) = node.as_lambda_node() {
             let param_tys = self.lambda_walk_param_types(&lambda, hint);
             let lambda_hint = self.lambda_hint_proc(hint);
+            let body_hint = lambda_hint
+                .as_ref()
+                .and_then(|h| self.lambda_body_hint(&h.function));
             let overlay = self.lambda_param_overlay(
                 lambda.parameters(),
                 &param_tys,
@@ -7747,12 +8116,17 @@ impl<'env> TypeChecker<'env> {
             // the lambda's own scope, so the walk belongs inside the
             // pushed scope and after the param bindings — a later
             // default can read an earlier param (`->(a, b = a.foo) {}`).
-            if let Some(params_node) = lambda.parameters() {
-                self.visit(&params_node);
-            }
-            if let Some(body) = lambda.body() {
-                self.check_node(&body, None);
-            }
+            // The hint's return type reaches the body's tail and any
+            // `next` that exits this lambda (Steep `type_lambda`'s
+            // `return_hint`); an unhinted lambda clears an outer one.
+            self.with_next_hint(body_hint, |checker| {
+                if let Some(params_node) = lambda.parameters() {
+                    checker.visit(&params_node);
+                }
+                if let Some(body) = lambda.body() {
+                    checker.check_node(&body, body_hint);
+                }
+            });
             self.ctx.pop_scope();
         }
         self.infer_type(node, hint)
@@ -7796,9 +8170,13 @@ impl<'env> TypeChecker<'env> {
                 &function.required_positionals,
                 Some(proc_ty),
             );
+            // Same tail hint as the walk (`check_lambda_node`), so the
+            // lambda's type — what an argument check compares — is the
+            // body's type under the hint.
+            let body_hint = self.lambda_body_hint(&function);
             let actual_return = match lambda.body() {
-                Some(body) => self.with_lambda_self(self_type, |checker| {
-                    checker.with_overlay(overlay, |checker| checker.infer_type(&body, None))
+                Some(body) => self.with_readonly_self(self_type, |checker| {
+                    checker.with_overlay(overlay, |checker| checker.infer_type(&body, body_hint))
                 }),
                 None => Ty::NIL,
             };
@@ -7832,6 +8210,34 @@ impl<'env> TypeChecker<'env> {
 
         self.env
             .class_instance_type(self.env.names().builtins().proc)
+    }
+
+    /// The hint a hinted lambda's body tail (and its `next` values) is
+    /// typed under: the hint Proc's return type, unless it is untyped,
+    /// `void`, or still holds a type variable — the same rule
+    /// `check_block` applies to a block's declared return type.
+    fn lambda_body_hint(&self, function: &Function) -> Option<Ty> {
+        let ret = function.return_type;
+        if ret.is_untyped()
+            || ret == Ty::VOID
+            || crate::types::contains_type_variable(ret, self.env.types())
+        {
+            return None;
+        }
+        Some(ret)
+    }
+
+    /// Run `f` with `next_hint` set to `hint`, restoring the outer value
+    /// afterwards (see the field doc).
+    pub(super) fn with_next_hint<R>(
+        &mut self,
+        hint: Option<Ty>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = std::mem::replace(&mut self.next_hint, hint);
+        let result = f(self);
+        self.next_hint = saved;
+        result
     }
 
     /// Pick the Proc type a lambda literal is checked against, from a call
@@ -8084,7 +8490,21 @@ impl<'env> TypeChecker<'env> {
     /// no-op for receivers without nil and preserves the input when the
     /// receiver is pure nil so the existing `::NilClass` diagnostic stays
     /// (bot-label parity with Steep is a separate todo).
-    pub(super) fn infer_receiver_type<'pr>(&self, call: &CallNode<'pr>) -> Ty {
+    /// `infer_type` of a call, with `key` its `try_pure_key`. Same cache
+    /// short-circuit as check_node's CallNode arm. `infer_type` is
+    /// `&self`, so it never writes to the cache; it only reads what an
+    /// earlier check_node pass already stored. The key is handed on to
+    /// the receiver (`OwnKey`), so inferring a chain builds each link's
+    /// key once.
+    fn infer_call<'pr>(&self, call: &CallNode<'pr>, hint: Option<Ty>, key: Option<PureKey>) -> Ty {
+        if let Some(ty) = self.pure_call_cached(key.as_ref()) {
+            return ty;
+        }
+        let resolved = ResolvedCall::resolve(self, call, OwnKey::Built(key));
+        self.infer_call_return_type(call, hint, &resolved)
+    }
+
+    pub(super) fn infer_receiver_type<'pr>(&self, call: &CallNode<'pr>, own_key: OwnKey) -> Ty {
         if let Some(receiver) = call.receiver() {
             let ty = if receiver.as_lambda_node().is_some() {
                 self.env
@@ -8098,6 +8518,8 @@ impl<'env> TypeChecker<'env> {
                 // inferred type and the assertion is silently dropped at
                 // the very position it exists to override.
                 asserted
+            } else if let Some(inner) = receiver.as_call_node() {
+                self.infer_call(&inner, None, self.receiver_pure_key(call, own_key))
             } else {
                 self.infer_type(&receiver, None)
             };
@@ -8120,8 +8542,12 @@ impl<'env> TypeChecker<'env> {
     /// opaque `SELF_TYPE`.
     pub(super) fn receiver_type_for_site<'pr>(&self, site: super::calls::CallSite<'_, 'pr>) -> Ty {
         match site {
-            super::calls::CallSite::Call(c) => self.infer_receiver_type(c),
-            super::calls::CallSite::Super(_) => self.current_self_type(),
+            super::calls::CallSite::Call(c) => self
+                .checked_receiver_type(c)
+                .unwrap_or_else(|| self.infer_receiver_type(c, OwnKey::Unbuilt)),
+            super::calls::CallSite::Super(_) | super::calls::CallSite::ForwardingSuper(_) => {
+                self.current_self_type()
+            }
         }
     }
 
@@ -8137,7 +8563,7 @@ impl<'env> TypeChecker<'env> {
             super::calls::CallSite::Call(c) => {
                 String::from_utf8_lossy(c.name().as_slice()).to_string()
             }
-            super::calls::CallSite::Super(_) => self
+            super::calls::CallSite::Super(_) | super::calls::CallSite::ForwardingSuper(_) => self
                 .ctx
                 .method_name()
                 .map(|s| s.to_string())
@@ -8194,15 +8620,14 @@ impl<'env> TypeChecker<'env> {
     }
 
     /// Resolve `Foo` (a `ConstantReadNode`) through `ConstantResolver`
-    /// against the current lexical scope. `node` is kept for the
-    /// `--verbose` location string.
+    /// against the current lexical scope.
     ///
     /// rbs `Resolver::ConstantResolver::resolve(name, context:)`
     /// handles the lexical scope + ancestor chain + Object/toplevel
     /// splice in one shot, so the type checker only needs to lift the
     /// `Context::class_stack` into a [`ConstantContext`].
-    fn resolve_constant_read<'pr>(&self, name_str: &str, node: &Node<'pr>) -> Ty {
-        self.try_resolve_constant_read(name_str, node)
+    fn resolve_constant_read(&self, name_str: &str) -> Ty {
+        self.try_resolve_constant_read(name_str)
             .map(|c| c.ty)
             .unwrap_or(Ty::UNTYPED)
     }
@@ -8213,44 +8638,17 @@ impl<'env> TypeChecker<'env> {
     /// lexical scope and returns the full [`ResolverConstant`] on a hit
     /// (extract's `constant` record needs the absolute name, not just
     /// the type), `None` on a miss.
-    /// Emits the `--verbose` location string either way; it never pushes
-    /// a diagnostic, so callers that need `UnknownConstant` must do so
+    /// It never pushes a diagnostic, so callers that need `UnknownConstant` must do so
     /// themselves. Bare reads emit in `check_constant_read` (exactly once
     /// per occurrence — see its doc for the duplicate-emit story); a class
     /// superclass emits at its `visit_class_node` site.
-    pub(super) fn try_resolve_constant_read<'pr>(
+    pub(super) fn try_resolve_constant_read(
         &self,
         name_str: &str,
-        node: &Node<'pr>,
     ) -> Option<crate::definition::ResolverConstant> {
-        // Hot path: skip the SourceLocation construction (which scans
-        // `source[..offset]` to count chars) and read raw byte offsets
-        // straight from `prism`. The verbose log only needs the byte
-        // numbers; a SourceLocation here would be discarded on every
-        // resolved constant read.
-        let start_byte = node.location().start_offset() as u32;
-        let names = self.env.names();
-        let sym = names.intern_symbol(name_str);
+        let sym = self.env.names().intern_symbol(name_str);
         let context = constant_context_from_class_stack(self.ctx.cref_stack());
-        match self.env.resolve_constant(sym, &context) {
-            Some(constant) => {
-                self.verbose_log(format_args!(
-                    "{}:{} constant {} → {}",
-                    start_byte,
-                    start_byte,
-                    name_str,
-                    self.display_type(constant.ty)
-                ));
-                Some(constant)
-            }
-            None => {
-                self.verbose_log(format_args!(
-                    "{}:{} constant {} → not found",
-                    start_byte, start_byte, name_str,
-                ));
-                None
-            }
-        }
+        self.env.resolve_constant(sym, &context)
     }
 
     /// Side-effecting constant read: resolve `name_str` and, on a miss,
@@ -8270,7 +8668,7 @@ impl<'env> TypeChecker<'env> {
         let generic = node.as_node();
         let start_offset = generic.location().start_offset();
         let end_offset = generic.location().end_offset();
-        match self.try_resolve_constant_read(&name_str, &generic) {
+        match self.try_resolve_constant_read(&name_str) {
             Some(constant) => {
                 let deprecated =
                     self.check_deprecated_constant_read(&name_str, start_offset, end_offset);
@@ -8611,7 +9009,6 @@ impl<'env> TypeChecker<'env> {
         let start = path.location().start_offset();
         let end = path.location().end_offset();
         let path_str = String::from_utf8_lossy(&self.source[start..end]).into_owned();
-        let path_loc = (start as u32, start as u32);
 
         let parent_ty = Substitution::new()
             .with_self_type(self.current_self_type())
@@ -8641,7 +9038,6 @@ impl<'env> TypeChecker<'env> {
             segments: vec![(leaf, leaf_offset)],
             path_str,
             is_absolute: false,
-            path_loc,
             kind,
         }
     }
@@ -8771,10 +9167,6 @@ impl<'env> TypeChecker<'env> {
             .map(|(s, _)| s.as_str())
             .collect::<Vec<_>>()
             .join("::");
-        let path_start_byte = path.location().start_offset() as u32;
-        // Single-point span (matches the prior `offset_to_location(start)`
-        // shape that produced `start_byte == end_byte`).
-        let path_loc = (path_start_byte, path_start_byte);
 
         let context = if is_absolute {
             ConstantContext::toplevel()
@@ -8845,7 +9237,6 @@ impl<'env> TypeChecker<'env> {
             segments,
             path_str,
             is_absolute,
-            path_loc,
             kind,
         }
     }
@@ -8859,15 +9250,13 @@ impl<'env> TypeChecker<'env> {
     /// the leaf emit (declaration contexts where the leaf is the name
     /// being declared, e.g. `class Foo::Bar`). Head and intermediate
     /// segments are always `Constant`; only a superclass leaf differs
-    /// (`Class`), matching Steep. Verbose logging fires regardless via
-    /// the shared `log_constant_path_outcome`.
+    /// (`Class`), matching Steep.
     pub(super) fn emit_constant_path_outcome(
         &mut self,
         outcome: &ConstantPathOutcome,
         leaf_kind: Option<crate::diagnostic::ConstantKind>,
     ) {
         use crate::diagnostic::{ConstantKind, Diagnostic, DiagnosticKind};
-        self.log_constant_path_outcome(outcome);
         let ConstantPathOutcome::Walked {
             segments,
             path_str,
@@ -8914,39 +9303,6 @@ impl<'env> TypeChecker<'env> {
         });
     }
 
-    /// `--verbose` log for a `ConstantPathOutcome` — silent on the
-    /// diagnostic axis. Shared by `resolve_constant_path_node` (type
-    /// query) and `emit_constant_path_outcome` (diagnostic path) so the
-    /// log text stays in lock-step with the resolver state.
-    fn log_constant_path_outcome(&self, outcome: &ConstantPathOutcome) {
-        let ConstantPathOutcome::Walked {
-            path_str,
-            path_loc,
-            kind,
-            ..
-        } = outcome
-        else {
-            return;
-        };
-        match kind {
-            ConstantPathOutcomeKind::Resolved(ty, _) => {
-                self.verbose_log(format_args!(
-                    "{}:{} constant {} → {}",
-                    path_loc.0,
-                    path_loc.1,
-                    path_str,
-                    self.display_type(*ty),
-                ));
-            }
-            ConstantPathOutcomeKind::IntermediateValue { .. } => {
-                self.log_constant_not_found(*path_loc, path_str, " (intermediate is a value)");
-            }
-            ConstantPathOutcomeKind::Miss { .. } => {
-                self.log_constant_not_found(*path_loc, path_str, "");
-            }
-        }
-    }
-
     /// Silent type-query path: walk `Outer::Inner` and return the
     /// resolved type, or `untyped` on any miss / dynamic-parent /
     /// intermediate-value. Never pushes a diagnostic — emit lives in
@@ -8964,15 +9320,7 @@ impl<'env> TypeChecker<'env> {
             let parent_ty = self.infer_type(&parent, None);
             outcome = self.resolve_dynamic_constant_path(path, parent_ty);
         }
-        self.log_constant_path_outcome(&outcome);
         outcome.resolved_ty()
-    }
-
-    fn log_constant_not_found(&self, span: ArgSpan, path_str: &str, suffix: &str) {
-        self.verbose_log(format_args!(
-            "{}:{} constant {} → not found{}",
-            span.0, span.1, path_str, suffix
-        ));
     }
 
     fn infer_statements_with_hint<'pr>(
@@ -9035,13 +9383,6 @@ pub(super) enum ConstantPathOutcome {
         segments: Vec<(String, usize)>,
         path_str: String,
         is_absolute: bool,
-        /// Raw byte span of the constant path. Kept as an [`ArgSpan`]
-        /// so successful path walks (the hot case — every `Foo::Bar`
-        /// reference) skip the char-offset scan that a `SourceLocation`
-        /// would cost. Materialized only when a diagnostic actually
-        /// fires for the path; see `emit_constant_path_outcome` and
-        /// `log_constant_path_outcome`.
-        path_loc: ArgSpan,
         kind: ConstantPathOutcomeKind,
     },
 }
@@ -9193,7 +9534,7 @@ fn prism_digits_to_decimal_string(negative: bool, digits: &[u32]) -> String {
 /// literal (`sym`, `str`, `int`, `true`, `false`). Returns `None` for
 /// non-literal keys — the caller uses that to fall through to `Hash`
 /// synthesis.
-fn record_key_from_literal_node<'pr>(node: &Node<'pr>) -> Option<RecordKey> {
+pub(super) fn record_key_from_literal_node<'pr>(node: &Node<'pr>) -> Option<RecordKey> {
     if let Some(sym) = node.as_symbol_node() {
         let s = String::from_utf8_lossy(sym.unescaped()).to_string();
         return Some(RecordKey::Symbol(s));

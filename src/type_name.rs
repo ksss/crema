@@ -15,19 +15,23 @@
 //! Each [`TypeName`] is a 64-bit content-addressed id derived from its
 //! parent's id and its last segment's [`SymbolId`]. Because the recipe is
 //! deterministic, two independently-built [`TypeNameInterner`]s assign the
-//! same id to the same logical name — merging is just a `HashMap` union.
+//! same id to the same logical name — merging is just a union of entries.
 //! Two pre-interned roots cover the absolute / relative split via fixed
 //! sentinel hashes.
+//!
+//! Unlike the rbs port, the methods take `&self` rather than `&mut self`:
+//! crema shares one interner across check threads (ADR-0034). The id
+//! recipe is unchanged.
 //!
 //! ```
 //! use crema::interner::StringInterner;
 //! use crema::type_name::{Kind, TypeNameInterner};
 //!
-//! let mut strings = StringInterner::new();
-//! let mut names = TypeNameInterner::new();
+//! let strings = StringInterner::new();
+//! let names = TypeNameInterner::new();
 //!
-//! let foo = names.parse(&mut strings, "::RBS::Foo");
-//! let foo_again = names.parse(&mut strings, "::RBS::Foo");
+//! let foo = names.parse(&strings, "::RBS::Foo");
+//! let foo_again = names.parse(&strings, "::RBS::Foo");
 //! assert_eq!(foo, foo_again);                         // flyweighted
 //! assert_eq!(names.kind(foo, &strings), Some(Kind::Class));
 //! assert_eq!(names.display(foo, &strings), "::RBS::Foo");
@@ -36,7 +40,7 @@
 use crate::ids::SymbolId;
 pub use crate::ids::TypeName;
 use crate::interner::StringInterner;
-use rustc_hash::FxHashMap;
+use crate::once_table::OnceTable;
 use xxhash_rust::xxh3::xxh3_64;
 
 
@@ -61,7 +65,7 @@ pub(crate) fn child_hash(parent: TypeName, segment: SymbolId) -> u64 {
 
 /// Kind of a [`TypeName`], derived from the first character of its last
 /// segment. `None` is returned for an empty type name (a namespace root).
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Class,
     Alias,
@@ -120,8 +124,8 @@ impl Entry {
 /// use crema::interner::StringInterner;
 /// use crema::type_name::TypeNameInterner;
 ///
-/// let mut strings = StringInterner::new();
-/// let mut names = TypeNameInterner::new();
+/// let strings = StringInterner::new();
+/// let names = TypeNameInterner::new();
 /// let rbs = strings.intern("RBS");
 /// let foo = strings.intern("Foo");
 ///
@@ -132,7 +136,7 @@ impl Entry {
 /// ```
 #[derive(Clone)]
 pub struct TypeNameInterner {
-    entries: FxHashMap<TypeName, Entry>,
+    entries: OnceTable<Entry>,
     relative_root: TypeName,
     absolute_root: TypeName,
 }
@@ -141,16 +145,16 @@ impl Default for TypeNameInterner {
     fn default() -> Self {
         let relative_root = TypeName::from_hash(RELATIVE_ROOT_HASH);
         let absolute_root = TypeName::from_hash(ABSOLUTE_ROOT_HASH);
-        let mut entries = FxHashMap::default();
+        let entries = OnceTable::new();
         entries.insert(
-            relative_root,
+            relative_root.get(),
             Entry::Relative(RelativeTypeNameEntry {
                 parent: None,
                 segment: None,
             }),
         );
         entries.insert(
-            absolute_root,
+            absolute_root.get(),
             Entry::Absolute(AbsoluteTypeNameEntry {
                 parent: None,
                 segment: None,
@@ -212,17 +216,29 @@ impl TypeNameInterner {
         }
     }
 
+    fn entry(&self, name: TypeName) -> Entry {
+        *self
+            .entries
+            .get(name.get())
+            .unwrap_or_else(|| panic!("TypeName not interned: {name:?}"))
+    }
+
+    /// Folds the table's growth chain (see `OnceTable::compact`).
+    pub(crate) fn compact(&mut self) {
+        self.entries.compact();
+    }
+
     /// Returns the type name `parent::segment`. Content-addressed:
     /// identical inputs return the same [`TypeName`] across any
     /// [`TypeNameInterner`].
-    pub fn append(&mut self, parent: TypeName, segment: SymbolId) -> TypeName {
+    pub fn append(&self, parent: TypeName, segment: SymbolId) -> TypeName {
         let id = TypeName::from_hash(child_hash(parent, segment));
-        if self.entries.contains_key(&id) {
+        if self.entries.contains_key(id.get()) {
             return id;
         }
         let parent_entry = self
             .entries
-            .get(&parent)
+            .get(parent.get())
             .copied()
             .expect("parent TypeName must be interned");
         let entry = if parent_entry.is_absolute() {
@@ -236,12 +252,12 @@ impl TypeNameInterner {
                 segment: Some(segment),
             })
         };
-        self.entries.insert(id, entry);
+        self.entries.insert(id.get(), entry);
         id
     }
 
     /// Builds a type name by appending each `segment` in order to `base`.
-    pub fn extend<I>(&mut self, base: TypeName, segments: I) -> TypeName
+    pub fn extend<I>(&self, base: TypeName, segments: I) -> TypeName
     where
         I: IntoIterator<Item = SymbolId>,
     {
@@ -259,7 +275,7 @@ impl TypeNameInterner {
         name: TypeName,
     ) -> Option<(Option<TypeName>, Option<SymbolId>, bool)> {
         self.entries
-            .get(&name)
+            .get(name.get())
             .map(|e| (e.parent(), e.segment(), e.is_absolute()))
     }
 
@@ -272,13 +288,13 @@ impl TypeNameInterner {
     /// has no entry for). No-op if `id` is already present, same
     /// idempotence as `append`.
     pub(crate) fn insert_child(
-        &mut self,
+        &self,
         id: TypeName,
         parent: TypeName,
         segment: SymbolId,
         absolute: bool,
     ) {
-        if self.entries.contains_key(&id) {
+        if self.entries.contains_key(id.get()) {
             return;
         }
         let entry = if absolute {
@@ -292,32 +308,32 @@ impl TypeNameInterner {
                 segment: Some(segment),
             })
         };
-        self.entries.insert(id, entry);
+        self.entries.insert(id.get(), entry);
     }
 
     /// Returns the parent of `name`, or `None` if `name` is one of the
     /// two roots.
     #[must_use]
     pub fn parent(&self, name: TypeName) -> Option<TypeName> {
-        self.entries[&name].parent()
+        self.entry(name).parent()
     }
 
     /// Returns the last segment of `name`, or `None` if `name` is one of
     /// the two roots.
     #[must_use]
     pub fn last_segment(&self, name: TypeName) -> Option<SymbolId> {
-        self.entries[&name].segment()
+        self.entry(name).segment()
     }
 
     #[must_use]
     pub fn is_absolute(&self, name: TypeName) -> bool {
-        self.entries[&name].is_absolute()
+        self.entry(name).is_absolute()
     }
 
     /// True for an empty path (the relative or absolute root).
     #[must_use]
     pub fn is_root(&self, name: TypeName) -> bool {
-        self.entries[&name].parent().is_none()
+        self.entry(name).parent().is_none()
     }
 
     /// Number of segments in `name`.
@@ -338,7 +354,7 @@ impl TypeNameInterner {
         let mut buf = Vec::with_capacity(self.depth(name));
         let mut cur = name;
         loop {
-            let entry = self.entries[&cur];
+            let entry = self.entry(cur);
             let Some(parent) = entry.parent() else {
                 break;
             };
@@ -351,7 +367,7 @@ impl TypeNameInterner {
     }
 
     /// Returns the same type name with `absolute = true`, sharing the path.
-    pub fn to_absolute(&mut self, name: TypeName) -> TypeName {
+    pub fn to_absolute(&self, name: TypeName) -> TypeName {
         if self.is_absolute(name) {
             return name;
         }
@@ -360,7 +376,7 @@ impl TypeNameInterner {
     }
 
     /// Returns the same type name with `absolute = false`, sharing the path.
-    pub fn to_relative(&mut self, name: TypeName) -> TypeName {
+    pub fn to_relative(&self, name: TypeName) -> TypeName {
         if !self.is_absolute(name) {
             return name;
         }
@@ -371,7 +387,7 @@ impl TypeNameInterner {
     /// Ruby `TypeName#+` semantics: if `tail` is absolute, return `tail`;
     /// otherwise concatenate `head`'s segments + `tail`'s segments under
     /// `head`'s absolute flag.
-    pub fn concat(&mut self, head: TypeName, tail: TypeName) -> TypeName {
+    pub fn concat(&self, head: TypeName, tail: TypeName) -> TypeName {
         if self.is_absolute(tail) {
             return tail;
         }
@@ -418,7 +434,7 @@ impl TypeNameInterner {
     ///
     /// Empty `source` returns the relative root; `"::"` returns the
     /// absolute root.
-    pub fn parse(&mut self, strings: &mut StringInterner, source: &str) -> TypeName {
+    pub fn parse(&self, strings: &StringInterner, source: &str) -> TypeName {
         let absolute = source.starts_with("::");
         let trimmed = source.strip_prefix("::").unwrap_or(source);
         let mut current = self.root(absolute);
@@ -434,10 +450,10 @@ impl TypeNameInterner {
 
     /// Move every entry from `other` into `self`. Because IDs are
     /// content-addressed, the two interners' roots and any shared paths
-    /// already have the same ids; this is a plain `HashMap` union.
-    pub fn merge(&mut self, other: TypeNameInterner) {
-        for (id, entry) in other.entries {
-            self.entries.entry(id).or_insert(entry);
+    /// already have the same ids; this is a plain union of entries.
+    pub fn merge(&self, other: TypeNameInterner) {
+        for (id, entry) in other.entries.into_entries() {
+            self.entries.insert(id, entry);
         }
     }
 
@@ -488,7 +504,7 @@ impl TypeNameInterner {
 ///
 /// Construct via [`TypeNameInterner::try_as_absolute`]; widen back to a
 /// plain [`TypeName`] via [`From`].
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbsoluteTypeName(TypeName);
 
 impl AbsoluteTypeName {
@@ -505,7 +521,7 @@ impl From<AbsoluteTypeName> for TypeName {
 }
 
 /// A [`TypeName`] guaranteed to be absolute and of [`Kind::Class`].
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbsoluteClassTypeName(TypeName);
 
 impl AbsoluteClassTypeName {
@@ -528,7 +544,7 @@ impl From<AbsoluteClassTypeName> for AbsoluteTypeName {
 }
 
 /// A [`TypeName`] guaranteed to be absolute and of [`Kind::Alias`].
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbsoluteAliasTypeName(TypeName);
 
 impl AbsoluteAliasTypeName {
@@ -551,7 +567,7 @@ impl From<AbsoluteAliasTypeName> for AbsoluteTypeName {
 }
 
 /// A [`TypeName`] guaranteed to be absolute and of [`Kind::Interface`].
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbsoluteInterfaceTypeName(TypeName);
 
 impl AbsoluteInterfaceTypeName {

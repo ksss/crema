@@ -4,6 +4,8 @@
 
 A top-level inline Ruby `class << self` opens the singleton class of `main`. RBS has no declaration shape for methods or members on that object.
 
+Reported only in inline mode (`inline = true`). Sig mode reads no declarations from Ruby files, so it does not report this.
+
 ## Recommended severity
 
 Recommended severity: error.

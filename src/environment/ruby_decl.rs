@@ -24,6 +24,7 @@ use crate::environment::draft::{
 use crate::location::{LocationRange, SourceLocation};
 use crate::name::NameTable;
 use crate::rbs_raw::Parser as RbsParser;
+use crate::source_ref::SourceRef;
 use crate::type_name::TypeName;
 
 /// Per-source bookkeeping threaded through the recursion: the original
@@ -31,7 +32,7 @@ use crate::type_name::TypeName;
 /// the on-disk path (for the `Diagnostic.file` field), and the
 /// diagnostic sink.
 struct LoadCtx<'a> {
-    source: &'a [u8],
+    source: SourceRef<'a>,
     file: Option<&'a Path>,
     diagnostics: &'a mut Vec<Diagnostic>,
 }
@@ -49,7 +50,7 @@ impl EnvironmentDraft {
     pub fn insert_ruby_decl(
         &mut self,
         decl: &Declaration,
-        source: &[u8],
+        source: SourceRef<'_>,
         file: Option<&Path>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
@@ -222,7 +223,7 @@ fn push_build_error_diagnostic(
     let name = match &err {
         BuildError::DuplicatedDeclaration { name }
         | BuildError::GenericParameterMismatch { name }
-        | BuildError::SuperclassConflict { name } => names.resolve(name),
+        | BuildError::SuperclassConflict { name } => names.display_type_name(*name),
         BuildError::DuplicatedGlobal { name } => names.resolve(*name).to_string(),
     };
     let range = match (&err, range) {
@@ -238,7 +239,7 @@ fn push_build_error_diagnostic(
         },
         location: Diagnostic::location_for_byte_range(
             ctx.file.map(|p| p.to_path_buf()).unwrap_or_default(),
-            ctx.source,
+            ctx.source.bytes(),
             range.0 as usize,
             range.1 as usize,
         ),
@@ -387,7 +388,10 @@ fn check_one_attr_annotation(
     };
     if let Err(err) = parse_rbs_type(text.as_bytes(), names) {
         ctx.diagnostics.push(build_annotation_syntax_error(
-            ctx.source, ctx.file, range, err,
+            ctx.source.bytes(),
+            ctx.file,
+            range,
+            err,
         ));
     }
 }
@@ -401,7 +405,10 @@ fn constant_decl_ast_type(cd: &ConstantDecl, ctx: &mut LoadCtx<'_>, names: &Name
             Err(err) => {
                 if let Some(range) = cd.annotation_range {
                     ctx.diagnostics.push(build_annotation_syntax_error(
-                        ctx.source, ctx.file, range, err,
+                        ctx.source.bytes(),
+                        ctx.file,
+                        range,
+                        err,
                     ));
                 }
                 constant_value_kind_to_ast_type(cd.value_kind, names)

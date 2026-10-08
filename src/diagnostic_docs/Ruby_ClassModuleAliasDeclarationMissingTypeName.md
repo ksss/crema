@@ -6,6 +6,8 @@ A class-alias or module-alias inline annotation cannot infer the aliased constan
 ## Trigger
 The inline alias annotation omits an explicit type name and the right-hand side is not a constant path.
 
+Reported only in inline mode (`inline = true`). Sig mode reads no declarations from Ruby files, so it does not report this.
+
 ## Example
 ```ruby
 Foo = factory.call #: class-alias

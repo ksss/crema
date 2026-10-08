@@ -85,65 +85,77 @@ crema check app.rb | jq -r .code | sort | uniq -c | sort -rn
 crema check app.rb | jq -r '"\(.file):\(.line): \(.message)"'
 ```
 
-### Baseline workflow (`--tamp`)
+### Baseline (grandfathering existing diagnostics)
 
-The output format is tamped (stably projected).
-The keys for each record are reduced to only `file`, `code`, and `fingerprint`, and are sorted in this order.
-This output is ideal for use as a baseline.
+Adopting crema on a project with hundreds of existing diagnostics? Record
+them once and let `crema check` report only what is new — the
+`rubocop_todo.yml` workflow, built in:
 
-Commit the output as a baseline and let `git diff` gate the increment:
+```toml
+# crema.toml
+baseline = true            # → crema_baseline.jsonl next to crema.toml
+# baseline = "ci/crema_baseline.jsonl"   # or any path, relative to crema.toml
+```
 
 ```sh
-# 1) Generate the baseline (once, and after every intentional cleanup)
-crema check --tamp > .crema-baseline.jsonl
+# 1) Record the current diagnostics (once, and after every cleanup)
+crema check --update-baseline
+git add crema_baseline.jsonl
 
-# 2) Inspect what has changed since the baseline
-#    `+` lines are new diagnostics (regressions), `-` lines are ones you
-#    have fixed. Byte-lex sort makes matching rows collide on the same
-#    diff hunk.
-git diff -- .crema-baseline.jsonl
+# 2) From now on, `crema check` prints only diagnostics that are not
+#    in the file, and exits 1 only for those. Everything recorded is
+#    silent and exit 0.
+crema check
 
-# 3) Pick the next batch of debts to burn down with jq
-git diff -- .crema-baseline.jsonl \
-  | grep '^-{' | sed 's/^-//' \
-  | jq -r 'select(.code == "Ruby::NoMethod") | .file' \
-  | sort -u
+# 3) When you fix recorded diagnostics, one stderr line counts the
+#    rows that no longer match and points at --update-baseline.
+#    Refresh the file to shrink it; the exit code never depends on
+#    stale rows.
+crema check --update-baseline
 
-# 4) Gate CI on "no new regressions" — an added row (`^+{`) fails.
-#    Capture the generator's exit code separately: `crema` exits `1`
-#    when diagnostics are present (expected in this workflow) and `2`
-#    on a hard error (missing config, build failure). We accept 0/1 as
-#    "generated successfully" and treat anything else as a crash — a
-#    crash would produce an empty file, which would look like "all
-#    debt cleared" to the diff gate below.
-crema check --tamp > .crema-baseline.jsonl.new
-code=$?
-if [ $code -ne 0 ] && [ $code -ne 1 ]; then
-  echo "crema check --tamp failed (exit $code); refusing to compare." >&2
-  exit $code
-fi
-if diff -u .crema-baseline.jsonl .crema-baseline.jsonl.new \
-     | grep -q '^+{'; then
-  echo "New diagnostics introduced. Fix them or refresh the baseline." >&2
-  exit 1
-fi
+# 4) See everything once, ignoring the file
+crema check --no-baseline
 ```
+
+Each row holds only `file`, `code` and a `fingerprint` (hash of the
+file path, code, enclosing scope and the source line's bytes), so
+edits elsewhere in the file — line shifts, new methods above — keep the
+row matching; editing the offending line itself makes it a new
+diagnostic. Matching is a multiset: two identical rows absorb two
+identical diagnostics. `file` is relative to the directory containing
+`crema.toml`, so the baseline matches from any subdirectory.
 
 Notes:
 
-- Exit code is unchanged (`0` clean, `1` errors present, `2` hard
-  error). In `--tamp` mode diagnostics are buffered until the run
-  completes, so a mid-run crash produces an **empty** file — always
-  check the exit code (as the snippet above does) rather than trusting
-  the file's content alone; a naive `crema check --tamp > out || true`
-  wrapper would let a crash silently look like "zero regressions".
-- The diagnostic **set** is the same as normal mode — `[diagnostic]`
-  severity overrides (including `"Ruby::Foo" = "ignore"`) apply before
-  projection. Silencing a code removes it from the baseline too.
-- The key order (`file` → `code` → `fingerprint`) is chosen so that
-  `LC_ALL=C sort` on the output is a no-op — external tools that need
-  to re-sort a merged baseline preserve the same ordering, even when
-  a filename contains bytes that JSON escapes.
+- `--update-baseline` needs the whole scope: it refuses file
+  arguments, `-e`, `--tamp` and `--no-baseline` (exit `2`), and never
+  touches the file when the run fails with exit `2`. A clean project
+  writes an empty file — the file must exist once `baseline` is on.
+- A missing file, or a row that is not a `{file, code, fingerprint}`
+  object, is exit `2` with the offending line number: the baseline is
+  never silently skipped.
+- `[diagnostic]` severity `ignore` applies before the baseline, so
+  silenced codes never enter the file.
+
+#### Rolling your own (`--tamp`)
+
+`crema check --tamp` prints the same rows the baseline file holds —
+`{"file","code","fingerprint"}`, byte-lex sorted, no volatile keys —
+without consulting `baseline`. Use it when the comparison should live
+outside crema (a shell gate, a different diff policy):
+
+```sh
+crema check --tamp > .crema-baseline.jsonl        # record
+crema check --tamp > .crema-baseline.jsonl.new    # later
+diff -u .crema-baseline.jsonl .crema-baseline.jsonl.new | grep '^+{'  # new rows
+```
+
+The exit code is unchanged (`0` clean, `1` errors present, `2` hard
+error) and rows are buffered until the run completes, so a crash
+produces an **empty** file — check the exit code rather than trusting
+the file's content alone. The key order (`file` → `code` →
+`fingerprint`) makes `LC_ALL=C sort` on the output a no-op, so
+external tools that re-sort a merged file preserve the same ordering.
 
 ### CLI options
 
@@ -152,6 +164,9 @@ Notes:
 | `-e <EVAL>` | Check an inline Ruby snippet against the project's type-check scope (from `crema.toml`'s `check` field) without adding the snippet to that scope. Still requires a configured `check` field. Mutually exclusive with file arguments. |
 | `--sig <DIR>` | RBS directory to load (repeatable). **Replaces** any `sig` list in `crema.toml`. See `--add-sig` to append instead. |
 | `--add-sig <DIR>` | Extra RBS directory to load (repeatable). Appended to the `sig` list in `crema.toml`. Ignored (with a warning) when `--sig` is also given. |
+| `--update-baseline` | Rewrite the `baseline` file from this run's diagnostics and exit `0`. Whole scope only (no file arguments / `-e` / `--tamp` / `--no-baseline`). |
+| `--no-baseline` | Ignore the `baseline` file for this run and report every diagnostic. |
+| `--tamp` | Print the stable projection (`file`, `code`, `fingerprint`; sorted) instead of full records, bypassing `baseline`. |
 | `--inline <true\|false>` | Whether to read `# @rbs` / `#:` inline annotations from `.rb` files. Default: `true`. Set to `false` to use only `sig/` as the source of truth. |
 | `--config <PATH>` | Top-level flag: load a config file from `<PATH>` instead of auto-discovering `./crema.toml`. The filename is arbitrary. When set, cwd discovery is **bypassed** (no merge). Missing or malformed files exit `2`. |
 | `--no-bundler` | Top-level flag: resolve gem paths with plain `ruby` instead of `bundle exec ruby`, even when a `Gemfile` is present. Lets `crema extract` run in CI without `bundle install`; gem-provided types (anything beyond rbs core and globally installed gems) are then **not** resolved. Snapshots built with and without the flag are cached separately. |
@@ -169,7 +184,7 @@ crema --config configs/strict.toml check app.rb
 crema --config /abs/path/profile.toml doc diagnostic
 ```
 
-`--config` short-circuits cwd discovery: the named file is loaded verbatim and `./crema.toml` is not consulted. Relative paths inside the file (e.g. `sig = ["vendor/rbs"]`) are resolved from the **current working directory**, not from the directory of the config file — so a config file is portable across cwds only when its inner paths are absolute.
+`--config` short-circuits cwd discovery: `./crema.toml` is not consulted, and the named file is treated as if it were the project's `crema.toml`. Its directory becomes the project root: relative paths inside the file (e.g. `sig = ["vendor/rbs"]`), the `.crema` cache directory and the `file` paths in the output are all relative to the **directory of the config file**, whatever the current directory is. Gem resolution (the Gemfile bundler reads) and rbs collection auto-discovery also start from that directory's project, not from the current directory's. CLI path arguments (`--sig`, positional filters) stay relative to the current directory.
 
 ```toml
 # crema.toml
@@ -236,7 +251,7 @@ crema doc diagnostic Ruby::NoMethod
 
 ### RBS loading order
 
-1. **Auto-detect + cache**: Detects the `rbs` gem and loads `core/` from it. The detected path is cached in `.crema/cache/rbs_gem_dir` so subsequent runs skip the Ruby subprocess.
+1. **Auto-detect**: Detects the `rbs` gem on every run and loads `core/` from it. With a Gemfile, the gem is located from `Gemfile.lock` without spawning `bundle`; without one (or with `--no-bundler`), a single `ruby` subprocess looks it up.
 2. **`libraries`**: stdlib libraries named in `crema.toml` are loaded from the detected rbs gem's `stdlib/`, with manifest dependencies resolved transitively.
 3. **`sig/` directory**: Always loads `.rbs` files from `./sig/` in the current working directory, if it exists.
 4. **`--sig <DIR>`**: **Replaces** the `sig` list from `crema.toml` (spec Design Goal 4, CLI overrides config). The auto-discovered `./sig/` from step 3 is still loaded independently.
@@ -295,9 +310,9 @@ you installed.
   `sig/gem-patch/<gem>/*.rbs` for gems that ship no RBS, one gem per
   cycle, ranked by how many NoMethod diagnostics cascade from each
   unresolved constant. See `skills/crema-rbs-from-diagnostics/SKILL.md`.
-- `crema-reduce-diagnostics` — shrink a committed `crema check --tamp` baseline
-  one diagnostic code and a few files per cycle, diffing the baseline by
-  fingerprint after every edit so removed, surfaced and introduced records
+- `crema-reduce-diagnostics` — shrink the `baseline` file of `crema.toml`
+  one diagnostic code and a few files per cycle, reading crema's baseline
+  matching after every edit so removed, surfaced and introduced records
   are told apart. See `skills/crema-reduce-diagnostics/SKILL.md`.
 
 Install with the GitHub CLI (preferred; `gh skill` is in preview):

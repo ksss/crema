@@ -38,7 +38,7 @@ pub enum InlineAliasKind {
 /// `Base.location` / `Base.prefix_location` shared by every rbs
 /// annotation, plus variant-specific sub-locations. This mirrors rbs's
 /// `RBS::AST::Ruby::Annotations::Base` inheritance hierarchy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LeadingAnnotation {
     /// `#: (T) -> U` — a single method-type assertion.
     ColonMethodType(Box<ColonMethodTypeAnnotation>),
@@ -86,7 +86,7 @@ impl LeadingAnnotation {
 /// `#: (T) -> U` leading annotation.
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::ColonMethodTypeAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ColonMethodTypeAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -97,7 +97,7 @@ pub struct ColonMethodTypeAnnotation {
 /// `# @rbs (T) -> U` leading annotation.
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::MethodTypesAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MethodTypesAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -109,7 +109,7 @@ pub struct MethodTypesAnnotation {
 /// `# @rbs foo: T` leading annotation.
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::ParamTypeAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParamTypeAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -123,7 +123,7 @@ pub struct ParamTypeAnnotation {
 /// `# @rbs return: T` leading annotation.
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::ReturnTypeAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReturnTypeAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -136,7 +136,7 @@ pub struct ReturnTypeAnnotation {
 /// `# @rbs *name: T` (name optional) leading annotation.
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::SplatParamTypeAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SplatParamTypeAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -151,7 +151,7 @@ pub struct SplatParamTypeAnnotation {
 /// `# @rbs **name: T` (name optional) leading annotation.
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::DoubleSplatParamTypeAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoubleSplatParamTypeAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -168,7 +168,7 @@ pub struct DoubleSplatParamTypeAnnotation {
 ///
 /// Mirrors `RBS::AST::Ruby::Members::MethodTypeAnnotation::DocStyle::param_type_annotation`
 /// (the 4-union type alias in rbs `sig/ast/ruby/members.rbs:23-26`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ParamTypeKindAnnotation {
     Param(ParamTypeAnnotation),
     Splat(SplatParamTypeAnnotation),
@@ -179,7 +179,7 @@ pub enum ParamTypeKindAnnotation {
 /// `# @rbs skip` leading annotation.
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::SkipAnnotation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SkipAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -330,7 +330,7 @@ impl MethodTypesAnnotation {
 /// rbs's `prefix_location`, `close_bracket_location`, and
 /// `comma_locations` are not ported here — adding them requires
 /// trailing-annotation parser changes and is left as a follow-up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypeApplicationAnnotation {
     pub type_args: Vec<Type>,
     pub location: PrismByteRange,
@@ -340,7 +340,7 @@ pub struct TypeApplicationAnnotation {
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::InstanceVariableAnnotation`
 /// for the payload needed by `InstanceVariableMember`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstanceVariableAnnotation {
     pub name: String,
     pub location: PrismByteRange,
@@ -353,7 +353,7 @@ pub struct InstanceVariableAnnotation {
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::BlockParamTypeAnnotation`
 /// for the payload needed by doc-style method annotations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockParamTypeAnnotation {
     pub location: PrismByteRange,
     pub prefix_location: PrismByteRange,
@@ -371,7 +371,7 @@ pub struct BlockParamTypeAnnotation {
 ///
 /// Mirrors `RBS::AST::Ruby::Annotations::ModuleSelfAnnotation`
 /// for the payload needed by `ModuleSelfMember`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModuleSelfAnnotation {
     pub name: TypeName,
     pub name_location: PrismByteRange,
@@ -395,7 +395,7 @@ pub struct ModuleSelfAnnotation {
 /// `type_name_location` sub-locations are not ported here — adding
 /// them is a follow-up child todo so the inline parser's trailing
 /// annotation parser can be extended in one pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AliasAnnotation {
     Class(AliasAnnotationFields),
     Module(AliasAnnotationFields),
@@ -407,7 +407,7 @@ pub enum AliasAnnotation {
 /// crema currently consumes. `type_name_text` corresponds to
 /// `annotation.type_name` and is `None` when the user wrote a bare
 /// `#: class-alias` / `#: module-alias` without an explicit target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AliasAnnotationFields {
     pub location: PrismByteRange,
     pub type_name_text: Option<String>,

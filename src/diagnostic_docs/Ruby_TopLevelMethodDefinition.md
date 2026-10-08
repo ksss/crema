@@ -6,6 +6,8 @@ A top-level inline Ruby `def self.name` defines a singleton method on the `main`
 
 A top-level `def name` (no receiver) is not reported: crema collects it as a private instance method of `::Object`, matching Ruby's semantics.
 
+Reported only in inline mode (`inline = true`). Sig mode reads no declarations from Ruby files, so it does not report this.
+
 ## Recommended severity
 
 Recommended severity: error.

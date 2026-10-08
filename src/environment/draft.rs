@@ -253,9 +253,9 @@ impl ClassAliasDraft {
     /// rather than silently aliasing to `""`.
     pub fn old_name_raw(&self, names: &NameTable) -> String {
         match self {
-            ClassAliasDraft::Class(decl) => names.resolve(decl.old_name),
-            ClassAliasDraft::Module(decl) => names.resolve(decl.old_name),
-            ClassAliasDraft::Ruby(decl) => names.resolve(decl.old_name(names).expect(
+            ClassAliasDraft::Class(decl) => names.display_type_name(decl.old_name),
+            ClassAliasDraft::Module(decl) => names.display_type_name(decl.old_name),
+            ClassAliasDraft::Ruby(decl) => names.display_type_name(decl.old_name(names).expect(
                 "Ruby alias decl reached old_name_raw without RHS — inline collector should have dropped it",
             )),
         }
@@ -496,7 +496,7 @@ impl BuildError {
             BuildError::DuplicatedDeclaration { name } => {
                 format!(
                     "DuplicatedDeclaration {{ name: {} ({}) }}",
-                    names.resolve(name),
+                    names.display_type_name(*name),
                     kind_label(name),
                 )
             }
@@ -506,14 +506,14 @@ impl BuildError {
             BuildError::GenericParameterMismatch { name } => {
                 format!(
                     "GenericParameterMismatch {{ name: {} ({}) }}",
-                    names.resolve(name),
+                    names.display_type_name(*name),
                     kind_label(name),
                 )
             }
             BuildError::SuperclassConflict { name } => {
                 format!(
                     "SuperclassConflict {{ name: {} ({}) }}",
-                    names.resolve(name),
+                    names.display_type_name(*name),
                     kind_label(name),
                 )
             }
@@ -606,6 +606,14 @@ impl EnvironmentDraft {
                 }
             }
         }
+    }
+
+    /// Fold the name tables' growth chains (see `OnceTable::compact`).
+    /// Growth never moves entries, so a table that grew a lot is a chain
+    /// of segments and every hit walks the chain; call this after a bulk
+    /// insert while the draft is still exclusively owned.
+    pub fn compact_names(&mut self) {
+        self.names.compact();
     }
 
     pub fn names(&self) -> &NameTable {
@@ -1295,7 +1303,10 @@ impl EnvironmentDraft {
         // cloning the whole overlay here would silently reintroduce an
         // O(env) copy).
         let mut overlay = self.overlay.take();
-        let names: NameTable = self.names;
+        let mut names: NameTable = self.names;
+        // Last point with exclusive ownership before the tables are shared;
+        // the build body itself runs on the folded tables.
+        names.compact();
 
         // Wrap the body in an immediately-invoked closure so `?` can
         // continue to propagate `BuildError` internally, while the outer
@@ -1437,7 +1448,10 @@ impl EnvironmentDraft {
                             }
                         },
                     };
-                    aliases.insert(*name, (names.resolve(old_name), Arc::clone(context)));
+                    aliases.insert(
+                        *name,
+                        (names.display_type_name(old_name), Arc::clone(context)),
+                    );
                 }
             }
 

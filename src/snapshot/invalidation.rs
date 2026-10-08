@@ -1,6 +1,7 @@
 //! G-snapshot invalidation key: a 256-bit content fingerprint over every
 //! input whose change must force a snapshot rebuild (ADR-0028 Decision 4:
-//! lockfiles, crema version, crema.toml, sig path set — plus the gem
+//! lockfiles, crema version refined to the running binary's identity,
+//! crema.toml, sig path set — plus the gem
 //! resolver mode, since `--no-bundler` can point G at a different rbs
 //! install than bundler does).
 
@@ -32,17 +33,57 @@ pub struct InvalidationInputs<'a> {
     pub no_bundler: bool,
 }
 
-/// The `crema_version` input for [`compute`]. Production builds always
-/// use the compiled crate version; debug builds honor
-/// `CREMA_VERSION_OVERRIDE` so e2e tests can force a key mismatch
-/// without rebuilding the binary.
+/// The `crema_version` input for [`compute`]: the compiled crate version
+/// plus the running executable's [`BinaryIdentity`], so a rebuild that
+/// keeps the version (a dogfood or A/B binary) does not replay caches
+/// another build wrote. Debug builds honor `CREMA_VERSION_OVERRIDE`,
+/// which replaces the whole input, so e2e tests can force a key
+/// mismatch without rebuilding the binary.
 pub fn crema_version() -> String {
     if cfg!(debug_assertions)
         && let Ok(v) = std::env::var("CREMA_VERSION_OVERRIDE")
     {
         return v;
     }
-    env!("CARGO_PKG_VERSION").to_string()
+    version_input(env!("CARGO_PKG_VERSION"), BinaryIdentity::current_exe())
+}
+
+/// Size and mtime of an executable file: a stat's worth of evidence
+/// that two runs are the same build. Not a content hash — reading and
+/// hashing the binary every run costs milliseconds — so reinstalling an
+/// identical build reads as a new one (one cold run, the safe side).
+/// The path is deliberately not part of it: a symlink or a `cp -p`
+/// copy of the same build shares its caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryIdentity {
+    pub len: u64,
+    pub mtime_nanos: u128,
+}
+
+impl BinaryIdentity {
+    /// `None` when the executable or its mtime cannot be read; the key
+    /// then falls back to the crate version alone.
+    fn current_exe() -> Option<Self> {
+        let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(Self {
+            len: meta.len(),
+            mtime_nanos: mtime.as_nanos(),
+        })
+    }
+}
+
+/// Folds `binary` into the version string, keeping the
+/// `InvalidationInputs` wire layout unchanged.
+pub fn version_input(version: &str, binary: Option<BinaryIdentity>) -> String {
+    match binary {
+        Some(b) => format!("{version}+bin.{}.{}", b.len, b.mtime_nanos),
+        None => version.to_string(),
+    }
 }
 
 pub fn compute(inputs: &InvalidationInputs<'_>) -> InvalidationKey {

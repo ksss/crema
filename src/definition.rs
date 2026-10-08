@@ -16,17 +16,15 @@
 //! pre-built.
 
 use rustc_hash::FxHashMap;
-use std::cell::OnceCell;
 use std::sync::Arc;
 
 use crate::name::Symbol;
 use crate::type_name::TypeName;
-use crate::types::{Ty, Type};
+use crate::types::Ty;
 
 pub mod ancestor_builder;
 pub mod ancestor_graph;
 pub mod constant_resolver;
-pub mod lowering_maps;
 pub mod method;
 pub mod method_builder;
 pub mod type_lowering;
@@ -39,7 +37,6 @@ pub use ancestor_graph::{AncestorGraph, Node as AncestorNode};
 pub use constant_resolver::{
     ConstantContext, ConstantOrigin, ConstantResolver, ConstantTable, ResolverConstant,
 };
-pub use lowering_maps::LoweringMaps;
 pub use method::{MemberRef, Method, TypeDef};
 pub use type_lowering::LoweringEnv;
 
@@ -63,31 +60,16 @@ pub struct Definition {
     /// — the type this `Definition` is the view of. Mirrors
     /// `RBS::Definition#self_type`.
     pub self_type: Ty,
-    /// Linearized ancestor view: `Instance` for class & interface
-    /// instance sides, `Singleton` for class & module singleton sides.
-    /// Mirrors `RBS::Definition#ancestors`; rbs uses
-    /// `interface_ancestors` for the interface entry point, so its
-    /// `InstanceAncestors` variant covers both class instance and
-    /// interface views (the variant name follows rbs).
-    ///
-    /// Lazy-populated via [`Definition::ancestors`]: full recursive
-    /// linearization is the heaviest ancestor op (3-10% of build phase
-    /// on rbs-scale fixtures), and the field has no in-tree caller
-    /// outside `Definition::ancestors` itself — populating eagerly
-    /// pays for an LSP / `crema ancestors` future use that hasn't
-    /// landed. `OnceCell` keeps the rbs port shape (field present,
-    /// same `Ancestors` enum) while making the cost zero when nothing
-    /// reads it.
-    ///
-    /// `pub(crate)` so the raw cell is not part of the crate's public
-    /// API surface — external callers go through the accessor, which
-    /// guarantees variant dispatch via `self_type`. Same-crate tests
-    /// can still observe init state directly for invariant pinning.
-    pub(crate) ancestors: OnceCell<Arc<Ancestors>>,
     /// Own methods on this type-view. Singleton-side `Definition`s
     /// carry the class's singleton methods, instance-side carries
     /// instance methods, interface carries declared methods.
-    pub methods: FxHashMap<Symbol, Method>,
+    ///
+    /// Each entry sits behind `Arc` so a lookup that finds the method on
+    /// this view and has nothing to merge hands the caller (and the
+    /// lookup memo) this same allocation instead of a deep copy — the
+    /// crema counterpart of rbs sharing `Method` objects across child
+    /// definitions when `Definition#sub` has nothing to substitute.
+    pub methods: FxHashMap<Symbol, Arc<Method>>,
     /// Own instance variables of this type-view. On instance-side
     /// `Definition`s, holds `@foo: T` declarations and instance-side
     /// `attr_*` ivar backings. On singleton-side `Definition`s, holds
@@ -99,72 +81,6 @@ pub struct Definition {
     /// `Definition`s only — singleton-side `Definition`s carry an empty
     /// map, matching rbs `build_singleton0`. Own-only, see [`Variable`].
     pub class_variables: FxHashMap<Symbol, Variable>,
-}
-
-/// Linearized ancestor view for a `Definition`. Wraps the existing
-/// `InstanceAncestors` / `SingletonAncestors`, mirroring rbs's
-/// `InstanceAncestors | SingletonAncestors` union — interfaces use
-/// the `Instance` variant because `RBS::DefinitionBuilder#build_interface`
-/// stores `ancestor_builder.interface_ancestors` (an `InstanceAncestors`).
-#[derive(Debug, Clone)]
-pub enum Ancestors {
-    Instance(InstanceAncestors),
-    Singleton(SingletonAncestors),
-}
-
-impl Definition {
-    /// Lazily resolve the linearized `ancestors`. The first call picks
-    /// `instance_ancestors` / `singleton_ancestors` / `interface_ancestors`
-    /// from `builder` based on `self.self_type`'s variant and stores the
-    /// result in the `OnceCell`; subsequent calls return the cached
-    /// `Arc<Ancestors>` without recomputing.
-    ///
-    /// # Contract
-    ///
-    /// `builder` **must** be derived from the same [`Environment`] that
-    /// produced this `Definition`. Crossing builders is undefined:
-    /// `self.self_type` is a [`TypeTable`]-local index, so resolving it
-    /// against a foreign builder's `TypeTable` may return an unrelated
-    /// `Type` or panic on out-of-range. The first such call writes the
-    /// wrong `Arc<Ancestors>` into the [`OnceCell`], which then poisons
-    /// every subsequent `ancestors` lookup on this `Definition` for the
-    /// program's lifetime — `OnceCell::get_or_init` never re-runs.
-    ///
-    /// The compiler cannot enforce this binding: `Definition` deliberately
-    /// does not carry an env reference, mirroring `RBS::Definition` shape
-    /// (ADR-0019). Caller discipline is the only line of defense. In
-    /// practice, always pass `definition_builder.ancestor_builder()`
-    /// where `definition_builder` is the [`DefinitionBuilder`] that
-    /// produced this `Definition`.
-    ///
-    /// [`Environment`]: crate::environment::Environment
-    /// [`TypeTable`]: crate::types::TypeTable
-    /// [`DefinitionBuilder`]: crate::definition_builder::DefinitionBuilder
-    pub fn ancestors(&self, builder: &AncestorBuilder) -> &Arc<Ancestors> {
-        self.ancestors.get_or_init(|| {
-            let resolved = builder.types().resolve(self.self_type);
-            let ancestors = match resolved {
-                Type::ClassInstance { .. } => {
-                    Ancestors::Instance(builder.instance_ancestors(&self.type_name).as_ref().clone())
-                }
-                Type::ClassSingleton { .. } => {
-                    Ancestors::Singleton(
-                        builder.singleton_ancestors(&self.type_name).as_ref().clone(),
-                    )
-                }
-                Type::Interface { .. } => {
-                    Ancestors::Instance(
-                        builder.interface_ancestors(&self.type_name).as_ref().clone(),
-                    )
-                }
-                _ => unreachable!(
-                    "Definition.self_type must be ClassInstance / ClassSingleton / Interface, got {:?}",
-                    resolved
-                ),
-            };
-            Arc::new(ancestors)
-        })
-    }
 }
 
 /// Type-view variable record, port of `RBS::Definition::Variable`

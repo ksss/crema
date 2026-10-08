@@ -1,4 +1,3 @@
-pub mod append_map;
 pub mod backend;
 pub mod convert;
 pub mod flat;

@@ -13,6 +13,7 @@
 //! to make the namespace separation explicit.
 
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use crate::definition::Method;
 use crate::definition_builder::{
@@ -26,17 +27,14 @@ use crate::types::{FunctionType, RecordKey, Ty, Type};
 
 /// Result of a successful per-call resolution.
 pub struct ResolvedMethod {
-    /// The method to apply at the call site. Cloned from the
-    /// `DefinitionBuilder` so receiver-class-dependent rewrites (e.g.
-    /// `Kernel#class` -> `singleton(C)`) can be baked in without
-    /// touching the underlying definition.
-    pub method: Method,
+    /// The method to apply at the call site. Shared with the
+    /// `DefinitionBuilder` (and its lookup memo) by pointer;
+    /// receiver-class-dependent rewrites (e.g. `Kernel#class` ->
+    /// `singleton(C)`) copy on write so the underlying definition is
+    /// never touched.
+    pub method: Arc<Method>,
     /// Type-parameter bindings collected along the ancestor walk.
     pub bindings: FxHashMap<TypeVarKey, Ty>,
-    /// The receiver class identity. Passed back so call-site diagnostics
-    /// can name the actual receiver (`receiver_class` field on
-    /// `CallTarget::Method`).
-    pub receiver_class: TypeName,
 }
 
 /// Look up a method given a receiver type and a method-name symbol.
@@ -73,29 +71,17 @@ pub fn lookup_method(
             let (method, bindings) =
                 env.lookup_instance_method_with_args(name, args, method_name)?;
             let method = maybe_rewrite_kernel_class(env, method, method_name, name);
-            Some(ResolvedMethod {
-                method,
-                bindings,
-                receiver_class: *name,
-            })
+            Some(ResolvedMethod { method, bindings })
         }
         Type::ClassSingleton { name } => {
             let (method, bindings) =
                 resolve_singleton_method_with_type_name_args(env, *name, method_name)?;
-            Some(ResolvedMethod {
-                method,
-                bindings,
-                receiver_class: *name,
-            })
+            Some(ResolvedMethod { method, bindings })
         }
         Type::Interface { name, args } => {
             let (method, bindings) =
                 env.lookup_interface_method_with_args(name, args, method_name)?;
-            Some(ResolvedMethod {
-                method,
-                bindings,
-                receiver_class: *name,
-            })
+            Some(ResolvedMethod { method, bindings })
         }
         Type::Literal(lit) => {
             let widened = env.class_instance_type(*lit.class_typename(env.names().builtins()));
@@ -227,26 +213,18 @@ fn overwrite_proc_call(
     let ResolvedMethod {
         mut method,
         bindings,
-        receiver_class,
     } = resolved;
     let Some(mut td) = method.defs.first().cloned() else {
-        return ResolvedMethod {
-            method,
-            bindings,
-            receiver_class,
-        };
+        return ResolvedMethod { method, bindings };
     };
     td.type_ = crate::types::MethodType {
         type_params: vec![],
         type_,
         block,
     };
-    method.defs = vec![td];
-    ResolvedMethod {
-        method,
-        bindings,
-        receiver_class,
-    }
+    // Copy-on-write: `::Proc#call` in the `Definition` keeps its own defs.
+    Arc::make_mut(&mut method).defs = vec![td];
+    ResolvedMethod { method, bindings }
 }
 
 /// Rewrite `Kernel#class`'s return type from `Class` to
@@ -266,10 +244,10 @@ fn overwrite_proc_call(
 /// (ADR-0021 Decision).
 fn maybe_rewrite_kernel_class(
     env: ConsultationView,
-    method: Method,
+    method: Arc<Method>,
     method_name: Symbol,
     receiver_class: &TypeName,
-) -> Method {
+) -> Arc<Method> {
     let class_sym = env.names().intern_symbol("class");
     if method_name != class_sym {
         return method;
@@ -279,8 +257,10 @@ fn maybe_rewrite_kernel_class(
         return method;
     }
     let singleton_ty = env.types().class_singleton(*receiver_class);
+    // Copy-on-write: the shared `Kernel#class` stays `() -> Class`; only
+    // this call site's copy returns `singleton(receiver)`.
     let mut rewritten = method;
-    for td in &mut rewritten.defs {
+    for td in &mut Arc::make_mut(&mut rewritten).defs {
         if &td.defined_in != kernel {
             continue;
         }

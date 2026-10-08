@@ -233,11 +233,17 @@ pub struct DefinitionRecord {
     pub method_type: Option<String>,
 }
 
+/// xxh3 of a file's bytes — [`FileRecord::content_hash`] before hex
+/// formatting.
+pub fn content_hash(source: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(source)
+}
+
 /// Per-file record bundle. Field order is the JSON key order.
 #[derive(Debug, Default, Serialize)]
 pub struct FileRecord {
-    /// xxh3 of the file bytes as fixed-width lowercase hex, for
-    /// consumers to detect staleness against the working tree.
+    /// [`content_hash`] of the file bytes as fixed-width lowercase hex,
+    /// for consumers to detect staleness against the working tree.
     pub content_hash: String,
     pub definitions: Vec<DefinitionRecord>,
     /// Ruby `def` sites (lexical symbol axis) — the implementation

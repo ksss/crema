@@ -4,6 +4,8 @@
 
 An inline Ruby `class << self` scope nested inside another `class << self`, or a `def self.foo` inside `class << self`, targets the singleton class of a singleton class. RBS has no declaration shape for that target.
 
+Reported only in inline mode (`inline = true`). Sig mode reads no declarations from Ruby files, so it does not report this.
+
 ## Recommended severity
 
 Recommended severity: error.

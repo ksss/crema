@@ -595,11 +595,7 @@ pub struct Environment {
     /// leaves no decl behind, yet still needs its targets. An entry with
     /// zero targets is recorded too — the checker skips that body, as
     /// Rails never runs it. A-layer only (concerns are a Ruby-only
-    /// mechanism), so never persisted in a G snapshot. Fingerprinted as
-    /// its own key (`FingerprintKey::ConcernTargets`, kept apart from
-    /// the module's `Type` so a target change is not expanded to every
-    /// includer) so adding or removing a target invalidates the concern
-    /// file and nothing else.
+    /// mechanism), so never persisted in a G snapshot.
     pub(crate) concern_block_targets: FxHashMap<TypeName, Vec<ConcernBlockTargets>>,
 }
 
@@ -1025,6 +1021,22 @@ impl Environment {
         self.path_index.get(file)
     }
 
+    /// The [`ScanScope`] for a CLI diagnostic filter over `files`: the
+    /// union of every [`PathIndexKey`] those files contributed. A file
+    /// the index does not know (no declarations, never loaded) adds
+    /// nothing, so the scope may be empty — the diagnostics-only walks
+    /// then visit no owner at all, which is the right answer for a run
+    /// whose filter would drop every env-level diagnostic anyway.
+    pub fn scan_scope_for_files(&self, files: impl IntoIterator<Item = Name>) -> ScanScope {
+        let mut keys: FxHashSet<PathIndexKey> = FxHashSet::default();
+        for file in files {
+            if let Some(file_keys) = self.path_index.get(file) {
+                keys.extend(file_keys);
+            }
+        }
+        ScanScope::Files(keys)
+    }
+
     /// Every path-backed file this environment currently has declarations
     /// for. ADR-0028 S8: warm change detection needs this superset of the
     /// persisted `fingerprints` baseline, since a file added
@@ -1064,6 +1076,38 @@ impl Environment {
             NormalizeModuleNameResult::UnknownTarget { original, .. }
             | NormalizeModuleNameResult::Cycle { original }
             | NormalizeModuleNameResult::NotClassOrModule { original } => original,
+        }
+    }
+
+    /// Mirrors rbs `Environment#normalize_type_name`
+    /// (`normalize_type_name?(name) || name`): a class-kind name goes
+    /// through [`Self::normalize_module_name`] whole; an alias /
+    /// interface-kind name keeps its own last segment and has only its
+    /// namespace normalized (`A::t` with `class A = ::Target` becomes
+    /// `::Target::t`). When the namespace cannot be normalized (cycle,
+    /// unknown alias target, undeclared parent) the input is returned
+    /// unchanged, exactly like the `|| name` fallback.
+    ///
+    /// Resolution (relative → absolute, rbs `absolute_type_name`) is a
+    /// separate step that runs first; this only rewrites alias names
+    /// to their targets. Called by type lowering so no lowered `Ty`
+    /// carries a class alias name (Steep displays the normalized name).
+    pub fn normalize_type_name(&self, name: TypeName) -> TypeName {
+        if self.names.is_class(name) {
+            return self.normalize_module_name(&name);
+        }
+        let Some(parent) = self.names.type_name_parent(name) else {
+            return name;
+        };
+        if self.names.type_name_is_root(parent) {
+            return name;
+        }
+        let Some(last) = self.names.last_segment(name) else {
+            return name;
+        };
+        match self.normalize_module_name_result(&parent) {
+            NormalizeModuleNameResult::Normalized(p) => self.names.append_type_name(p, last),
+            _ => name,
         }
     }
 
@@ -1317,4 +1361,55 @@ fn remove_class_or_module_decls(
         }
     }
     false
+}
+
+/// Which declarations the diagnostics-only environment walks start from
+/// (ADR-0036 Decision 4-2). Those walks — `DefinitionBuilder`'s
+/// construction-time method / variable dup scans and every
+/// `validator::full_validate` sub-check — exist only to produce
+/// diagnostics; the type checker never reads their results. Under a CLI
+/// file filter (ADR-0029: positional targets filter the *output*, scope
+/// is `crema.toml`'s `check`) every diagnostic they produce for an owner
+/// outside the filter's files is dropped at render time, so building it
+/// is wasted work: on a single-file check those walks were ~2/5 of the
+/// wall before the check phase even began.
+///
+/// `Files` restricts each walk to the owners `path_index` attributes to
+/// the filter's files. That is output-preserving because a diagnostic
+/// located in file `F` always comes from an owner that has a declaration
+/// in `F` — a method / variable dup anchors on a member of one of the
+/// owner's decls, an arity violation on a mixin clause of the host's
+/// decl, an ancestor / type-alias cycle on its anchor participant's
+/// primary decl, an alias-target error on the alias decl itself — and
+/// `path_index` records an owner under every file holding one of its
+/// decls, infusion's concern expansions included (they are inserted under
+/// the concern's file). Cross-file relations are still followed from
+/// those seeds (reopens are walked through the owner's merged entry,
+/// cycles through the reachable graph), so what the seeds produce is
+/// identical to what the whole walk produced for them.
+///
+/// Walk *order* is also preserved: a scoped walk iterates the same maps
+/// as the whole walk and skips non-members, rather than iterating the
+/// seed set — `sort_by_canonical_order` breaks ties by insertion order,
+/// and two owners can emit diagnostics with an identical sort key (one
+/// concern `def` expanded into several models anchors every dup on the
+/// same concern-file location).
+#[derive(Debug, Clone)]
+pub enum ScanScope {
+    /// Every declaration — a project-wide check, `extract`,
+    /// `--update-baseline`: no filter, so every diagnostic reaches output.
+    Whole,
+    /// Only the owners the filter's files declared, as `path_index` keys.
+    /// Built by [`Environment::scan_scope_for_files`].
+    Files(FxHashSet<PathIndexKey>),
+}
+
+impl ScanScope {
+    /// Whether a walk should visit the owner `key` names.
+    pub fn admits(&self, key: PathIndexKey) -> bool {
+        match self {
+            ScanScope::Whole => true,
+            ScanScope::Files(keys) => keys.contains(&key),
+        }
+    }
 }

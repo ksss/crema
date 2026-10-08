@@ -24,13 +24,11 @@
 //! provided.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
 use std::sync::Arc;
 
 use super::MixinRef;
 use super::ancestor_graph::Node;
-use super::lowering_maps::LoweringMaps;
-use super::type_lowering::{LoweringEnv, build_lowering_maps, class_alias_old_name};
+use super::type_lowering::LoweringEnv;
 use crate::ast::TypeParam as AstTypeParam;
 use crate::ast::declarations::{AsMember, Member};
 use crate::ast::ruby::members::{Member as RubyMember, MixinMember as RubyMixinMember};
@@ -41,6 +39,7 @@ use crate::environment::frozen::{
 };
 use crate::location::{LocationRange, SourceLocation};
 use crate::name::NameTable;
+use crate::once_map::OnceMap;
 use crate::substitution::Substitution;
 use crate::type_name::{Kind, TypeName};
 use crate::type_param::{
@@ -202,8 +201,9 @@ enum Side {
     Singleton,
 }
 
-/// `Clone` deep-copies every cache (`RefCell` clone copies the inner
-/// map) — added for the same reason as [`Environment`]'s own `Clone`
+/// `Clone` copies every cache into a fresh map (the entries are the same
+/// `Arc`s; later inserts on either side stay on that side) — added for
+/// the same reason as [`Environment`]'s own `Clone`
 /// (ADR-0028 `_internal incr-bench`, and now [`AncestorGraph`]'s
 /// bench-only per-iteration clone — see its doc): a caller that keeps an
 /// old generation alive alongside a delta-updated new one needs an
@@ -222,20 +222,15 @@ pub struct AncestorBuilder {
     /// the persisted Ty-*keyed cache* ADR-0028 Decision 3 forbids (that
     /// decision targets invalidation-unsound caches like `subtype_cache`).
     types: Arc<TypeTable>,
-    /// `Arc`-shared declared-name membership + class-alias map for cheap
-    /// `LoweringEnv` reconstruction. Built once in [`Self::new`]; every
-    /// `lowering()` call goes through [`LoweringEnv::from_maps`] instead
-    /// of re-walking every declaration.
-    lowering_maps: Arc<LoweringMaps>,
     /// Name-keyed memoization of [`Self::one_instance_ancestors`].
     /// `OneAncestors` is a function of the canonical (post-`normalize_module_name`)
     /// `TypeName` and the frozen environment, both of which are immutable
     /// over `AncestorBuilder`'s lifetime, so cache invalidation is not a
     /// concern. The cache mirrors rbs `@one_instance_ancestors_cache` in
     /// `lib/rbs/definition_builder/ancestor_builder.rb`.
-    one_instance_cache: RefCell<FxHashMap<TypeName, Arc<OneAncestors>>>,
-    one_singleton_cache: RefCell<FxHashMap<TypeName, Arc<OneAncestors>>>,
-    one_interface_cache: RefCell<FxHashMap<TypeName, Arc<OneAncestors>>>,
+    one_instance_cache: OnceMap<TypeName, Arc<OneAncestors>>,
+    one_singleton_cache: OnceMap<TypeName, Arc<OneAncestors>>,
+    one_interface_cache: OnceMap<TypeName, Arc<OneAncestors>>,
     /// Full-linearization memoization, mirroring rbs
     /// `@instance_ancestors_cache` / `@singleton_ancestors_cache` /
     /// `@interface_ancestors_cache`. Keyed by the same canonical
@@ -245,15 +240,17 @@ pub struct AncestorBuilder {
     /// that type plus the environment, so caching it is sound.
     ///
     /// Cyclic ancestors (mutual includes) are malformed input that rbs
-    /// rejects with `RecursiveAncestorError`. crema does not raise; the
-    /// `visited` guard returns an empty chain at the re-entrant node, and
-    /// the cache may then store a build-order-dependent partial for the
-    /// cyclic types. This divergence is left unaddressed: it is bounded to
-    /// declarations rbs would not accept, never panics, and termination
-    /// still holds via `visited`.
-    instance_ancestors_cache: RefCell<FxHashMap<TypeName, Arc<InstanceAncestors>>>,
-    singleton_ancestors_cache: RefCell<FxHashMap<TypeName, Arc<SingletonAncestors>>>,
-    interface_ancestors_cache: RefCell<FxHashMap<TypeName, Arc<InstanceAncestors>>>,
+    /// rejects with `RecursiveAncestorError`, unwinding before anything
+    /// on the cycle reaches its cache. crema does not raise: the
+    /// [`BuildStack`] guard returns an empty chain at the re-entrant
+    /// node, so a chain built on a cycle depends on which names were
+    /// already on the stack. Such chains are never stored (see
+    /// [`BuildStack`]); a type on a cycle is rebuilt per request, which
+    /// makes its chain the one a fresh builder gives when asked for that
+    /// type alone, whatever was requested before (and from which thread).
+    instance_ancestors_cache: OnceMap<TypeName, Arc<InstanceAncestors>>,
+    singleton_ancestors_cache: OnceMap<TypeName, Arc<SingletonAncestors>>,
+    interface_ancestors_cache: OnceMap<TypeName, Arc<InstanceAncestors>>,
     /// Companion cache (crema-only, ADR-0028 S3b-2): for every `node`
     /// whose one-ancestors computation dropped a mixin/super reference
     /// because `resolve_mixin_target` found no declaration for the
@@ -272,7 +269,7 @@ pub struct AncestorBuilder {
     /// `AncestorGraph::unresolved`) can find `C` from `::Missing` alone,
     /// without needing to know `A` was ever involved.
     ///
-    unresolved: RefCell<FxHashMap<Node, FxHashSet<TypeName>>>,
+    unresolved: OnceMap<Node, FxHashSet<TypeName>>,
 }
 
 impl AncestorBuilder {
@@ -281,26 +278,17 @@ impl AncestorBuilder {
     }
 
     pub fn with_types(env: Arc<Environment>, types: TypeTable) -> Self {
-        let (all_names, class_aliases) = build_lowering_maps(&env, env.names());
         Self {
             env,
             types: Arc::new(types),
-            lowering_maps: Arc::new(LoweringMaps::from_owned_maps(all_names, class_aliases)),
-            one_instance_cache: RefCell::new(FxHashMap::default()),
-            one_singleton_cache: RefCell::new(FxHashMap::default()),
-            one_interface_cache: RefCell::new(FxHashMap::default()),
-            instance_ancestors_cache: RefCell::new(FxHashMap::default()),
-            singleton_ancestors_cache: RefCell::new(FxHashMap::default()),
-            interface_ancestors_cache: RefCell::new(FxHashMap::default()),
-            unresolved: RefCell::new(FxHashMap::default()),
+            one_instance_cache: OnceMap::default(),
+            one_singleton_cache: OnceMap::default(),
+            one_interface_cache: OnceMap::default(),
+            instance_ancestors_cache: OnceMap::default(),
+            singleton_ancestors_cache: OnceMap::default(),
+            interface_ancestors_cache: OnceMap::default(),
+            unresolved: OnceMap::default(),
         }
-    }
-
-    /// The shared lowering maps — test-only today, to compare a
-    /// delta-patched copy against a from-scratch build.
-    #[cfg(test)]
-    pub(crate) fn lowering_parts(&self) -> &Arc<LoweringMaps> {
-        &self.lowering_maps
     }
 
     /// crema-only: rbs's `AncestorBuilder` has no `update` counterpart —
@@ -318,73 +306,27 @@ impl AncestorBuilder {
     /// [`DefinitionBuilder::update`](crate::definition_builder::DefinitionBuilder::update)).
     /// `self.types` is shared (not rebuilt) with the returned builder —
     /// see the field's doc for why that is sound.
-    ///
-    /// `lowering_maps` is delta-patched from `self`'s copy (ADR-0028 S4b,
-    /// S2 follow-up): touching only `except` plus `changed_constants`
-    /// (`InvalidationResult::constants`; `except`/
-    /// `InvalidationResult::type_names` deliberately excludes constants,
-    /// see that field's doc, but this patch's name-membership check needs
-    /// them too) instead of re-walking every declaration the way
-    /// [`build_lowering_maps`] does. Correctness depends on `except` ∪
-    /// `changed_constants` being a superset of every `TypeName` whose
-    /// class/module/interface/type-alias/class-alias/constant declaration
-    /// entry appeared or disappeared between the old and new environment
-    /// — [`crate::environment::invalidation::invalidated_names`] already
-    /// guarantees this for its own two fields.
-    pub fn update(
-        &self,
-        env: Arc<Environment>,
-        except: &FxHashSet<TypeName>,
-        changed_constants: &FxHashSet<TypeName>,
-    ) -> Self {
-        let mut new_maps = (*self.lowering_maps).clone();
-        let names = env.names();
-        for &owner in except.iter().chain(changed_constants) {
-            let n = names.intern(&names.resolve(owner));
-            let declared = env.class_decls().contains_key(&owner)
-                || env.interface_decls().contains_key(&owner)
-                || env.type_alias_decls().contains_key(&owner)
-                || env.constant_decls().contains_key(&owner)
-                || env.class_alias_decls().contains_key(&owner);
-            if declared {
-                new_maps.insert_name(n);
-            } else {
-                new_maps.remove_name(n);
-            }
-
-            match env
-                .class_alias_decls()
-                .get(&owner)
-                .and_then(|entry| class_alias_old_name(entry, names))
-            {
-                Some(old_n) => {
-                    new_maps.insert_alias(n, old_n);
-                }
-                None => {
-                    new_maps.remove_alias(n);
-                }
-            }
-        }
+    pub fn update(&self, env: Arc<Environment>, except: &FxHashSet<TypeName>) -> Self {
         // Carry the `unresolved` cache forward minus the `except`ed
         // nodes; `record_unresolved` below re-populates any of them this
         // pass actually re-walks.
-        let mut new_unresolved = self.unresolved.borrow().clone();
-        for &name in except {
-            for node in [Node::InstanceNode(name), Node::SingletonNode(name)] {
-                new_unresolved.remove(&node);
+        let new_unresolved = OnceMap::default();
+        for (node, misses) in self.unresolved.iter() {
+            let (Node::InstanceNode(name) | Node::SingletonNode(name)) = node;
+            if !except.contains(name) {
+                new_unresolved.insert_first(*node, misses.clone());
             }
         }
         let result = Self {
             env,
             types: Arc::clone(&self.types),
-            lowering_maps: Arc::new(new_maps),
-            one_instance_cache: RefCell::new(FxHashMap::default()),
-            one_singleton_cache: RefCell::new(FxHashMap::default()),
-            one_interface_cache: RefCell::new(FxHashMap::default()),
-            instance_ancestors_cache: RefCell::new(FxHashMap::default()),
-            singleton_ancestors_cache: RefCell::new(FxHashMap::default()),
-            interface_ancestors_cache: RefCell::new(FxHashMap::default()),
-            unresolved: RefCell::new(new_unresolved),
+            one_instance_cache: OnceMap::default(),
+            one_singleton_cache: OnceMap::default(),
+            one_interface_cache: OnceMap::default(),
+            instance_ancestors_cache: OnceMap::default(),
+            singleton_ancestors_cache: OnceMap::default(),
+            interface_ancestors_cache: OnceMap::default(),
+            unresolved: new_unresolved,
         };
         carry_over_arc_cache(&self.one_instance_cache, &result.one_instance_cache, except);
         carry_over_arc_cache(
@@ -420,11 +362,7 @@ impl AncestorBuilder {
     /// not resolve. Read by [`AncestorGraph`](super::ancestor_graph::AncestorGraph)
     /// to build/delta-update its target-keyed `unresolved` reverse index.
     pub(super) fn unresolved_misses(&self, node: Node) -> FxHashSet<TypeName> {
-        self.unresolved
-            .borrow()
-            .get(&node)
-            .cloned()
-            .unwrap_or_default()
+        self.unresolved.get(&node).cloned().unwrap_or_default()
     }
 
     pub fn env(&self) -> &Environment {
@@ -436,11 +374,7 @@ impl AncestorBuilder {
     }
 
     pub(crate) fn lowering(&self) -> LoweringEnv<'_> {
-        LoweringEnv::from_maps(
-            Arc::clone(&self.lowering_maps),
-            self.env.names(),
-            &self.types,
-        )
+        LoweringEnv::from_environment(&self.env, &self.types)
     }
 
     /// Resolve own super_class / included / prepended / extended for an
@@ -491,53 +425,48 @@ impl AncestorBuilder {
     /// passing a `class A = ::Real`-style alias produces a duplicate
     /// cache entry under the alias key.
     fn one_instance_cached(&self, name: &TypeName) -> Arc<OneAncestors> {
-        if let Some(v) = self.one_instance_cache.borrow().get(name) {
+        if let Some(v) = self.one_instance_cache.get(name) {
             return Arc::clone(v);
         }
         let lowering = self.lowering();
         let mut misses = FxHashSet::default();
         let computed = Arc::new(self.one_instance_ancestors_with(name, &lowering, &mut misses));
-        self.one_instance_cache
-            .borrow_mut()
-            .insert(*name, Arc::clone(&computed));
         self.record_unresolved(Node::InstanceNode(*name), misses);
-        computed
+        Arc::clone(self.one_instance_cache.insert_first(*name, computed))
     }
 
     fn one_singleton_cached(&self, name: &TypeName) -> Arc<OneAncestors> {
-        if let Some(v) = self.one_singleton_cache.borrow().get(name) {
+        if let Some(v) = self.one_singleton_cache.get(name) {
             return Arc::clone(v);
         }
         let lowering = self.lowering();
         let mut misses = FxHashSet::default();
         let computed = Arc::new(self.one_singleton_ancestors_with(name, &lowering, &mut misses));
-        self.one_singleton_cache
-            .borrow_mut()
-            .insert(*name, Arc::clone(&computed));
         self.record_unresolved(Node::SingletonNode(*name), misses);
-        computed
+        Arc::clone(self.one_singleton_cache.insert_first(*name, computed))
     }
 
     fn one_interface_cached(&self, name: &TypeName) -> Arc<OneAncestors> {
-        if let Some(v) = self.one_interface_cache.borrow().get(name) {
+        if let Some(v) = self.one_interface_cache.get(name) {
             return Arc::clone(v);
         }
         let mut misses = FxHashSet::default();
         let computed = Arc::new(self.compute_one_interface_ancestors(name, &mut misses));
-        self.one_interface_cache
-            .borrow_mut()
-            .insert(*name, Arc::clone(&computed));
         self.record_unresolved(Node::InstanceNode(*name), misses);
-        computed
+        Arc::clone(self.one_interface_cache.insert_first(*name, computed))
     }
 
-    /// Merge `misses` (ADR-0028 S3b-2) into [`Self::unresolved`] under
-    /// `node`, skipping empty sets so the cache never holds an entry with
-    /// no misses (matches the invariant the other `one_*_cache`s'
-    /// insert-on-compute pattern keeps implicitly).
+    /// Record `misses` (ADR-0028 S3b-2) in [`Self::unresolved`] under
+    /// `node` — first write wins, like the `one_*_cache` entry it
+    /// accompanies — skipping empty sets so the cache never holds an
+    /// entry with no misses (matches the invariant the other
+    /// `one_*_cache`s' insert-on-compute pattern keeps implicitly).
+    ///
+    /// Callers record before they publish the `one_*_cache` entry, so a
+    /// thread that hits that cache finds the misses already in place.
     fn record_unresolved(&self, node: Node, misses: FxHashSet<TypeName>) {
         if !misses.is_empty() {
-            self.unresolved.borrow_mut().insert(node, misses);
+            self.unresolved.insert_first(node, misses);
         }
     }
 
@@ -752,32 +681,45 @@ impl AncestorBuilder {
     /// single [`InstanceAncestors::apply`] at the top binds concrete
     /// args throughout the chain.
     pub fn instance_ancestors(&self, name: &TypeName) -> Arc<InstanceAncestors> {
-        self.build_instance_ancestors(name, &mut FxHashSet::default())
+        self.build_instance_ancestors(name, &mut BuildStack::default())
+            .0
     }
 
     /// Build the fully linearized singleton ancestors of `name`.
     pub fn singleton_ancestors(&self, name: &TypeName) -> Arc<SingletonAncestors> {
-        self.build_singleton_ancestors(name, &mut FxHashSet::default())
+        self.build_singleton_ancestors(name, &mut BuildStack::default())
+            .0
+    }
+
+    /// [`Self::singleton_ancestors`] plus whether the build re-entered
+    /// `name` itself, i.e. `name` sits on a superclass cycle (which rbs
+    /// rejects with `RecursiveAncestorError`).
+    pub fn singleton_ancestors_on_cycle(&self, name: &TypeName) -> (Arc<SingletonAncestors>, bool) {
+        let (chain, low) = self.build_singleton_ancestors(name, &mut BuildStack::default());
+        (chain, low == 0)
     }
 
     /// Build the fully linearized interface ancestors of `name`.
     pub fn interface_ancestors(&self, name: &TypeName) -> Arc<InstanceAncestors> {
-        self.build_interface_ancestors(name, &mut FxHashSet::default())
+        self.build_interface_ancestors(name, &mut BuildStack::default())
+            .0
     }
 
+    /// Returns the chain and the shallowest [`BuildStack`] depth the
+    /// build re-entered ([`NO_REENTRY`] if none).
     fn build_instance_ancestors(
         &self,
         name: &TypeName,
-        visited: &mut FxHashSet<TypeName>,
-    ) -> Arc<InstanceAncestors> {
+        stack: &mut BuildStack,
+    ) -> (Arc<InstanceAncestors>, usize) {
         let normalized = self.env.normalize_module_name(name);
 
-        // Full-linearization cache check, mirroring rbs ancestor_builder.rb:493.
+        // Full-linearization cache check, mirroring rbs ancestor_builder.rb:496.
         // Runs *before* the cycle guard so a completed build is reused when
-        // reached recursively. For acyclic graphs the stored chain is the
-        // canonical one (cycle divergence is documented on the cache field).
-        if let Some(cached) = self.instance_ancestors_cache.borrow().get(&normalized) {
-            return Arc::clone(cached);
+        // reached recursively. Only chains off any cycle are stored, so a
+        // hit never carries a cut made under another request's stack.
+        if let Some(cached) = self.instance_ancestors_cache.get(&normalized) {
+            return (Arc::clone(cached), NO_REENTRY);
         }
 
         let one = self.one_instance_cached(&normalized);
@@ -789,15 +731,21 @@ impl AncestorBuilder {
         // it is mixed in along two different chains (e.g. `class B < A;
         // include M; end` where A also includes M — Ruby yields M in both
         // positions). A persistent set would silently drop the second M.
-        // The empty result returned here is the cyclic-input divergence
-        // documented on the cache field (rbs raises instead).
-        if !visited.insert(normalized) {
-            return Arc::new(InstanceAncestors {
-                type_name: normalized,
-                params,
-                ancestors: Vec::new(),
-            });
-        }
+        // The empty result returned here is where rbs raises instead.
+        let depth = match stack.enter(normalized) {
+            Ok(depth) => depth,
+            Err(reentered) => {
+                return (
+                    Arc::new(InstanceAncestors {
+                        type_name: normalized,
+                        params,
+                        ancestors: Vec::new(),
+                    }),
+                    reentered,
+                );
+            }
+        };
+        let mut low = NO_REENTRY;
 
         let self_args: Vec<Ty> = params
             .iter()
@@ -822,21 +770,24 @@ impl AncestorBuilder {
             ..
         }) = &one.super_class
         {
-            let super_ia = self.build_instance_ancestors(super_name, visited);
+            let (super_ia, l) = self.build_instance_ancestors(super_name, stack);
+            low = low.min(l);
             let mut super_subs = super_ia.apply(super_args, &self.types);
             fill_ancestor_source(&mut super_subs, super_name, AncestorSource::Super);
             prepend_in_place(&mut ancestors, super_subs);
         }
 
         for mixin in &one.included_modules {
-            let mod_ia = self.build_instance_ancestors(&mixin.name, visited);
+            let (mod_ia, l) = self.build_instance_ancestors(&mixin.name, stack);
+            low = low.min(l);
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut mod_subs, &mixin.name, AncestorSource::Include);
             prepend_in_place(&mut ancestors, mod_subs);
         }
 
         for mixin in &one.included_interfaces {
-            let iface_ia = self.build_interface_ancestors(&mixin.name, visited);
+            let (iface_ia, l) = self.build_interface_ancestors(&mixin.name, stack);
+            low = low.min(l);
             let mut iface_subs = iface_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut iface_subs, &mixin.name, AncestorSource::Include);
             prepend_in_place(&mut ancestors, iface_subs);
@@ -845,46 +796,64 @@ impl AncestorBuilder {
         ancestors.insert(0, self_ancestor);
 
         for mixin in &one.prepended_modules {
-            let mod_ia = self.build_instance_ancestors(&mixin.name, visited);
+            let (mod_ia, l) = self.build_instance_ancestors(&mixin.name, stack);
+            low = low.min(l);
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut mod_subs, &mixin.name, AncestorSource::Prepend);
             prepend_in_place(&mut ancestors, mod_subs);
         }
 
-        visited.remove(&normalized);
+        stack.leave(&normalized);
         let result = Arc::new(InstanceAncestors {
             type_name: normalized,
             params,
             ancestors,
         });
-        self.instance_ancestors_cache
-            .borrow_mut()
-            .insert(normalized, Arc::clone(&result));
-        result
+        if low <= depth {
+            return (result, low);
+        }
+        (
+            Arc::clone(
+                self.instance_ancestors_cache
+                    .insert_first(normalized, result),
+            ),
+            NO_REENTRY,
+        )
     }
 
+    /// Same return shape as [`Self::build_instance_ancestors`]. `stack`
+    /// holds singleton names only: the instance chains built from here
+    /// (super flip, extend, prepend) start their own stack, since an
+    /// instance build never comes back to a singleton.
     fn build_singleton_ancestors(
         &self,
         name: &TypeName,
-        visited: &mut FxHashSet<TypeName>,
-    ) -> Arc<SingletonAncestors> {
+        stack: &mut BuildStack,
+    ) -> (Arc<SingletonAncestors>, usize) {
         let normalized = self.env.normalize_module_name(name);
 
         // Full-linearization cache check before the cycle guard. See
         // `build_instance_ancestors`.
-        if let Some(cached) = self.singleton_ancestors_cache.borrow().get(&normalized) {
-            return Arc::clone(cached);
+        if let Some(cached) = self.singleton_ancestors_cache.get(&normalized) {
+            return (Arc::clone(cached), NO_REENTRY);
         }
 
         let self_ancestor = Ancestor::Singleton { name: normalized };
 
         // Stack-style cycle guard. See `build_instance_ancestors`.
-        if !visited.insert(normalized) {
-            return Arc::new(SingletonAncestors {
-                type_name: normalized,
-                ancestors: Vec::new(),
-            });
-        }
+        let depth = match stack.enter(normalized) {
+            Ok(depth) => depth,
+            Err(reentered) => {
+                return (
+                    Arc::new(SingletonAncestors {
+                        type_name: normalized,
+                        ancestors: Vec::new(),
+                    }),
+                    reentered,
+                );
+            }
+        };
+        let mut low = NO_REENTRY;
 
         let one = self.one_singleton_cached(&normalized);
         let mut ancestors: Vec<Ancestor> = Vec::new();
@@ -896,20 +865,21 @@ impl AncestorBuilder {
                 ..
             }) => {
                 // BasicObject / Module singleton flips to instance chain.
-                let super_ia = self.build_instance_ancestors(super_name, &mut FxHashSet::default());
+                let super_ia = self.instance_ancestors(super_name);
                 let mut super_subs = super_ia.apply(super_args, &self.types);
                 fill_ancestor_source(&mut super_subs, super_name, AncestorSource::Super);
                 prepend_in_place(&mut ancestors, super_subs);
             }
             Some(Ancestor::Singleton { name: super_name }) => {
-                let super_sa = self.build_singleton_ancestors(super_name, visited);
+                let (super_sa, l) = self.build_singleton_ancestors(super_name, stack);
+                low = low.min(l);
                 prepend_in_place(&mut ancestors, super_sa.ancestors.clone());
             }
             None => {}
         }
 
         for mixin in &one.extended_modules {
-            let mod_ia = self.build_instance_ancestors(&mixin.name, &mut FxHashSet::default());
+            let mod_ia = self.instance_ancestors(&mixin.name);
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             // Match rbs L607-614: `singleton_ancestors`' extended_modules
             // loop fills the chain root with `mod.source`, i.e. the
@@ -920,7 +890,7 @@ impl AncestorBuilder {
             prepend_in_place(&mut ancestors, mod_subs);
         }
         for mixin in &one.extended_interfaces {
-            let iface_ia = self.build_interface_ancestors(&mixin.name, &mut FxHashSet::default());
+            let iface_ia = self.interface_ancestors(&mixin.name);
             let mut iface_subs = iface_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut iface_subs, &mixin.name, AncestorSource::Extend);
             prepend_in_place(&mut ancestors, iface_subs);
@@ -929,46 +899,60 @@ impl AncestorBuilder {
         ancestors.insert(0, self_ancestor);
 
         for mixin in &one.prepended_modules {
-            let mod_ia = self.build_instance_ancestors(&mixin.name, &mut FxHashSet::default());
+            let mod_ia = self.instance_ancestors(&mixin.name);
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut mod_subs, &mixin.name, AncestorSource::Prepend);
             prepend_in_place(&mut ancestors, mod_subs);
         }
 
-        visited.remove(&normalized);
+        stack.leave(&normalized);
         let result = Arc::new(SingletonAncestors {
             type_name: normalized,
             ancestors,
         });
-        self.singleton_ancestors_cache
-            .borrow_mut()
-            .insert(normalized, Arc::clone(&result));
-        result
+        if low <= depth {
+            return (result, low);
+        }
+        (
+            Arc::clone(
+                self.singleton_ancestors_cache
+                    .insert_first(normalized, result),
+            ),
+            NO_REENTRY,
+        )
     }
 
+    /// Same return shape as [`Self::build_instance_ancestors`].
     fn build_interface_ancestors(
         &self,
         name: &TypeName,
-        visited: &mut FxHashSet<TypeName>,
-    ) -> Arc<InstanceAncestors> {
+        stack: &mut BuildStack,
+    ) -> (Arc<InstanceAncestors>, usize) {
         // Full-linearization cache check before the cycle guard. Interfaces
         // are keyed by `name` directly (no `normalize_module_name`), matching
         // `one_interface_cached`. See `build_instance_ancestors`.
-        if let Some(cached) = self.interface_ancestors_cache.borrow().get(name) {
-            return Arc::clone(cached);
+        if let Some(cached) = self.interface_ancestors_cache.get(name) {
+            return (Arc::clone(cached), NO_REENTRY);
         }
 
         let one = self.one_interface_cached(name);
         let params: Vec<TypeVarKey> = one.params.iter().map(|tp| tp.name.clone()).collect();
 
         // Stack-style cycle guard. See `build_instance_ancestors`.
-        if !visited.insert(*name) {
-            return Arc::new(InstanceAncestors {
-                type_name: *name,
-                params,
-                ancestors: Vec::new(),
-            });
-        }
+        let depth = match stack.enter(*name) {
+            Ok(depth) => depth,
+            Err(reentered) => {
+                return (
+                    Arc::new(InstanceAncestors {
+                        type_name: *name,
+                        params,
+                        ancestors: Vec::new(),
+                    }),
+                    reentered,
+                );
+            }
+        };
+        let mut low = NO_REENTRY;
 
         let self_args: Vec<Ty> = params
             .iter()
@@ -988,7 +972,8 @@ impl AncestorBuilder {
         let mut ancestors: Vec<Ancestor> = Vec::new();
 
         for mixin in &one.included_interfaces {
-            let iface_ia = self.build_interface_ancestors(&mixin.name, visited);
+            let (iface_ia, l) = self.build_interface_ancestors(&mixin.name, stack);
+            low = low.min(l);
             let mut iface_subs = iface_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut iface_subs, &mixin.name, AncestorSource::Include);
             prepend_in_place(&mut ancestors, iface_subs);
@@ -996,30 +981,81 @@ impl AncestorBuilder {
 
         ancestors.insert(0, self_ancestor);
 
-        visited.remove(name);
+        stack.leave(name);
         let result = Arc::new(InstanceAncestors {
             type_name: *name,
             params,
             ancestors,
         });
-        self.interface_ancestors_cache
-            .borrow_mut()
-            .insert(*name, Arc::clone(&result));
-        result
+        if low <= depth {
+            return (result, low);
+        }
+        (
+            Arc::clone(self.interface_ancestors_cache.insert_first(*name, result)),
+            NO_REENTRY,
+        )
+    }
+}
+
+/// "No name still on the stack was re-entered" for the `low` a
+/// `build_*_ancestors` returns.
+const NO_REENTRY: usize = usize::MAX;
+
+/// The names one ancestor request is building, each with its depth
+/// (rbs's `building_ancestors`).
+///
+/// A build that re-enters a name at depth `d` cuts the chain there, so
+/// its result depends on what sits on the stack at `d` and below. The
+/// builds return the shallowest depth they re-entered, and a build at
+/// depth `depth` stores its chain only when that is deeper than
+/// `depth`: then every cut it made was inside its own subtree, and a
+/// fresh request for that name alone would have made the same cuts.
+/// A shallower (or equal) re-entry means the name lies on a cycle
+/// through the stack, so its chain is returned but not stored.
+///
+/// The depth comes up from the whole subtree, not only from a build's
+/// own re-entries: on `A -> B -> C -> A` requested from `A`, only `C`
+/// re-enters (at `A`), yet `B`'s chain lacks the `A` a lone request for
+/// `B` would have expanded.
+///
+/// Rebuilding a name on a cycle per request costs what its chain is
+/// long. That stays small for real cycles, but `n` modules that all
+/// include each other give chains of about `(n-1)!` entries (`n = 10`:
+/// ~4s). Accepted: the input already reports `RecursiveAncestorError`.
+#[derive(Default)]
+struct BuildStack {
+    depth: FxHashMap<TypeName, usize>,
+}
+
+impl BuildStack {
+    /// Push `name` and return its depth, or the depth it already sits
+    /// at when this is a re-entry.
+    fn enter(&mut self, name: TypeName) -> Result<usize, usize> {
+        let depth = self.depth.len();
+        match self.depth.entry(name) {
+            std::collections::hash_map::Entry::Occupied(e) => Err(*e.get()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(depth);
+                Ok(depth)
+            }
+        }
+    }
+
+    fn leave(&mut self, name: &TypeName) {
+        self.depth.remove(name);
     }
 }
 
 /// Copy every `src` entry not in `except` into `dst`. Shared by
 /// [`AncestorBuilder::update`]'s six `TypeName`-keyed `Arc` caches.
 fn carry_over_arc_cache<V>(
-    src: &RefCell<FxHashMap<TypeName, Arc<V>>>,
-    dst: &RefCell<FxHashMap<TypeName, Arc<V>>>,
+    src: &OnceMap<TypeName, Arc<V>>,
+    dst: &OnceMap<TypeName, Arc<V>>,
     except: &FxHashSet<TypeName>,
 ) {
-    let mut dst_map = dst.borrow_mut();
-    for (name, value) in src.borrow().iter() {
+    for (name, value) in src.iter() {
         if !except.contains(name) {
-            dst_map.insert(*name, Arc::clone(value));
+            dst.insert_first(*name, Arc::clone(value));
         }
     }
 }

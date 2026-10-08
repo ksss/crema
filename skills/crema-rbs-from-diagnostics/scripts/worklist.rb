@@ -189,7 +189,10 @@ File.foreach(jsonl) do |line|
   when "Ruby::UnknownConstant" then unknown[r["path"].delete_prefix("::")] << r
   when "Ruby::NoMethod"
     # A union receiver (`::X | nil`) still cascades from each member.
-    r["receiver_type"].to_s.split(" | ").each do |t|
+    # `missing_from` lists the expanded members even when `receiver_type`
+    # shows an alias name (`::RBS::Types::t`), so prefer it.
+    members = r["missing_from"] || r["receiver_type"].to_s.split(" | ")
+    members.each do |t|
       no_method[t] += 1
       no_method_names[t][r["method_name"]] += 1
       no_method_files[t][r["file"]] += 1

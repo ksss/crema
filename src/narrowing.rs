@@ -22,6 +22,14 @@ use crate::definition_builder::{ConsultationView, expand_alias};
 use crate::subtyping::SubtypeChecker;
 use crate::types::{Literal, Ty, Type, union_of, union_of_many};
 
+/// `(truthy, falsy)` sides of `ty` for `&&` / `||` value types and
+/// predicate narrowing — [`crate::types::partition_union_with`] with
+/// aliases unfolded through `env`. `None` on a side means that branch
+/// is statically unreachable.
+pub fn partition_union(ty: Ty, env: ConsultationView) -> (Option<Ty>, Option<Ty>) {
+    crate::types::partition_union_with(ty, env.types(), &|t| expand_alias(env, t))
+}
+
 /// Return the intersection of `ty` with `target`.
 ///
 /// Empty intersection → `Ty::BOTTOM`. `Untyped` on the input narrows to

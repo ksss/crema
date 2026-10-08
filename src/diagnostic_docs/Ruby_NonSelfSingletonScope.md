@@ -4,6 +4,8 @@
 
 An inline Ruby `class << expr` where `expr` is not `self` opens an anonymous singleton class. RBS has no declaration shape for that target.
 
+Reported only in inline mode (`inline = true`). Sig mode reads no declarations from Ruby files, so it does not report this.
+
 ## Recommended severity
 
 Recommended severity: error.

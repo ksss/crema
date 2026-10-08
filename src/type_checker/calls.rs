@@ -1,4 +1,4 @@
-use ruby_prism::{ArgumentsNode, CallNode, Location, Node, SuperNode, Visit};
+use ruby_prism::{ArgumentsNode, CallNode, ForwardingSuperNode, Location, Node, SuperNode, Visit};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::ruby::annotations::TypeApplicationAnnotation;
@@ -7,6 +7,8 @@ use crate::definition_builder;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, ForwardingMismatchKind};
 use crate::inline_parser::TrailingAnnotation;
 use crate::location::SourceLocation;
+use crate::pure_call_env::PureKey;
+use crate::type_name::TypeName;
 use crate::type_param::TypeParamScope;
 use crate::types::{
     Block, Function, FunctionType, Literal, MethodType, RecordKey, Ty, Type, Visibility,
@@ -36,6 +38,9 @@ pub(super) type KwsplatKeys = Vec<(String, Ty)>;
 pub(super) enum CallSite<'a, 'pr> {
     Call(&'a CallNode<'pr>),
     Super(&'a SuperNode<'pr>),
+    /// Bare `super { ... }`: forwards the enclosing method's arguments, so
+    /// it has no argument list of its own. Only the block helpers use it.
+    ForwardingSuper(&'a ForwardingSuperNode<'pr>),
 }
 
 impl<'a, 'pr> CallSite<'a, 'pr> {
@@ -43,6 +48,7 @@ impl<'a, 'pr> CallSite<'a, 'pr> {
         match self {
             CallSite::Call(c) => c.arguments(),
             CallSite::Super(s) => s.arguments(),
+            CallSite::ForwardingSuper(_) => None,
         }
     }
 
@@ -50,13 +56,21 @@ impl<'a, 'pr> CallSite<'a, 'pr> {
         match self {
             CallSite::Call(c) => c.block(),
             CallSite::Super(s) => s.block(),
+            CallSite::ForwardingSuper(s) => s.block().map(|b| b.as_node()),
         }
+    }
+
+    /// True for a `{ ... }` / `do ... end` block, false for no block or a
+    /// `&blk` / `&:sym` block pass.
+    pub(super) fn has_block_literal(&self) -> bool {
+        self.block().is_some_and(|b| b.as_block_node().is_some())
     }
 
     pub(super) fn location(&self) -> Location<'pr> {
         match self {
             CallSite::Call(c) => c.location(),
             CallSite::Super(s) => s.location(),
+            CallSite::ForwardingSuper(s) => s.location(),
         }
     }
 
@@ -70,7 +84,7 @@ impl<'a, 'pr> CallSite<'a, 'pr> {
     pub(super) fn as_call_node(self) -> Option<&'a CallNode<'pr>> {
         match self {
             CallSite::Call(c) => Some(c),
-            CallSite::Super(_) => None,
+            CallSite::Super(_) | CallSite::ForwardingSuper(_) => None,
         }
     }
 }
@@ -88,15 +102,15 @@ pub(super) enum LiteralAccessResult {
 }
 
 /// Result of classifying a NoMethod receiver. The single-receiver path
-/// emits NoMethod on `Pass(widened)` (using the widened `Ty` so a
-/// `Literal(1)` receiver reports `::Integer` instead of `1`), a dev-only
+/// emits NoMethod on `Pass` (displaying the receiver as written, not the
+/// class it was widened to for the gate), a dev-only
 /// `Crema::NotImplementedYet` on `Unhandled` (to flag receiver kinds
-/// without a NoMethod arm yet), and stays silent via `verbose_log` on
-/// `Unnameable` (gate fail under partial RBS). The `Type::Union`
+/// without a NoMethod arm yet), and stays silent on `Unnameable` (gate
+/// fail under partial RBS). The `Type::Union`
 /// per-member path treats both non-`Pass` outcomes as "suppress the
 /// whole union" conservatively.
 pub(super) enum NoMethodReceiverGate {
-    Pass(Ty),
+    Pass,
     Unnameable,
     Unhandled,
 }
@@ -116,9 +130,26 @@ pub(super) struct ResolvedCall {
     pub receiver_ty: Ty,
 }
 
+/// A call's own pure-call key, as the code about to resolve the call
+/// holds it. Walking a chain top-down, the key of each receiver link is
+/// the receiver half of the key above it (`Send(r, m)` → `r`), so handing
+/// the key down keeps building it O(1) per link; rebuilding it at every
+/// link re-walked the chain to its base and made a chain of n calls cost
+/// n² (see `TypeChecker::receiver_pure_key`).
+pub(super) enum OwnKey {
+    /// No cache lookup preceded the resolution, so the key was never built.
+    Unbuilt,
+    /// `try_pure_key` of the call, built for the lookup that preceded it.
+    Built(Option<PureKey>),
+}
+
 impl ResolvedCall {
-    pub(super) fn resolve<'env, 'pr>(checker: &TypeChecker<'env>, call: &CallNode<'pr>) -> Self {
-        let receiver_ty = checker.infer_receiver_type(call);
+    pub(super) fn resolve<'env, 'pr>(
+        checker: &TypeChecker<'env>,
+        call: &CallNode<'pr>,
+        own_key: OwnKey,
+    ) -> Self {
+        let receiver_ty = checker.infer_receiver_type(call, own_key);
         let target = checker.resolve_call_target(call, receiver_ty);
         Self {
             target,
@@ -294,12 +325,249 @@ fn union_method_block_survives<'a>(
 }
 
 impl<'env> TypeChecker<'env> {
+    /// Check-pass counterpart of [`ResolvedCall::resolve`]: walks the
+    /// receiver subtree (emitting its diagnostics) and resolves the call
+    /// with the receiver type that walk produced, so each receiver is
+    /// typed once (Steep's `type_send` synthesizes the receiver once and
+    /// dispatches on it). `ResolvedCall::resolve` re-infers the receiver
+    /// with `infer_type`; doing that at every link of a call chain and
+    /// then walking the same link again made a chain of n calls cost n²
+    /// method resolutions.
+    ///
+    /// Call receivers are walked by [`Self::walk_receiver_call`]. Other
+    /// receivers keep inferring first and walking second: `check_node`
+    /// has no arm for many of them (interpolated regexps, `defined?`, …)
+    /// and would drop the diagnostics inside.
+    pub(super) fn resolve_call_in_check<'pr>(
+        &mut self,
+        call: &CallNode<'pr>,
+        own_key: OwnKey,
+    ) -> ResolvedCall {
+        let Some(receiver) = call.receiver() else {
+            return ResolvedCall::resolve(self, call, own_key);
+        };
+        let receiver_ty = if let Some(inner) = receiver.as_call_node() {
+            // Extract-mode hand-off: the receiver call's record gets the
+            // value the check computed for it, except where the resolved
+            // receiver type diverges from that value — safe navigation
+            // strips nil and an adjacent trailing `#: T` overrides it.
+            // The adjacency probe is a comment scan (no type lowering).
+            let carry = self.extract.is_some()
+                && !call.is_safe_navigation()
+                && self
+                    .trailing_node_assertion_adjacent(receiver.location().end_offset())
+                    .is_none();
+            let inner_key = self.receiver_pure_key(call, own_key);
+            let natural = self.walk_receiver_call(&inner, carry, inner_key);
+            // The same adjustments `infer_receiver_type` applies (a
+            // lambda literal is never a CallNode).
+            let ty = self
+                .lookup_receiver_trailing_assertion(&receiver)
+                .unwrap_or(natural);
+            if call.is_safe_navigation() {
+                self.unwrap_optional(ty)
+            } else {
+                ty
+            }
+        } else {
+            let ty = self.infer_receiver_type(call, own_key);
+            self.visit(&receiver);
+            ty
+        };
+        // Must run after the walk: the assertion gate reads the
+        // checker's live scope state, which only reflects a preceding
+        // sibling statement inside the receiver's own parens
+        // (`(\n a = 1\n a #: T\n).m`) once that statement has actually
+        // executed via the walk.
+        self.apply_receiver_assertion_gate(&receiver);
+        let target = self.resolve_call_target(call, receiver_ty);
+        ResolvedCall {
+            target,
+            receiver_ty,
+        }
+    }
+
+    /// Walk a call that sits in receiver position and return its value.
+    /// The walk is the one `visit_call_node` does (check, then an
+    /// extract record carrying the value when `carry`), and the value is
+    /// the one `infer_type` gives, computed after the walk (Ruby
+    /// evaluates a call's arguments before the call). The pure-call
+    /// cache is read before the walk, as `infer_type` did when it ran
+    /// ahead of it, and never written — a receiver reached this way does
+    /// not prove its chain pure (see `maybe_cache_pure_call`).
+    fn walk_receiver_call<'pr>(
+        &mut self,
+        call: &CallNode<'pr>,
+        carry: bool,
+        key: Option<PureKey>,
+    ) -> Ty {
+        let cached = self.pure_call_cached(key.as_ref());
+        let resolved = self.resolve_call_in_check(call, OwnKey::Built(key));
+        let ty = self.check_call_and_infer(call, None, &resolved, cached);
+        self.record_extract_call_site(call, &resolved, carry.then_some(ty));
+        ty
+    }
+
+    /// Pure-call cache lookup under `key`, the call's `try_pure_key`
+    /// (read only; see `walk_receiver_call`).
+    pub(super) fn pure_call_cached(&self, key: Option<&PureKey>) -> Option<Ty> {
+        let key = key?;
+        self.lookup_pure_overlay(key)
+            .or_else(|| self.ctx.pure_call_env().get(key))
+    }
+
+    /// Walk a call that sits in argument position. The walk is the one
+    /// `visit_call_node` does, under the slot `hint` the hinted collector
+    /// will ask for; the extract record carries the value when `carry`
+    /// (the canonical collection used to deposit it there). The value is
+    /// parked on the enclosing call's frame so the collectors read it
+    /// back (`infer_argument`) instead of inferring the subtree again.
+    /// The pure-call cache is read, never written, as for receivers.
+    fn walk_argument_call<'pr>(&mut self, call: &CallNode<'pr>, hint: Option<Ty>, carry: bool) {
+        let key = self.try_pure_key(&call.as_node());
+        let cached = self.pure_call_cached(key.as_ref());
+        let resolved = self.resolve_call_in_check(call, OwnKey::Built(key));
+        let ty = self.check_call_and_infer(call, hint, &resolved, cached);
+        self.record_extract_call_site(call, &resolved, carry.then_some(ty));
+        self.park_value(&call.as_node(), hint, ty);
+    }
+
+    fn park_value<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>, ty: Ty) {
+        if let Some(frame) = self.call_frames.borrow_mut().last_mut() {
+            frame.arguments.push(super::ArgumentValue {
+                span: (
+                    node.location().start_offset() as u32,
+                    node.location().end_offset() as u32,
+                ),
+                hint,
+                ty,
+            });
+        }
+    }
+
+    /// Type of one argument expression, for the collectors. A call
+    /// argument the enclosing call's walk already typed under the same
+    /// hint is read back from the frame — its subtree is not inferred
+    /// again, and its extract record already carries the value. Anything
+    /// else is inferred here and, in extract mode, carried to its record
+    /// point (`extract_carry_argument`).
+    pub(super) fn infer_argument<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>) -> Ty {
+        let span = (
+            node.location().start_offset() as u32,
+            node.location().end_offset() as u32,
+        );
+        if let Some(frame) = self.call_frames.borrow().last()
+            && let Some(value) = frame
+                .arguments
+                .iter()
+                .find(|a| a.span == span && a.hint == hint)
+        {
+            return value.ty;
+        }
+        let ty = self.infer_type(node, hint);
+        self.extract_carry_argument(node, ty);
+        ty
+    }
+
+    /// Extract record for a walked call site, with `return_type` the
+    /// value the walk computed for it (None when no frame consumed it).
+    pub(super) fn record_extract_call_site<'pr>(
+        &self,
+        call: &CallNode<'pr>,
+        resolved: &ResolvedCall,
+        return_type: Option<Ty>,
+    ) {
+        if let Some(target) = resolved.target.as_ref() {
+            self.record_extract_call(
+                call.location().start_offset(),
+                call.location().end_offset(),
+                target,
+                resolved.receiver_ty,
+                return_type,
+            );
+        } else {
+            self.record_extract_call_no_target(call, resolved.receiver_ty, return_type);
+        }
+    }
+
+    /// Receiver type of a call currently being checked by `check_call`,
+    /// if `call` is one of them. Helpers deep in the call check
+    /// (`check_no_method`, block-overload selection, bound checks) need
+    /// the receiver type again; re-inferring it re-walks the whole
+    /// receiver subtree. The frame lives for exactly one `check_call`,
+    /// so a body checked again with another self (concern `included`
+    /// blocks) never sees a type from the previous pass.
+    pub(super) fn checked_receiver_type<'pr>(&self, call: &CallNode<'pr>) -> Option<Ty> {
+        let span = (call.location().start_offset(), call.location().end_offset());
+        self.call_frames
+            .borrow()
+            .iter()
+            .rev()
+            .find(|f| f.span == span)
+            .map(|f| f.receiver_ty)
+    }
+
+    /// True while the check walk is typing `call` itself — its frame is
+    /// the innermost one. Read-only inference pushes no frames, so a
+    /// re-inference of `call` from elsewhere (block body inference,
+    /// statement-position inference, a hash value, a lambda body, an
+    /// array receiver) sees some other call's frame on top, or none.
+    /// Diagnostics a read-only pass can reach use this to report once,
+    /// from the walk, instead of once per inference.
+    pub(super) fn check_walk_types_call<'pr>(&self, call: &CallNode<'pr>) -> bool {
+        let span = (call.location().start_offset(), call.location().end_offset());
+        self.call_frames
+            .borrow()
+            .last()
+            .is_some_and(|f| f.span == span)
+    }
+
     /// Side-effecting evaluator for a single call expression: emits
     /// argument / block diagnostics, and pushes/pops the block scope
     /// around the block body walk. The caller pre-resolves the target
-    /// via `ResolvedCall::resolve` so the same target lookup is shared
-    /// with the read-only `infer_call_return_type` pass.
+    /// via `resolve_call_in_check`, which has already walked the
+    /// receiver, so the same target lookup is shared with the read-only
+    /// `infer_call_return_type` pass.
     pub(super) fn check_call<'pr>(
+        &mut self,
+        node: &CallNode<'pr>,
+        hint: Option<Ty>,
+        resolved: &ResolvedCall,
+    ) {
+        self.push_call_frame(node, resolved);
+        self.check_call_in_frame(node, hint, resolved);
+        self.call_frames.borrow_mut().pop();
+    }
+
+    /// `check_call` followed by the call's return type, inferred while
+    /// the frame is still open so the argument values the walk parked
+    /// are read back (`infer_argument`) instead of inferred again.
+    /// `cached` is a pure-call cache hit the caller already found; it
+    /// wins over inference, as it did when `infer_type` ran ahead of the
+    /// walk.
+    pub(super) fn check_call_and_infer<'pr>(
+        &mut self,
+        node: &CallNode<'pr>,
+        hint: Option<Ty>,
+        resolved: &ResolvedCall,
+        cached: Option<Ty>,
+    ) -> Ty {
+        self.push_call_frame(node, resolved);
+        self.check_call_in_frame(node, hint, resolved);
+        let ty = cached.unwrap_or_else(|| self.infer_call_return_type(node, hint, resolved));
+        self.call_frames.borrow_mut().pop();
+        ty
+    }
+
+    fn push_call_frame<'pr>(&self, node: &CallNode<'pr>, resolved: &ResolvedCall) {
+        self.call_frames.borrow_mut().push(super::CallFrame {
+            span: (node.location().start_offset(), node.location().end_offset()),
+            receiver_ty: resolved.receiver_ty,
+            arguments: Vec::new(),
+        });
+    }
+
+    fn check_call_in_frame<'pr>(
         &mut self,
         node: &CallNode<'pr>,
         hint: Option<Ty>,
@@ -319,62 +587,56 @@ impl<'env> TypeChecker<'env> {
         // Gated so the default check path keeps its single-None-branch
         // cost profile (no RefCell borrows added per call).
         let track_error = self.extract.is_some() && target.is_some();
+
+        // The overload whose parameter types hint the arguments. Chosen
+        // once here and handed to both the argument walk and the
+        // argument check, so the walk types each call argument under
+        // exactly the hint the collector asks for afterwards.
+        let hint_overload = target.and_then(|t| {
+            let def = t.method_definition()?;
+            self.pick_hint_overload(
+                def,
+                CallSite::Call(node),
+                &t.bindings(),
+                resolved.receiver_ty,
+            )
+        });
+        // Extract: a call argument's record carries the value the walk
+        // computed exactly where the canonical collection used to
+        // deposit it (a Method target that reaches its argument
+        // collection — see `canonical_collection_runs`).
+        let carry = self.extract.is_some()
+            && target.is_some_and(|t| self.canonical_collection_runs(node, t));
+
+        // Walk the arguments first — Ruby evaluates them before the call,
+        // so an lvar written in one argument is visible to the next and
+        // to the call's own argument check. BEFORE pushing block scope,
+        // so block parameters don't leak into argument evaluation. The
+        // receiver was already walked by `resolve_call_in_check`.
+        if let Some(arguments) = node.arguments() {
+            self.visit_call_arguments(
+                &arguments,
+                target,
+                resolved.receiver_ty,
+                hint_overload.as_ref(),
+                carry,
+            );
+        }
+
         let before = if track_error {
             self.diagnostics_len()
         } else {
             0
         };
         // Argument-channel carry is armed only across this canonical
-        // collection — the one whose per-argument values the argument
-        // visit below actually consumes. Auxiliary re-collections
-        // (`lookup_block_type`, `infer_call_return_type`, yield/super
-        // paths) stay unarmed so they can't deposit orphans or
-        // overwrite the consumed values (see `extract_carry_armed`).
+        // collection. Auxiliary re-collections (`lookup_block_type`,
+        // `infer_call_return_type`, yield/super paths) stay unarmed so
+        // they can't deposit orphans or overwrite the consumed values
+        // (see `extract_carry_armed`).
         let carry_prev = self.extract_carry_armed.replace(self.extract.is_some());
-        self.check_call_arguments(node, target, resolved.receiver_ty);
+        self.check_call_arguments(node, target, resolved.receiver_ty, hint_overload.as_ref());
         self.extract_carry_armed.set(carry_prev);
         let mut errored = track_error && self.diagnostics_len() > before;
-
-        // Visit receiver and arguments BEFORE pushing block scope,
-        // so block parameters don't leak into receiver/argument evaluation.
-        if let Some(receiver) = node.receiver() {
-            // Extract-mode hand-off: `resolved.receiver_ty` IS the inner
-            // call's check-computed return type, so carry it to the
-            // receiver's own record point (reached via the `visit`
-            // below). Guarded where the resolved value diverges from
-            // the receiver expression's checked value: safe navigation
-            // strips nil (`unwrap_optional`) and an adjacent trailing
-            // `#: T` overrides the natural type (`infer_receiver_type`)
-            // — carrying either would record a value the check never
-            // computed for the inner call. The adjacency probe is a
-            // comment scan (no type lowering), so the visit path stays
-            // env-query-free by construction.
-            if self.extract.is_some()
-                && receiver.as_call_node().is_some()
-                && !node.is_safe_navigation()
-                && self
-                    .trailing_node_assertion_adjacent(receiver.location().end_offset())
-                    .is_none()
-            {
-                self.extract_carry_type(
-                    (
-                        receiver.location().start_offset() as u32,
-                        receiver.location().end_offset() as u32,
-                    ),
-                    resolved.receiver_ty,
-                );
-            }
-            // Must run after `visit`: the assertion gate reads the
-            // checker's live scope state, which only reflects a
-            // preceding sibling statement inside the receiver's own
-            // parens (`(\n a = 1\n a #: T\n).m`) once that statement has
-            // actually executed via this visit.
-            self.visit(&receiver);
-            self.apply_receiver_assertion_gate(&receiver);
-        }
-        if let Some(arguments) = node.arguments() {
-            self.visit_call_arguments(&arguments, target, resolved.receiver_ty);
-        }
 
         let site = CallSite::Call(node);
         let before_block = if track_error {
@@ -383,7 +645,7 @@ impl<'env> TypeChecker<'env> {
             0
         };
         let block_scope_pushed = self.setup_block_scope(site, target, hint);
-        self.check_block(site, target, hint);
+        let body_hint = self.check_block(site, target, hint);
         errored |= track_error && self.diagnostics_len() > before_block;
         if track_error && errored {
             self.extract_flag_call_state(
@@ -395,34 +657,87 @@ impl<'env> TypeChecker<'env> {
             );
         }
 
-        if let Some(block) = node.block()
-            && !self.walk_concern_block_body(node, &block)
-        {
-            self.visit(&block);
+        if let Some(block) = node.block() {
+            let saved_concerning = self.enter_concerning_block(node);
+            if !self.walk_concern_block_body(node, &block) {
+                self.walk_block(&block, body_hint);
+            }
+            self.concerning_module = saved_concerning;
         }
         if block_scope_pushed {
             self.ctx.pop_scope();
         }
     }
 
-    /// Walk a call's arguments. Lambda literals are pre-dispatched into
-    /// `check_node` with the parameter type as hint so their params bind
-    /// typed (Steep parity); every other argument takes the plain
-    /// default-walker path, which reaches `check_node` hintless.
+    /// Walk a call's block (inside the block scope `setup_block_scope`
+    /// pushed). The parameters take the default walk (default-value
+    /// expressions), then the body goes through `check_node` — the same
+    /// entry a def / lambda / `class_eval` body uses — so every statement
+    /// passes the statement-position `#: T` gate and the sticky-bot
+    /// list type (`check_statements_with_hint`), and a `do ... rescue ...
+    /// end` body (BeginNode) walks its rescue / else / ensure arms the
+    /// typed way too. The `body_hint` from [`Self::check_block`] reaches
+    /// only the body's last statement, as `check_block` typed it
+    /// read-only, so a hint-driven report comes from the walk once. A
+    /// block argument (`&blk`) has no body and takes the default walk.
+    pub(super) fn walk_block<'pr>(&mut self, block: &Node<'pr>, body_hint: Option<Ty>) {
+        let Some(b) = block.as_block_node() else {
+            self.visit(block);
+            return;
+        };
+        // A `next` in the body exits this block, so its value is typed
+        // under the same expected return type as the tail.
+        self.with_next_hint(body_hint, |checker| {
+            if let Some(params) = b.parameters() {
+                checker.visit(&params);
+            }
+            if let Some(body) = b.body() {
+                checker.check_node(&body, body_hint);
+            }
+        });
+    }
+
+    /// Walk a call's arguments once, left to right, before the call's
+    /// own argument check runs.
     ///
-    /// The hint is only resolved for a single-overload, non-generic
-    /// target on a call with no splat / keyword arguments. With several
-    /// candidates the winning slot type isn't decided until arg matching
-    /// runs, and a generic slot would bind a free type variable — either
-    /// would make the body walk a false-positive source. Failing to
-    /// resolve a hint only costs UNTYPED params (silence), never a wrong
-    /// binding.
+    /// Every argument is typed here, under the slot hint the hinted
+    /// collector (`collect_call_arguments_hinted`) will ask for, and its
+    /// value parked on the current call frame so the collectors read it
+    /// back (`infer_argument`) instead of inferring it after the walk —
+    /// which would see the env after a later argument's lvar write. Call
+    /// arguments get their value from their own walk
+    /// (`walk_argument_call`); the rest are inferred once right after
+    /// their walk (`park_argument_value`). Splat elements and a folded
+    /// braceless keyword hash are the exception: the collectors still
+    /// infer those themselves.
+    ///
+    /// Lambda literals are pre-dispatched into `check_node` with the
+    /// parameter type as hint so their params bind typed (Steep parity);
+    /// every other argument takes the plain default-walker path, which
+    /// reaches `check_node` hintless.
+    ///
+    /// The lambda hint is only resolved for a single-overload,
+    /// non-generic target on a call with no splat / keyword arguments.
+    /// With several candidates the winning slot type isn't decided until
+    /// arg matching runs, and a generic slot would bind a free type
+    /// variable — either would make the body walk a false-positive
+    /// source. Failing to resolve a hint only costs UNTYPED params
+    /// (silence), never a wrong binding.
     fn visit_call_arguments<'pr>(
         &mut self,
         arguments: &ruby_prism::ArgumentsNode<'pr>,
         target: Option<&CallTarget>,
         receiver_ty: Ty,
+        hint_overload: Option<&crate::types::MethodType>,
+        carry: bool,
     ) {
+        // No target (untyped receiver, NoMethod): nothing collects the
+        // arguments, so there is no value to park — walk them the plain
+        // way, without inferring call values nobody consumes.
+        if target.is_none() {
+            self.visit_arguments_node(arguments);
+            return;
+        }
         let args: Vec<_> = arguments.arguments().iter().collect();
         // A trailing `key: value` hash (every element a symbol-keyed assoc,
         // no `**splat`) is walked element-wise so a lambda value gets the
@@ -436,16 +751,6 @@ impl<'env> TypeChecker<'env> {
                         .is_some_and(|assoc| assoc.key().as_symbol_node().is_some())
                 })
             });
-        let keyword_has_lambda = trailing_keywords.as_ref().is_some_and(|hash| {
-            hash.elements().iter().any(|elem| {
-                elem.as_assoc_node()
-                    .is_some_and(|assoc| assoc.value().as_lambda_node().is_some())
-            })
-        });
-        if !keyword_has_lambda && !args.iter().any(|arg| arg.as_lambda_node().is_some()) {
-            self.visit_arguments_node(arguments);
-            return;
-        }
         let positional_count = args.len() - usize::from(trailing_keywords.is_some());
         let simple_shape = args[..positional_count].iter().all(|arg| {
             arg.as_splat_node().is_none()
@@ -471,37 +776,151 @@ impl<'env> TypeChecker<'env> {
                 None => hint,
             })
         };
+        // The collector's slot bookkeeping (`collect_call_arguments_hinted`):
+        // the same estimate and the same slot index, so each argument is
+        // parked under the hint the collector will ask for.
+        let positional_count_est = self.estimate_post_expansion_positional_count(arguments);
+        let mut positional_index = 0usize;
         for (index, arg) in args.iter().enumerate() {
-            if index == positional_count
-                && let Some(hash) = &trailing_keywords
-            {
+            if let Some(hash) = arg.as_keyword_hash_node() {
+                let lambda_hinted = index == positional_count && trailing_keywords.is_some();
                 for elem in hash.elements().iter() {
-                    let lambda_value = elem.as_assoc_node().and_then(|assoc| {
-                        let name = assoc.key().as_symbol_node()?;
+                    if let Some(assoc) = elem.as_assoc_node() {
+                        let key = assoc.key();
                         let value = assoc.value();
-                        value.as_lambda_node()?;
-                        Some((String::from_utf8_lossy(name.unescaped()).to_string(), value))
-                    });
-                    if let Some((name, value)) = lambda_value {
-                        let hint = bind(overload.and_then(|o| o.keyword_param_for_call(&name)));
-                        self.check_node(&value, hint);
+                        if let Some(sym) = key.as_symbol_node() {
+                            let name = String::from_utf8_lossy(sym.unescaped()).to_string();
+                            let hint = hint_overload.and_then(|o| o.keyword_param_for_call(&name));
+                            if let Some(call) = value.as_call_node() {
+                                self.walk_argument_call(&call, hint, carry);
+                            } else {
+                                if lambda_hinted && value.as_lambda_node().is_some() {
+                                    let lambda_hint = bind(
+                                        overload.and_then(|o| o.keyword_param_for_call(&name)),
+                                    );
+                                    self.check_node(&value, lambda_hint);
+                                } else {
+                                    // Typed under the keyword's hint, as the
+                                    // collector will (see positional below).
+                                    self.check_node(&value, hint);
+                                }
+                                self.park_argument_value(&value, hint);
+                            }
+                        } else {
+                            self.visit(&key);
+                            if let Some(call) = value.as_call_node() {
+                                self.walk_argument_call(&call, None, carry);
+                            } else {
+                                self.visit(&value);
+                                self.park_argument_value(&value, None);
+                            }
+                        }
+                    } else if let Some(splat) = elem.as_assoc_splat_node()
+                        && let Some(value) = splat.value()
+                    {
+                        if let Some(call) = value.as_call_node() {
+                            self.walk_argument_call(&call, None, carry);
+                        } else {
+                            self.visit(&elem);
+                            self.park_argument_value(&value, None);
+                        }
                     } else {
                         self.visit(&elem);
                     }
                 }
-            } else if arg.as_lambda_node().is_some() {
-                let hint = if simple_shape {
-                    bind(
-                        overload.and_then(|o| o.positional_param_for_call(index, positional_count)),
-                    )
-                } else {
-                    None
-                };
-                self.check_node(arg, hint);
-            } else {
+            } else if let Some(splat) = arg.as_splat_node() {
                 self.visit(arg);
+                positional_index += self.splat_expansion_count(&splat);
+            } else {
+                let hint = hint_overload.and_then(|o| {
+                    o.positional_param_for_call(positional_index, positional_count_est)
+                });
+                if let Some(call) = arg.as_call_node() {
+                    self.walk_argument_call(&call, hint, carry);
+                } else {
+                    if arg.as_lambda_node().is_some() {
+                        let lambda_hint =
+                            if simple_shape {
+                                bind(overload.and_then(|o| {
+                                    o.positional_param_for_call(index, positional_count)
+                                }))
+                            } else {
+                                None
+                            };
+                        self.check_node(arg, lambda_hint);
+                    } else {
+                        // Typed under the parameter's hint, threaded through
+                        // wrappers (`(x)`, `c ? x : y`, `begin; x; end`), so
+                        // the walk types a wrapped call exactly as the
+                        // collector does: a hint-driven report then comes
+                        // from the walk, not from a read-only re-inference.
+                        self.check_node(arg, hint);
+                    }
+                    self.park_argument_value(arg, hint);
+                }
+                positional_index += 1;
             }
         }
+    }
+
+    /// Type of a `**` argument. An anonymous `**` (`def a(**); b(**); end`)
+    /// has no value node: it reads the hidden lvar `bind_parameters` bound
+    /// to the enclosing method's kwrest (`Hash[Symbol, V]`, the type a named
+    /// `**h` has), and is untyped where nothing is bound (sig-less method).
+    fn kwsplat_value_type<'pr>(&self, splat: &ruby_prism::AssocSplatNode<'pr>) -> Ty {
+        match splat.value() {
+            Some(value) => self.infer_argument(&value, None),
+            None => self
+                .ctx
+                .lookup_local_variable(self.checker_names().intern(super::ANON_KWREST_LVAR))
+                .unwrap_or(Ty::UNTYPED),
+        }
+    }
+
+    /// Park the value of a non-call argument right after its walk, so the
+    /// collectors see the type it had at its own evaluation point — not
+    /// the type after a later argument wrote the same lvar
+    /// (`me(k, k = 1)` passes the old `k`). The walk produced no value
+    /// for these (`visit` is unit), so the read-only inference runs here,
+    /// once, under the collector's hint.
+    fn park_argument_value<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>) {
+        let ty = self.infer_type(node, hint);
+        self.park_value(node, hint, ty);
+    }
+
+    /// How many positional slots the collectors advance past a splat
+    /// (mirrors `absorb_splat_into_args`): a literal array without an
+    /// inner splat contributes its element count, a Tuple-typed
+    /// expression its arity, and anything else becomes the splat tail
+    /// (no slot).
+    fn splat_expansion_count<'pr>(&self, splat: &ruby_prism::SplatNode<'pr>) -> usize {
+        let Some(expr) = splat.expression() else {
+            return 0;
+        };
+        if let Some(array) = expr.as_array_node() {
+            let elements: Vec<Node<'pr>> = array.elements().iter().collect();
+            if !elements.iter().any(|el| el.as_splat_node().is_some()) {
+                return elements.len();
+            }
+        }
+        match self.env.types().resolve(self.infer_type(&expr, None)) {
+            Type::Tuple(elems) => elems.len(),
+            _ => 0,
+        }
+    }
+
+    /// Whether `check_call_arguments` reaches its argument collection for
+    /// this target (the collection that used to deposit the extract
+    /// argument carry): a Method target with no visibility / forwarding
+    /// early-out. Mirrors the early returns in `check_call_arguments`.
+    fn canonical_collection_runs<'pr>(&self, node: &CallNode<'pr>, target: &CallTarget) -> bool {
+        let Some(method_def) = target.method_definition() else {
+            return false;
+        };
+        if method_def.accessibility == Visibility::Private && !is_implicit_or_self_receiver(node) {
+            return false;
+        }
+        !self.call_has_forwarding_args(node)
     }
 
     /// Separate positional and keyword arguments from a call node.
@@ -597,10 +1016,7 @@ impl<'env> TypeChecker<'env> {
     }
 
     fn lower_annotation_args(&self, annotation: &TypeApplicationAnnotation) -> Vec<Ty> {
-        let context = super::visitor::build_lowering_context_from_cref_stack(
-            self.ctx.cref_stack(),
-            self.env.names(),
-        );
+        let context: Vec<TypeName> = self.ctx.cref_stack().to_vec();
         annotation
             .type_args
             .iter()
@@ -785,8 +1201,7 @@ impl<'env> TypeChecker<'env> {
                         if let Some(sym) = key.as_symbol_node() {
                             let name = String::from_utf8_lossy(sym.unescaped()).to_string();
                             let value = assoc.value();
-                            let value_type = self.infer_type(&value, None);
-                            self.extract_carry_argument(&value, value_type);
+                            let value_type = self.infer_argument(&value, None);
                             let key_location = sym.value_loc().unwrap_or_else(|| sym.location());
                             keywords.push((
                                 name,
@@ -800,8 +1215,7 @@ impl<'env> TypeChecker<'env> {
                         } else {
                             let value = assoc.value();
                             let key_type = self.infer_type(&key, None);
-                            let value_type = self.infer_type(&value, None);
-                            self.extract_carry_argument(&value, value_type);
+                            let value_type = self.infer_argument(&value, None);
                             non_symbol_pairs.push((
                                 key_type,
                                 value_type,
@@ -811,11 +1225,8 @@ impl<'env> TypeChecker<'env> {
                                 ),
                             ));
                         }
-                    } else if let Some(splat) = elem.as_assoc_splat_node()
-                        && let Some(value) = splat.value()
-                    {
-                        let value_type = self.infer_type(&value, None);
-                        self.extract_carry_argument(&value, value_type);
+                    } else if let Some(splat) = elem.as_assoc_splat_node() {
+                        let value_type = self.kwsplat_value_type(&splat);
                         kwsplats.push((
                             value_type,
                             arg_span(
@@ -852,16 +1263,14 @@ impl<'env> TypeChecker<'env> {
                     element_ty: Ty::UNTYPED,
                     span: arg_span(arg.location().start_offset(), arg.location().end_offset()),
                 });
-                let arg_ty = self.infer_type(&arg, None);
-                self.extract_carry_argument(&arg, arg_ty);
+                let arg_ty = self.infer_argument(&arg, None);
                 positional.push(arg_ty);
                 positional_spans.push(arg_span(
                     arg.location().start_offset(),
                     arg.location().end_offset(),
                 ));
             } else {
-                let arg_ty = self.infer_type(&arg, None);
-                self.extract_carry_argument(&arg, arg_ty);
+                let arg_ty = self.infer_argument(&arg, None);
                 positional.push(arg_ty);
                 positional_spans.push(arg_span(
                     arg.location().start_offset(),
@@ -1039,8 +1448,7 @@ impl<'env> TypeChecker<'env> {
                             let name = String::from_utf8_lossy(sym.unescaped()).to_string();
                             let hint = overload.and_then(|o| o.keyword_param_for_call(&name));
                             let value = assoc.value();
-                            let value_type = self.infer_type(&value, hint);
-                            self.extract_carry_argument(&value, value_type);
+                            let value_type = self.infer_argument(&value, hint);
                             let key_location = sym.value_loc().unwrap_or_else(|| sym.location());
                             keywords.push((
                                 name,
@@ -1054,8 +1462,7 @@ impl<'env> TypeChecker<'env> {
                         } else {
                             let value = assoc.value();
                             let key_type = self.infer_type(&key, None);
-                            let value_type = self.infer_type(&value, None);
-                            self.extract_carry_argument(&value, value_type);
+                            let value_type = self.infer_argument(&value, None);
                             non_symbol_pairs.push((
                                 key_type,
                                 value_type,
@@ -1065,11 +1472,8 @@ impl<'env> TypeChecker<'env> {
                                 ),
                             ));
                         }
-                    } else if let Some(splat) = elem.as_assoc_splat_node()
-                        && let Some(value) = splat.value()
-                    {
-                        let value_type = self.infer_type(&value, None);
-                        self.extract_carry_argument(&value, value_type);
+                    } else if let Some(splat) = elem.as_assoc_splat_node() {
+                        let value_type = self.kwsplat_value_type(&splat);
                         kwsplats.push((
                             value_type,
                             arg_span(
@@ -1129,8 +1533,7 @@ impl<'env> TypeChecker<'env> {
                 });
                 let hint = overload
                     .and_then(|o| o.positional_param_for_call(positional_index, positional_count));
-                let ty = self.infer_type(&arg, hint);
-                self.extract_carry_argument(&arg, ty);
+                let ty = self.infer_argument(&arg, hint);
                 positional.push(ty);
                 positional_spans.push(arg_span(
                     arg.location().start_offset(),
@@ -1140,8 +1543,7 @@ impl<'env> TypeChecker<'env> {
             } else {
                 let hint = overload
                     .and_then(|o| o.positional_param_for_call(positional_index, positional_count));
-                let ty = self.infer_type(&arg, hint);
-                self.extract_carry_argument(&arg, ty);
+                let ty = self.infer_argument(&arg, hint);
                 positional.push(ty);
                 positional_spans.push(arg_span(
                     arg.location().start_offset(),
@@ -1438,7 +1840,7 @@ impl<'env> TypeChecker<'env> {
             // arity-incompatible block params). Returning `None` routes the
             // call to `check_no_method`, which reports NoMethod for the
             // whole union — matching Steep for both `x.m` and `x.m { }`.
-            if !union_method_block_survives(components.iter().map(|c| &c.method_def)) {
+            if !union_method_block_survives(components.iter().map(|c| &*c.method_def)) {
                 return None;
             }
             return Some(CallTarget::UnionMethod {
@@ -1451,7 +1853,6 @@ impl<'env> TypeChecker<'env> {
 
         Some(CallTarget::Method {
             method_name: method_name.to_string(),
-            receiver_class: resolved.receiver_class,
             method_def: resolved.method,
             bindings: resolved.bindings,
         })
@@ -1466,11 +1867,12 @@ impl<'env> TypeChecker<'env> {
         node: &CallNode<'pr>,
         target: Option<&CallTarget>,
         receiver_type: Ty,
+        hint_overload: Option<&crate::types::MethodType>,
     ) {
         let method_name_str = String::from_utf8_lossy(node.name().as_slice()).to_string();
         // Hot path: hold the call's source span as raw byte offsets and
         // materialize a `SourceLocation` only at diagnostic-emit time.
-        // The verbose-log paths below just need the byte numbers; the
+        // The extract flags below just need the byte numbers; the
         // helper chain (`check_against_method_def`,
         // `check_forwarding_call`, `check_union_call_arguments`)
         // forwards the span and lifts it lazily in its own emit sites.
@@ -1484,7 +1886,7 @@ impl<'env> TypeChecker<'env> {
         // it is `&self` and side-effect-free, so reusing the resolved value
         // here avoids a second `infer_receiver_type` pass per call; the single
         // value is then shared across every branch below (peek / no-target /
-        // target / verbose-log).
+        // target).
 
         // Tuple/Record literal-access diagnostics. The shared specializer also
         // drives the return type in `infer_call_return_type`; here we only emit
@@ -1508,25 +1910,11 @@ impl<'env> TypeChecker<'env> {
                 // Flag now, record at the walk entry (which knows the
                 // site's expression type when the check computed one).
                 self.extract_flag_call_state(loc_span, super::ExtractCallState::Untyped);
-                self.verbose_log(format_args!(
-                    "{}:{} skipped .{} — receiver is untyped",
-                    loc_span.0, loc_span.1, method_name_str
-                ));
-            } else {
-                let receiver_display = self.display_type(receiver_type);
-                let separator = match self.env.types().resolve(receiver_type) {
-                    Type::ClassSingleton { .. } => ".",
-                    _ => "#",
-                };
-                self.verbose_log(format_args!(
-                    "{}:{} not_found {}{}{}",
-                    loc_span.0, loc_span.1, receiver_display, separator, method_name_str
-                ));
             }
             // Extract-mode `no_method_error`: only a site whose
             // NoMethod diagnostic actually fired is recorded, so the
-            // silent boundary (bot receivers, classifier-gated
-            // receivers, untyped short-circuit inside
+            // silent boundary (narrowed-to-bot local receivers,
+            // classifier-gated receivers, untyped short-circuit inside
             // `check_no_method`, `NotImplementedYet`-only sites) stays
             // unrecorded exactly as before. Kind-checked rather than a
             // bare count delta, since `check_no_method` can also push
@@ -1546,7 +1934,6 @@ impl<'env> TypeChecker<'env> {
             return;
         };
 
-        self.verbose_log_call_resolved(node, target, receiver_type);
         // The extract-mode record is NOT pushed here: its `return_type`
         // field is the check's own answer for the site, which the two
         // walk entries (`check_node`'s CallNode arm / `visit_call_node`)
@@ -1635,11 +2022,8 @@ impl<'env> TypeChecker<'env> {
         // hint path aligned with the substitution state the subtype-check
         // path applies below.
         let bindings = target.bindings();
-        let hint_overload =
-            self.pick_hint_overload(&method_def, CallSite::Call(node), &bindings, receiver_type);
-        let arguments =
-            self.collect_call_arguments_hinted(CallSite::Call(node), hint_overload.as_ref());
-        if let Some(ov) = hint_overload.as_ref() {
+        let arguments = self.collect_call_arguments_hinted(CallSite::Call(node), hint_overload);
+        if let Some(ov) = hint_overload {
             self.emit_hash_literal_record_extras(
                 CallSite::Call(node),
                 ov,
@@ -1805,7 +2189,8 @@ impl<'env> TypeChecker<'env> {
     /// here: Steep emits no argument diagnostic for forwarded args
     /// (measured 2026-06-05). Its UnexpectedSuper emission for
     /// unresolvable bare super lives in `inference.rs::check_node`'s
-    /// ForwardingSuperNode arm.
+    /// ForwardingSuperNode arm, and its block takes
+    /// [`Self::check_forwarding_super_block`].
     pub(super) fn check_super_node<'pr>(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         let Some(method_name) = self.ctx.method_name().map(|s| s.to_string()) else {
             self.visit_super_children(node);
@@ -1883,27 +2268,8 @@ impl<'env> TypeChecker<'env> {
         }
 
         // Build a synthetic CallTarget for the shared block-check path.
-        // `receiver_class` is only consulted by `verbose_log_call_resolved`
-        // (CallNode-only diagnostic path); for super we set it to the
-        // current self class so it's well-formed without claiming the
-        // super-target's defining class (which `lookup_super_method`
-        // doesn't surface).
-        let receiver_class = match self.env.types().resolve(self_ty) {
-            Type::ClassInstance { name, .. } => *name,
-            Type::ClassSingleton { name } => *name,
-            // Invariant enforced by `lookup_super_method`: it returns
-            // `Some` only when `self_ty` resolves to one of the two
-            // arms above (see definition_builder.rs:1257). The earlier
-            // `let Some(...) = lookup_super_method(...) else { ... }`
-            // guarantees we don't reach here. `unreachable!` makes the
-            // invariant explicit so a future widening of
-            // `lookup_super_method` doesn't silent-drop the super
-            // block check.
-            _ => unreachable!("lookup_super_method returned Some on non-class self_ty"),
-        };
         let target = CallTarget::Method {
             method_name: method_name.clone(),
-            receiver_class,
             method_def: method,
             bindings: bindings.clone(),
         };
@@ -1920,11 +2286,61 @@ impl<'env> TypeChecker<'env> {
             self.extract_flag_call_state(super_span, super::ExtractCallState::Error);
         }
         if let Some(block) = node.block() {
-            self.visit(&block);
+            self.walk_block(&block, None);
         }
         if block_scope_pushed {
             self.ctx.pop_scope();
         }
+    }
+
+    /// Block half of `check_super_node` for bare `super { ... }`: bind the
+    /// params against the super target's block type, check the body's
+    /// value against its return type, then walk the body. No argument
+    /// check — the forwarded arguments are the enclosing def's own, so
+    /// overload selection sees zero arguments and falls back to the first
+    /// block-bearing overload when none fits.
+    ///
+    /// An unresolvable target (no enclosing method, no ancestor method)
+    /// still walks the body with UNTYPED params, like `visit_super_children`.
+    pub(super) fn check_forwarding_super_block<'pr>(&mut self, node: &ForwardingSuperNode<'pr>) {
+        let Some(block) = node.block() else {
+            return;
+        };
+        let resolved = self.ctx.method_name().and_then(|name| {
+            let sym = self.env.names().intern_symbol(name);
+            self.env
+                .lookup_super_method(self.current_self_type(), sym)
+                .map(|(method, bindings)| CallTarget::Method {
+                    method_name: name.to_string(),
+                    method_def: method,
+                    bindings,
+                })
+        });
+        let Some(target) = resolved else {
+            self.push_block_scope_for(&block, None);
+            self.walk_block(&block.as_node(), None);
+            self.ctx.pop_scope();
+            return;
+        };
+        let site = CallSite::ForwardingSuper(node);
+        let target_ref = Some(&target);
+        let track_error = self.extract.is_some();
+        let before = if track_error {
+            self.diagnostics_len()
+        } else {
+            0
+        };
+        self.setup_block_scope(site, target_ref, None);
+        self.check_block(site, target_ref, None);
+        if track_error && self.diagnostics_len() > before {
+            let span = (
+                node.location().start_offset() as u32,
+                node.location().end_offset() as u32,
+            );
+            self.extract_flag_call_state(span, super::ExtractCallState::Error);
+        }
+        self.walk_block(&block.as_node(), None);
+        self.ctx.pop_scope();
     }
 
     fn visit_super_children<'pr>(&mut self, node: &ruby_prism::SuperNode<'pr>) {
@@ -1932,81 +2348,8 @@ impl<'env> TypeChecker<'env> {
             self.visit_arguments_node(&arguments_node);
         }
         if let Some(block) = node.block() {
-            self.visit(&block);
+            self.walk_block(&block, None);
         }
-    }
-
-    /// Log verbose information about a resolved call target.
-    ///
-    /// When the method has a known source file, prefers a compact
-    /// `` found `::Foo#bar` from (path) `` form over printing the full
-    /// RBS signature — long signatures (e.g. `File.write`) are hard to
-    /// read, and the file path is the more useful pointer.
-    /// Without a source file, falls back to `found ::Foo#bar: (sig) -> ret`
-    /// so tests and REPL-style use still see the type info.
-    fn verbose_log_call_resolved<'pr>(
-        &self,
-        node: &CallNode<'pr>,
-        target: &CallTarget,
-        receiver_type: Ty,
-    ) {
-        if !self.options.verbose {
-            return;
-        }
-        let loc = self.offset_to_location(node.location().start_offset());
-        match target {
-            CallTarget::Method {
-                method_name,
-                receiver_class,
-                method_def,
-                ..
-            } => {
-                let receiver_str = self.env.names().resolve(receiver_class);
-                let separator = match self.env.types().resolve(receiver_type) {
-                    Type::ClassSingleton { .. } => ".",
-                    _ => "#",
-                };
-                let qualified = format!("{}{}{}", receiver_str, separator, method_name);
-                match self.format_method_source(method_def) {
-                    Some(from) => self.verbose_log(format_args!(
-                        "{}:{} found `{}` from {}",
-                        loc.range.start_byte, loc.range.end_byte, qualified, from
-                    )),
-                    None => {
-                        let sig = method_def
-                            .method_types()
-                            .next()
-                            .map(|o| self.display_method_type(o))
-                            .unwrap_or_else(|| "?".to_string());
-                        self.verbose_log(format_args!(
-                            "{}:{} found {}: {}",
-                            loc.range.start_byte, loc.range.end_byte, qualified, sig
-                        ));
-                    }
-                }
-            }
-            CallTarget::UnionMethod {
-                method_name,
-                components,
-            } => {
-                let receiver_str = self.display_type(receiver_type);
-                self.verbose_log(format_args!(
-                    "{}:{} found `{}#{}` on all {} union components",
-                    loc.range.start_byte,
-                    loc.range.end_byte,
-                    receiver_str,
-                    method_name,
-                    components.len()
-                ));
-            }
-        }
-    }
-
-    /// Format a Method's primary source location as `(file)` for verbose
-    /// logs, or `None` when no file-bearing source is available.
-    fn format_method_source(&self, method_def: &crate::definition::Method) -> Option<String> {
-        let source = method_def.primary_source_location(self.env.names())?;
-        Some(format!("({})", source.file.display()))
     }
 
     /// Returns true when this overload's method-level bounds are satisfied
@@ -2021,6 +2364,7 @@ impl<'env> TypeChecker<'env> {
         overload: &crate::types::MethodType,
         arguments: &CallArguments,
         receiver_bindings: &FxHashMap<crate::type_param::TypeVarKey, Ty>,
+        receiver_type: Ty,
         call: Option<CallSite<'_, 'pr>>,
     ) -> bool {
         let has_any_bound = overload
@@ -2034,7 +2378,12 @@ impl<'env> TypeChecker<'env> {
         let mut local_bindings =
             self.collect_call_site_bindings(overload, arguments, receiver_bindings);
         if let Some(call) = call {
-            self.augment_bindings_with_block_body(call, overload, &mut local_bindings);
+            self.augment_bindings_with_block_body(
+                call,
+                overload,
+                receiver_type,
+                &mut local_bindings,
+            );
         }
 
         let subtyper = self.subtyper();
@@ -2502,7 +2851,7 @@ impl<'env> TypeChecker<'env> {
         // path can still point at a specific overload for
         // TypeArgumentBoundViolation (Phase C).
         let candidates = Self::narrow_with_fallback(candidates, |o| {
-            self.overload_passes_bounds(o, arguments, receiver_bindings, call)
+            self.overload_passes_bounds(o, arguments, receiver_bindings, receiver_type, call)
         });
 
         // Block-presence preference (soft, with fallback): tiebreaker
@@ -2604,6 +2953,7 @@ impl<'env> TypeChecker<'env> {
         overload: &crate::types::MethodType,
         arguments: &CallArguments,
         receiver_bindings: &FxHashMap<crate::type_param::TypeVarKey, Ty>,
+        receiver_type: Ty,
     ) {
         let has_any_bound = overload
             .type_params
@@ -2615,7 +2965,7 @@ impl<'env> TypeChecker<'env> {
 
         let mut local_bindings =
             self.collect_call_site_bindings(overload, arguments, receiver_bindings);
-        self.augment_bindings_with_block_body(site, overload, &mut local_bindings);
+        self.augment_bindings_with_block_body(site, overload, receiver_type, &mut local_bindings);
 
         let subtyper = self.subtyper();
         let violations = subtyper.check_type_arg_bounds(&overload.type_params, &local_bindings);
@@ -2623,15 +2973,23 @@ impl<'env> TypeChecker<'env> {
             return;
         }
 
-        let receiver_type = self.receiver_type_for_site(site);
+        let site_receiver_type = self.receiver_type_for_site(site);
         let container = {
-            let resolved = self.env.types().resolve(receiver_type);
+            let resolved = self.env.types().resolve(site_receiver_type);
             match resolved {
                 Type::ClassSingleton { name } => {
-                    format!("{}.{}", self.env.names().resolve(name), method_name)
+                    format!(
+                        "{}.{}",
+                        self.env.names().display_type_name(*name),
+                        method_name
+                    )
                 }
                 Type::ClassInstance { name, .. } => {
-                    format!("{}#{}", self.env.names().resolve(name), method_name)
+                    format!(
+                        "{}#{}",
+                        self.env.names().display_type_name(*name),
+                        method_name
+                    )
                 }
                 _ => method_name.to_string(),
             }
@@ -2642,7 +3000,7 @@ impl<'env> TypeChecker<'env> {
             // BoundViolation carries the raw RBS-written name as a Symbol
             // (`subtyping.rs` extracts `param.name.raw` from the TypeVarKey),
             // so resolving it back to a string is just an interner lookup.
-            let param_name = self.env.names().resolve(violation.param_name);
+            let param_name = self.env.names().resolve(violation.param_name).to_string();
             let bound = self.display_type(violation.bound);
             let actual = self.display_type(violation.actual);
             self.push_diagnostic(Diagnostic {
@@ -2688,27 +3046,46 @@ impl<'env> TypeChecker<'env> {
         // just like `resolve_call_target` lookup. The synthetic-call sibling
         // (`x += rhs`) hands in a raw lvar type that's never SELF_TYPE, so the
         // bot-self arm below never fires for those callers.
-        let raw_receiver = self.infer_receiver_type(node);
+        let raw_receiver = self
+            .checked_receiver_type(node)
+            .unwrap_or_else(|| self.infer_receiver_type(node, OwnKey::Unbuilt));
+        // A bot receiver is a NoMethod on `bot`, as in Steep (`type_send` has
+        // no bot arm: `calculate_interface(bot)` is nil whether or not the
+        // send is reachable). The exception is a local narrowed to bot in an
+        // unreachable branch: Steep types that branch's local as `untyped`
+        // (case-else) or as the narrowed-to class, never bot, so crema's bot
+        // there is its own artifact and stays silent. Only a local bound
+        // from a bot value (`y = boom`, `a, b = boom`) reports.
         if raw_receiver == Ty::BOTTOM
             && let Some(receiver) = node.receiver()
-            && let Some(lvar) = receiver.as_local_variable_read_node()
+            && self.is_bot_receiver_reportable(receiver)
         {
-            let name_str = String::from_utf8_lossy(lvar.name().as_slice());
-            let name = self.checker_names().intern(&name_str);
-            if self.ctx.is_bot_rhs_local_variable(name) {
-                self.push_diagnostic(Diagnostic {
-                    scope: None,
-                    location: name_location,
-                    kind: DiagnosticKind::NoMethod {
-                        method_name,
-                        receiver_type: self.display_type(Ty::BOTTOM),
-                        missing_from: Vec::new(),
-                    },
-                });
-                return;
-            }
+            self.push_diagnostic(Diagnostic {
+                scope: None,
+                location: name_location,
+                kind: DiagnosticKind::NoMethod {
+                    method_name,
+                    receiver_type: self.display_type(Ty::BOTTOM),
+                    missing_from: Vec::new(),
+                },
+            });
+            return;
         }
         self.check_no_method_at(raw_receiver, &method_name, name_location);
+    }
+
+    /// Whether a receiver typed as bot is reported (see `check_no_method`):
+    /// any expression except a local read whose bot came from narrowing.
+    /// Parentheses are looked through, so `(x).foo` follows `x.foo`.
+    fn is_bot_receiver_reportable(&self, receiver: Node<'_>) -> bool {
+        match super::visitor::unwrap_top_level_parens(receiver).as_local_variable_read_node() {
+            Some(lvar) => {
+                let name_str = String::from_utf8_lossy(lvar.name().as_slice());
+                let name = self.checker_names().intern(&name_str);
+                self.ctx.is_bot_rhs_local_variable(name)
+            }
+            None => true,
+        }
     }
 
     /// CallNode-free core of `check_no_method`. Reused by the synthetic-call
@@ -2728,13 +3105,11 @@ impl<'env> TypeChecker<'env> {
         }
 
         // Bot `self` receiver: a one-Some union block folds block `self` to
-        // bot (`union_blocks`), and `self` is a *value* whose type is bot — the
-        // send is reachable, so Steep reports every self-send as NoMethod on
-        // `self`. This is scoped to `raw_receiver == SELF_TYPE`: a bot reached
-        // any other way (a diverging expression `(raise).foo`, a method
-        // returning bot, a local narrowed to bot in an unreachable branch) is a
-        // *control-flow* bot whose continuation Steep treats as unreachable and
-        // leaves silent — crema matches by falling through to the plain return.
+        // bot (`union_blocks`), and Steep reports every self-send there as
+        // NoMethod on `self`. A bot receiver written as an expression is
+        // reported by `check_no_method` before reaching here; what is left is
+        // a local narrowed to bot (silent, see there) and the synthetic-call
+        // callers, which stay silent as before.
         if receiver_type == Ty::BOTTOM {
             if raw_receiver == Ty::SELF_TYPE {
                 self.push_diagnostic(Diagnostic {
@@ -2750,17 +3125,27 @@ impl<'env> TypeChecker<'env> {
             return;
         }
 
+        // A receiver typed as an alias is displayed by the alias name it was
+        // written with (`::RBS::Types::t`), not its expansion: the name
+        // carries the intent and a large union alias would otherwise
+        // render every member. Only a top-level alias qualifies — alias
+        // members of a union are flattened below and display that way.
+        // Display only; dispatch and gates run on the normalized type.
+        let alias_display = matches!(self.env.types().resolve(receiver_type), Type::Alias { .. })
+            .then_some(receiver_type);
+
         // Mirror `resolve_call_target_at`: dispatch-boundary receiver
         // normalization (alias expand → Optional/Bool sugar widen →
         // alias-of-union flatten) so NoMethod reporting routes through
         // `check_no_method_union` (whose gates handle partial RBS) for
         // these sugars too. Memoized via `DefinitionBuilder`.
         let receiver_type = definition_builder::normalize_receiver(self.env, receiver_type);
+        let display_receiver = alias_display.unwrap_or(receiver_type);
 
         // Union receiver: per-name dispatch (ADR-0021). NoMethod fires when
         // any component lacks the method, reported once for the whole union.
         if let Type::Union(members) = self.env.types().resolve(receiver_type) {
-            self.check_no_method_union_at(members, method_name, receiver_type, name_location);
+            self.check_no_method_union_at(members, method_name, display_receiver, name_location);
             return;
         }
 
@@ -2774,7 +3159,7 @@ impl<'env> TypeChecker<'env> {
             self.check_no_method_intersection_at(
                 members,
                 method_name,
-                receiver_type,
+                display_receiver,
                 name_location,
             );
             return;
@@ -2784,29 +3169,26 @@ impl<'env> TypeChecker<'env> {
         // `classify_no_method_receiver` for the Class vs Interface gate
         // and the widening it folds in. The three arms below carry the
         // duties unique to the single-receiver path (NoMethod report on
-        // pass, verbose_log on gate fail, dev-only NotImplementedYet on
-        // unhandled variants).
+        // pass, silence on gate fail, dev-only NotImplementedYet on
+        // unhandled variants). The widening only picks the class to gate
+        // on; the report names the receiver as written (`[::Symbol,
+        // ::Integer]`, not `::Array[...]`), as Steep and the union path do.
         match self.classify_no_method_receiver(receiver_type) {
-            NoMethodReceiverGate::Pass(widened) => {
+            NoMethodReceiverGate::Pass => {
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location: name_location,
                     kind: DiagnosticKind::NoMethod {
                         method_name: method_name.to_string(),
-                        receiver_type: self.display_type(widened),
+                        receiver_type: self.display_type(display_receiver),
                         missing_from: Vec::new(),
                     },
                 });
             }
-            NoMethodReceiverGate::Unnameable => {
-                self.verbose_log(format_args!(
-                    "{}:{} .{} → NoMethod check skipped (receiver gate not passed for {})",
-                    name_location.range.start_byte,
-                    name_location.range.end_byte,
-                    method_name,
-                    self.display_type(receiver_type)
-                ));
-            }
+            // Deliberately silent: the receiver has no nameable class to
+            // report a NoMethod against. Kept as its own arm so it stays
+            // distinct from `Unhandled`, which still flags the gap.
+            NoMethodReceiverGate::Unnameable => {}
             NoMethodReceiverGate::Unhandled => {
                 self.push_diagnostic(Diagnostic {
                     scope: None,
@@ -2836,7 +3218,7 @@ impl<'env> TypeChecker<'env> {
         &mut self,
         members: &[Ty],
         method_name: &str,
-        union_type: Ty,
+        display_receiver: Ty,
         name_location: SourceLocation,
     ) {
         let method_sym = self.env.names().intern_symbol(method_name);
@@ -2847,10 +3229,10 @@ impl<'env> TypeChecker<'env> {
         // reading of this vec — same signal, plus the member identities
         // needed for the `missing_from` JSON key.
         let mut missing_from: Vec<String> = Vec::new();
-        let mut methods: Vec<crate::definition::Method> = Vec::new();
+        let mut methods: Vec<std::sync::Arc<crate::definition::Method>> = Vec::new();
         for &member in members {
             match self.classify_no_method_receiver(member) {
-                NoMethodReceiverGate::Pass(_) => {}
+                NoMethodReceiverGate::Pass => {}
                 NoMethodReceiverGate::Unnameable => return,
                 NoMethodReceiverGate::Unhandled => {
                     // Mirror the single-receiver `Unhandled` arm: a union
@@ -2888,7 +3270,7 @@ impl<'env> TypeChecker<'env> {
         // union: either a component lacks the method, or every component has
         // it but their block clauses fail to combine (Steep `union_shape`
         // drop). Both surface as one NoMethod on the whole union.
-        if missing_from.is_empty() && union_method_block_survives(methods.iter()) {
+        if missing_from.is_empty() && union_method_block_survives(methods.iter().map(|m| &**m)) {
             return;
         }
         self.push_diagnostic(Diagnostic {
@@ -2896,7 +3278,7 @@ impl<'env> TypeChecker<'env> {
             location: name_location,
             kind: DiagnosticKind::NoMethod {
                 method_name: method_name.to_string(),
-                receiver_type: self.display_type(union_type),
+                receiver_type: self.display_type(display_receiver),
                 missing_from,
             },
         });
@@ -2923,12 +3305,12 @@ impl<'env> TypeChecker<'env> {
         &mut self,
         members: &[Ty],
         method_name: &str,
-        inter_type: Ty,
+        display_receiver: Ty,
         name_location: SourceLocation,
     ) {
         for &member in members {
             match self.classify_no_method_receiver(member) {
-                NoMethodReceiverGate::Pass(_) => {}
+                NoMethodReceiverGate::Pass => {}
                 NoMethodReceiverGate::Unnameable => return,
                 NoMethodReceiverGate::Unhandled => {
                     self.push_diagnostic(Diagnostic {
@@ -2948,7 +3330,7 @@ impl<'env> TypeChecker<'env> {
             location: name_location,
             kind: DiagnosticKind::NoMethod {
                 method_name: method_name.to_string(),
-                receiver_type: self.display_type(inter_type),
+                receiver_type: self.display_type(display_receiver),
                 missing_from: Vec::new(),
             },
         });
@@ -3418,15 +3800,15 @@ impl<'env> TypeChecker<'env> {
     }
 
     /// Classify a receiver for NoMethod reporting. Widens `Literal`/`Tuple`/
-    /// `Record`/`Nil` to a `ClassInstance` (the single-receiver path used to
-    /// do this inline) and applies the per-kind gate: `ClassInstance`/
+    /// `Record`/`Nil`/`Proc` to a `ClassInstance` for the gate only — callers
+    /// display the receiver as written — and applies the per-kind gate: `ClassInstance`/
     /// `ClassSingleton` need a complete ancestor chain, `Interface` needs
     /// registration in `interface_decls()`. Centralizing both gates here
     /// keeps the single-receiver and `Type::Union` per-member paths in sync
     /// so a future receiver kind only adds one match arm.
     ///
     /// The single-receiver caller distinguishes `Unnameable` (gate fail,
-    /// silent skip via `verbose_log`) from `Unhandled` (no NoMethod arm yet,
+    /// silent skip) from `Unhandled` (no NoMethod arm yet,
     /// surfaced as dev-only `Crema::NotImplementedYet`). The union caller
     /// treats both as "suppress the whole union" since partial RBS must not
     /// produce false positives.
@@ -3436,9 +3818,9 @@ impl<'env> TypeChecker<'env> {
         // path drops into the NoMethod branch). Match that — reuse the
         // existing NoMethod diagnostic, no Object/untyped widen, no new
         // diagnostic kind. `display_type(Ty::VOID)` already renders
-        // "void", so Pass(ty) carries the right receiver display.
+        // "void".
         if matches!(self.env.types().resolve(ty), Type::Void) {
-            return NoMethodReceiverGate::Pass(ty);
+            return NoMethodReceiverGate::Pass;
         }
         let widened = match self.env.types().resolve(ty) {
             Type::Literal(lit) => self
@@ -3449,30 +3831,12 @@ impl<'env> TypeChecker<'env> {
             Type::Nil => self
                 .env
                 .class_instance_type(self.env.names().builtins().nil_class),
-            Type::Proc { .. } => {
-                // Steep `proc_shape` builds its Shape with the proc type
-                // itself as `Shape.type` while merging in `::Proc` methods.
-                // `type_construction.rb` then reports NoMethod against
-                // `interface&.type || receiver_type`, so the diagnostic
-                // displays the proc signature (`^() -> bool`), not the
-                // widened class. Mirror that: gate completeness against
-                // `::Proc` (it needs a real ancestor chain for the dispatch
-                // to land), but Pass the original `ty` so `display_type`
-                // emits the signature.
-                let widened = self
-                    .env
-                    .class_instance_type(self.env.names().builtins().proc);
-                return match self.env.types().resolve(widened) {
-                    Type::ClassInstance { name, .. } => {
-                        if self.env.has_complete_ancestor_chain(name) {
-                            NoMethodReceiverGate::Pass(ty)
-                        } else {
-                            NoMethodReceiverGate::Unnameable
-                        }
-                    }
-                    _ => NoMethodReceiverGate::Unhandled,
-                };
-            }
+            // Steep `proc_shape` merges in `::Proc` methods but keeps the
+            // proc type as `Shape.type`, so its NoMethod names the signature
+            // (`^() -> bool`) — the same as-written display every arm gets.
+            Type::Proc { .. } => self
+                .env
+                .class_instance_type(self.env.names().builtins().proc),
             Type::ClassInstance { .. } | Type::ClassSingleton { .. } | Type::Interface { .. } => ty,
             Type::Alias { .. } => {
                 // Steep `raw_shape` expands `Name::Alias` and recurses for
@@ -3497,10 +3861,10 @@ impl<'env> TypeChecker<'env> {
             Type::Untyped => return NoMethodReceiverGate::Unnameable,
             // `top` is the universal supertype with no declared methods.
             // Steep reports NoMethod with display "top" (measured
-            // 2026-06-06). Pass `ty` straight through — `display_type`
+            // 2026-06-06). Pass without a gate — `display_type`
             // already renders "top", and `lookup_method`'s `_ => None`
             // arm guarantees the union any_missing path fires.
-            Type::Top => return NoMethodReceiverGate::Pass(ty),
+            Type::Top => return NoMethodReceiverGate::Pass,
             // Free / bounded TypeVariable both need bound resolution to
             // match Steep: Steep looks up `config.upper_bound(name)` and
             // builds the shape from the bound (`::Numeric` for
@@ -3518,14 +3882,14 @@ impl<'env> TypeChecker<'env> {
         match self.env.types().resolve(widened) {
             Type::ClassInstance { name, .. } | Type::ClassSingleton { name, .. } => {
                 if self.env.has_complete_ancestor_chain(name) {
-                    NoMethodReceiverGate::Pass(widened)
+                    NoMethodReceiverGate::Pass
                 } else {
                     NoMethodReceiverGate::Unnameable
                 }
             }
             Type::Interface { name, .. } => {
                 if self.env.is_declared_interface(name) {
-                    NoMethodReceiverGate::Pass(widened)
+                    NoMethodReceiverGate::Pass
                 } else {
                     NoMethodReceiverGate::Unnameable
                 }
@@ -3701,6 +4065,7 @@ impl<'env> TypeChecker<'env> {
                         overload,
                         &arguments,
                         &c.bindings,
+                        c.receiver_type,
                         Some(CallSite::Call(node)),
                     )
                 });
@@ -3802,9 +4167,9 @@ impl<'env> TypeChecker<'env> {
             // (e.g. `[T < String] (T) -> _ | [T < Integer] (T) -> _`), the
             // arg-only `find` would commit to the first and then falsely flag
             // the caller. Filtering by bound lets the later overload win.
-            let any_bound_passing = arg_matching
-                .iter()
-                .any(|overload| self.overload_passes_bounds(overload, arguments, bindings, call));
+            let any_bound_passing = arg_matching.iter().any(|overload| {
+                self.overload_passes_bounds(overload, arguments, bindings, receiver_type, call)
+            });
             if any_bound_passing {
                 return;
             }
@@ -3820,6 +4185,7 @@ impl<'env> TypeChecker<'env> {
                     arg_matching[0],
                     arguments,
                     bindings,
+                    receiver_type,
                 );
             }
             return;
@@ -4193,7 +4559,7 @@ impl<'env> TypeChecker<'env> {
             &arguments,
             &recv,
             receiver_type,
-            call_hint,
+            call_hint.filter(|_| node.has_block_literal()),
         ))
     }
 
@@ -4219,7 +4585,11 @@ impl<'env> TypeChecker<'env> {
         let mut bindings = self.collect_call_site_bindings(overload, arguments, recv_bindings);
         // Pass `None` for the diagnostic location: the same hint conflict is
         // already reported by `infer_return_type` in `infer_call_return_type`.
-        if let Some(hint_ty) = call_hint {
+        // Callers drop `call_hint` for a `&:sym` block pass, which also
+        // resolves its expected block here, so a hint means a block literal.
+        if let Some(hint_ty) = call_hint
+            && self.hint_drives_instantiation(overload, hint_ty, true, receiver_type, recv_bindings)
+        {
             self.apply_hint_override(overload, hint_ty, &mut bindings, None);
         }
         let substitution = self.substitution_for_call_receiver(receiver_type, bindings);
@@ -4276,7 +4646,7 @@ impl<'env> TypeChecker<'env> {
                 &arguments,
                 &comp.bindings,
                 comp.receiver_type,
-                call_hint,
+                call_hint.filter(|_| node.has_block_literal()),
             );
             acc = Some(match acc {
                 None => resolved,
@@ -4442,11 +4812,19 @@ impl<'env> TypeChecker<'env> {
     /// a method that exists but needs arguments (Steep falls through to its
     /// generic block-pass compatibility check there, which crema does not
     /// port — see the todo's intentional-divergence notes).
+    ///
+    /// `param_ty` goes through the dispatch-boundary receiver normalization
+    /// (`normalize_receiver`: alias expand → Optional/Bool widen →
+    /// alias-of-union flatten) first, like a regular call's receiver, so
+    /// `T?` / `bool` / aliases resolve as their expanded unions. The
+    /// untyped / type-variable gate runs on the normalized type: an alias
+    /// can expand into either.
     pub(super) fn symbol_to_proc_return_type(
         &self,
         param_ty: Ty,
         method_name: crate::name::Symbol,
     ) -> SymbolToProcResolution {
+        let param_ty = definition_builder::normalize_receiver(self.env, param_ty);
         if param_ty.is_untyped() || crate::types::contains_type_variable(param_ty, self.env.types())
         {
             return SymbolToProcResolution::Skip;
@@ -4476,7 +4854,7 @@ impl<'env> TypeChecker<'env> {
         // produce a NoMethod here; everything else stays silent.
         let Some(resolved) = method_resolver::lookup_method(self.env, param_ty, method_name) else {
             return match self.classify_no_method_receiver(param_ty) {
-                NoMethodReceiverGate::Pass(_) => SymbolToProcResolution::NoMethod {
+                NoMethodReceiverGate::Pass => SymbolToProcResolution::NoMethod {
                     missing: vec![param_ty],
                 },
                 _ => SymbolToProcResolution::Skip,
@@ -4525,12 +4903,18 @@ impl<'env> TypeChecker<'env> {
         for &member in &missing {
             if !matches!(
                 self.classify_no_method_receiver(member),
-                NoMethodReceiverGate::Pass(_)
+                NoMethodReceiverGate::Pass
             ) {
                 return;
             }
         }
-        let missing_from = if matches!(self.env.types().resolve(param_ty), Type::Union(_)) {
+        // Display rule of `check_no_method_at`: a top-level alias shows by
+        // its name, anything else by the normalized type; `missing_from`
+        // lists members only when the normalized type is a union.
+        let alias_display =
+            matches!(self.env.types().resolve(param_ty), Type::Alias { .. }).then_some(param_ty);
+        let normalized = definition_builder::normalize_receiver(self.env, param_ty);
+        let missing_from = if matches!(self.env.types().resolve(normalized), Type::Union(_)) {
             let mut displays: Vec<String> = missing.iter().map(|&m| self.display_type(m)).collect();
             displays.sort();
             displays
@@ -4543,39 +4927,35 @@ impl<'env> TypeChecker<'env> {
             location,
             kind: DiagnosticKind::NoMethod {
                 method_name: method_name.to_string(),
-                receiver_type: self.display_type(param_ty),
+                receiver_type: self.display_type(alias_display.unwrap_or(normalized)),
                 missing_from,
             },
         });
     }
 
     /// Check block parameter types and return type against the RBS block type.
+    ///
+    /// Returns the hint the body's last statement is typed under (the
+    /// block's declared return type, when concrete), so the walk of the
+    /// body types that statement as this check's read-only inference did.
     pub(super) fn check_block<'pr>(
         &mut self,
         node: CallSite<'_, 'pr>,
         target: Option<&CallTarget>,
         call_hint: Option<Ty>,
-    ) {
-        let Some(block_node) = node.block() else {
-            return;
-        };
-        let Some(target) = target else {
-            return;
-        };
+    ) -> Option<Ty> {
+        let block_node = node.block()?;
+        let target = target?;
         if let Some((name, sym_offset)) = block_pass_symbol(&block_node) {
             self.check_symbol_to_proc_block_pass(node, target, &name, sym_offset, call_hint);
-            return;
+            return None;
         }
-        let Some(block) = block_node.as_block_node() else {
-            return;
-        };
-        let Some(expected_block) = self.lookup_block_type(node, target, call_hint) else {
-            return;
-        };
+        let block = block_node.as_block_node()?;
+        let expected_block = self.lookup_block_type(node, target, call_hint)?;
 
         let block_return_type = expected_block.return_type();
         if block_return_type.is_untyped() || block_return_type == Ty::VOID {
-            return;
+            return None;
         }
 
         let Some(body) = block.body() else {
@@ -4593,7 +4973,7 @@ impl<'env> TypeChecker<'env> {
                     },
                 });
             }
-            return;
+            return None;
         };
 
         // Propagate the substituted block return type as a hint so the
@@ -4635,7 +5015,7 @@ impl<'env> TypeChecker<'env> {
             }
         }
         if actual.is_untyped() {
-            return;
+            return body_hint;
         }
 
         let subtyper = self.subtyper();
@@ -4652,21 +5032,24 @@ impl<'env> TypeChecker<'env> {
                 },
             });
         }
+        body_hint
     }
 
-    /// `block_param_types` when the call's block type resolved; every param
-    /// UNTYPED otherwise, so an unresolvable block never invents a binding
-    /// (e.g. `Array[bot]` for `*rest`) that could surface a new diagnostic.
-    fn unresolved_or_block_param_types(
+    /// `block_param_types` when the call's block type resolved to a typed
+    /// function; every param UNTYPED otherwise. An unresolvable block or a
+    /// `(?)` block says nothing about its arguments, and handing
+    /// `block_param_types` its empty slot list would read as "yields zero
+    /// values" and bind `*rest` to `Array[bot]` (Steep: `untyped`).
+    pub(super) fn unresolved_or_block_param_types(
         &self,
         expected_block: Option<&Block>,
         shape: BlockParamShape,
     ) -> (Vec<Option<Ty>>, Option<Ty>) {
         match expected_block {
-            Some(block) => {
+            Some(block) if !block.is_untyped_function() => {
                 self.block_param_types(&block.flat_positionals(), block.rest_positional(), shape)
             }
-            None => (
+            _ => (
                 vec![Some(Ty::UNTYPED); shape.positionals()],
                 shape.rest_present.then_some(Ty::UNTYPED),
             ),
@@ -4710,7 +5093,7 @@ impl<'env> TypeChecker<'env> {
     /// `Array[union of remaining expected_params (+ expected_rest)]`, or
     /// `Array[expected_rest]` / `Array[bot]` when nothing remains. This handles
     /// `|*b|` (rest-only) correctly: rest gets `Array[expected_params[0]]`.
-    pub(super) fn block_param_types(
+    fn block_param_types(
         &self,
         expected_params: &[Ty],
         expected_rest: Option<Ty>,
@@ -4829,7 +5212,20 @@ impl<'env> TypeChecker<'env> {
         };
         let expected_block =
             target.and_then(|target| self.lookup_block_type(node, target, call_hint));
+        self.push_block_scope_for(&block, expected_block);
+        true
+    }
 
+    /// The push-and-bind half of [`Self::setup_block_scope`], for a block
+    /// whose expected type is already resolved (or known to be
+    /// unresolvable: bare `super { }` forwards the enclosing method's
+    /// arguments and never looks its block type up, so its params bind
+    /// UNTYPED like any unresolved block's).
+    pub(super) fn push_block_scope_for<'pr>(
+        &mut self,
+        block: &ruby_prism::BlockNode<'pr>,
+        expected_block: Option<Block>,
+    ) {
         self.push_block_scope();
         if let Some(self_ty) = expected_block.as_ref().and_then(|b| b.self_type) {
             // A `[self: self]` block binding substitutes to SELF_TYPE via
@@ -5010,8 +5406,6 @@ impl<'env> TypeChecker<'env> {
                 }
             }
         }
-
-        true
     }
 
     /// Run the Tuple then Record element-access specializers, returning the
@@ -5027,9 +5421,9 @@ impl<'env> TypeChecker<'env> {
     /// `&mut self` diagnostic pass (`check_call_arguments`, which acts on
     /// `Missing`) and the `&self` return-type pass (`infer_call_return_type`,
     /// which maps `Found`/`Missing` to a type) so the entry condition and
-    /// specializer order live in one place. The key argument is synthesized
-    /// under the receiver's key classes as its hint (see below) so the
-    /// specializers can inspect the argument's literal (Symbol / Integer).
+    /// specializer order live in one place. The key argument is typed
+    /// under each known key literal in turn (`collect_element_access_arguments`)
+    /// so the specializers can inspect the argument's literal.
     pub(super) fn element_access_specialization<'pr>(
         &self,
         receiver: Ty,
@@ -5059,32 +5453,7 @@ impl<'env> TypeChecker<'env> {
         if !self.has_element_access_shape(receiver) {
             return None;
         }
-        // The key argument is synthesized under the receiver's key
-        // classes (`::Integer` for a tuple, every record key class for a
-        // record) as its hint, so a literal key keeps its literal type
-        // for the specializers below (a literal expression is class-typed
-        // unless its hint admits it). Steep's `record_shape`
-        // (`interface/builder.rb`) composes per-key literal overloads —
-        // what the specializers stand in for — over a `Hash#[] (K) -> V`
-        // fallback whose `K` is the keys' `back_type`; the hint here is
-        // that `K`, broadened to every key class so a wrong-class key
-        // (`rec["name"]` on `{name: String}`) still reaches the
-        // specializer and reports `UnknownRecordKey` / `UnknownTupleIndex`
-        // instead of falling through to the widened `Hash#[]`.
-        let args = match self.element_access_key_hint(receiver) {
-            Some(key_hint) => {
-                let overload = MethodType {
-                    type_params: vec![],
-                    type_: FunctionType::Typed(Function {
-                        required_positionals: vec![key_hint],
-                        ..Function::empty(Ty::UNTYPED)
-                    }),
-                    block: None,
-                };
-                self.collect_call_arguments_hinted(CallSite::Call(node), Some(&overload))
-            }
-            None => self.collect_call_arguments(CallSite::Call(node)),
-        };
+        let args = self.collect_element_access_arguments(receiver, node);
 
         // Union receiver: dispatch per member. `resolve_call_target` peels
         // Unions for the method-lookup path (ADR-0021), but this entry runs
@@ -5133,39 +5502,96 @@ impl<'env> TypeChecker<'env> {
             .or_else(|| self.record_key_specialization(receiver, method, &args))
     }
 
-    /// Key classes of a tuple / record receiver (union members
-    /// flattened): the hint for `element_access_specialization`'s key
-    /// argument. `::Integer` for a tuple; every `RecordKey` class
-    /// (`::Symbol | ::String | ::Integer | bool`) for a record. `None`
-    /// when no member is structural.
-    fn element_access_key_hint(&self, receiver: Ty) -> Option<Ty> {
-        let builtins = self.env.names().builtins();
-        let integer = self.env.class_instance_type(builtins.integer);
-        let key_class = |ty: Ty| match self.env.types().resolve(ty) {
-            Type::Tuple(_) => Some(vec![integer]),
-            Type::Record { .. } => Some(vec![
-                self.env.class_instance_type(builtins.symbol),
-                self.env.class_instance_type(builtins.string),
-                integer,
-                Ty::BOOL,
-            ]),
-            _ => None,
+    /// Arguments of a tuple / record element access, with the key
+    /// argument typed so the specializers can read the key from it.
+    ///
+    /// Steep's `record_shape` / `tuple_shape` (`interface/builder.rb`)
+    /// give `[]` / `fetch` one overload per known key (`(:name) ->
+    /// String`, `(1) -> String`) ahead of the `Hash#[]` / `Array#[]`
+    /// fallback; overload resolution types the key argument under each
+    /// key literal in turn, and a literal key keeps its literal type
+    /// only under its own overload (`unwrap(:name)` is `:name`). Each
+    /// known key is tried here as the hint the same way; the first
+    /// trial whose key argument comes out as a literal is the one the
+    /// specializers read.
+    ///
+    /// When no known key admits the argument, the arguments are typed
+    /// without a hint (a literal key is class-typed, as under Steep's
+    /// fallback overload). The unknown-key diagnostics
+    /// (`UnknownRecordKey` / `UnknownTupleIndex`) are a crema extension
+    /// with no Steep counterpart: for them alone, a key written as a
+    /// literal node (`r[:zzz]`, `t[7]`) is read from the node, the way
+    /// hash-literal synthesis reads record keys
+    /// (`record_key_from_literal_node`). A variable key (`k = :name;
+    /// r[k]`) is never re-read and falls through to the widened access.
+    fn collect_element_access_arguments<'pr>(
+        &self,
+        receiver: Ty,
+        node: &CallNode<'pr>,
+    ) -> CallArguments {
+        let Some(key_node) = node.arguments().and_then(|a| a.arguments().iter().next()) else {
+            return self.collect_call_arguments(CallSite::Call(node));
         };
-        let classes: Vec<Ty> = match self.env.types().resolve(receiver) {
+        let types = self.env.types();
+        let is_literal = |args: &CallArguments| {
+            args.positional
+                .first()
+                .is_some_and(|&t| matches!(types.resolve(t), Type::Literal(_)))
+        };
+        for key in self.element_access_keys(receiver) {
+            let overload = MethodType {
+                type_params: vec![],
+                type_: FunctionType::Typed(Function {
+                    required_positionals: vec![key],
+                    ..Function::empty(Ty::UNTYPED)
+                }),
+                block: None,
+            };
+            let args = self.collect_call_arguments_hinted(CallSite::Call(node), Some(&overload));
+            if is_literal(&args) {
+                return args;
+            }
+        }
+        let mut args = self.collect_call_arguments(CallSite::Call(node));
+        if let Some(key) = super::inference::record_key_from_literal_node(&key_node)
+            && let Some(first) = args.positional.first_mut()
+        {
+            *first = types.intern(Type::Literal(record_key_literal(&key)));
+        }
+        args
+    }
+
+    /// Known keys of a tuple / record receiver (union members flattened,
+    /// duplicates dropped) as literal types: `0`..`n-1` for a tuple, each
+    /// field key for a record.
+    fn element_access_keys(&self, receiver: Ty) -> Vec<Ty> {
+        let types = self.env.types();
+        let members = match types.resolve(receiver) {
             Type::Union(members) => {
                 definition_builder::flatten_alias_union_members(self.env, members)
-                    .into_iter()
-                    .filter_map(key_class)
-                    .flatten()
-                    .collect()
             }
-            _ => key_class(receiver).into_iter().flatten().collect(),
+            _ => vec![receiver],
         };
-        if classes.is_empty() {
-            None
-        } else {
-            Some(crate::types::union_of_many(&classes, self.env.types()))
+        let mut keys: Vec<Ty> = Vec::new();
+        for member in members {
+            let lits: Vec<Literal> = match types.resolve(member) {
+                Type::Tuple(elems) => (0..elems.len())
+                    .map(|i| Literal::Integer(i.to_string()))
+                    .collect(),
+                Type::Record { fields } => fields
+                    .iter()
+                    .map(|(key, _, _)| record_key_literal(key))
+                    .collect(),
+                _ => continue,
+            };
+            for lit in lits {
+                let key = types.intern(Type::Literal(lit));
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
         }
+        keys
     }
 
     /// Whether any specializer could serve this receiver. A Union passes on
@@ -5405,6 +5831,16 @@ impl<'env> TypeChecker<'env> {
 
     pub(super) fn widen_record_to_hash(&self, fields: &[(RecordKey, Ty, bool)]) -> Ty {
         method_resolver::widen_record_to_hash(self.env, fields)
+    }
+}
+
+/// The literal a record key denotes (`name:` is `:name`).
+fn record_key_literal(key: &RecordKey) -> Literal {
+    match key {
+        RecordKey::Symbol(s) => Literal::Symbol(s.clone()),
+        RecordKey::String(s) => Literal::String(s.clone()),
+        RecordKey::Integer(i) => Literal::Integer(i.clone()),
+        RecordKey::Bool(b) => Literal::Bool(*b),
     }
 }
 

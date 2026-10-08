@@ -10,7 +10,7 @@ use crate::rbs_raw::Parser as RbsParser;
 /// Mirrors `RBS::AST::Ruby::CommentBlock` for the payload crema keeps
 /// after Prism parsing: the original comment byte range plus the text
 /// normalized for inline annotation parsing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommentBlock {
     pub comments: Vec<CommentLine>,
 }
@@ -92,7 +92,7 @@ impl CommentBlock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommentLine {
     pub location: PrismByteRange,
     pub text: String,

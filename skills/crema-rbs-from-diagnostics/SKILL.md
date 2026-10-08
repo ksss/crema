@@ -30,8 +30,11 @@ type traces to a line of the gem's source, and anything not traced is
 
 ## Inputs
 
-- A `crema check` JSONL file (run from the project root:
-  `crema check > /tmp/crema.jsonl`).
+- A `crema check` JSONL file with every record (run from the project
+  root: `crema check --no-baseline > /tmp/crema.jsonl`). `--no-baseline`
+  matters when `crema.toml` sets `baseline`: without it crema drops the
+  known records and the worklist ranks only what is new. Without the key
+  it changes nothing.
 - A runner for fact lookups, default `bundle exec ruby -e '...'`. Only if
   the gem cannot be required without the application, use
   `bin/rails runner '...'` instead. The runner is for facts
@@ -288,7 +291,7 @@ name, or a `sig` key placed after a table — and the full run would only
 confirm that:
 
 ```sh
-crema check <smoke file> | jq -r .code | sort | uniq -c
+crema check --no-baseline <smoke file> | jq -r .code | sort | uniq -c
 ```
 
 Iterate on single files; the whole project runs at most twice per cycle
@@ -305,15 +308,16 @@ problem, not a cache problem.
 Then the full run:
 
 ```sh
-crema check > /tmp/crema.after.jsonl
+crema check --no-baseline > /tmp/crema.after.jsonl
 jq -r .code /tmp/crema.jsonl | sort | uniq -c | sort -rn > /tmp/before.txt
 jq -r .code /tmp/crema.after.jsonl | sort | uniq -c | sort -rn > /tmp/after.txt
 diff /tmp/before.txt /tmp/after.txt
 # still unresolved under this gem's path
 jq -c 'select(.code=="Ruby::UnknownConstant" and (.path|startswith("<Path>")))' /tmp/crema.after.jsonl
 # newly surfaced now that the receiver has a type: NoMethod carries
-# receiver_type, the argument diagnostics carry defined_in
-jq -c 'select((.receiver_type? // .defined_in? // "") | contains("<Path>"))' /tmp/crema.after.jsonl
+# receiver_type (an alias receiver shows the alias name; its expanded
+# members are in missing_from), the argument diagnostics carry defined_in
+jq -c 'select(([.receiver_type?, .defined_in?] + (.missing_from? // []) | map(select(. != null)) | join(" ")) | contains("<Path>"))' /tmp/crema.after.jsonl
 # NoMethod still cascading from the root (the receiver is a subclass, not <Path>)
 ruby <skill dir>/scripts/worklist.rb /tmp/crema.after.jsonl --methods <Path>
 ```
