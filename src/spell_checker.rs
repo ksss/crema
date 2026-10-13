@@ -41,12 +41,17 @@ pub fn correct(input: &str, dictionary: &[String]) -> Vec<String> {
         .filter(|word| jaro_winkler_distance(&normalize(word), &normalized_input) >= threshold)
         .filter(|word| input != word.as_str())
         .collect();
+    // Best match first. The gem sorts ascending and reverses, which
+    // leaves equal scores in reverse dictionary order; the resolver's
+    // dictionary comes out of a hash map, so equal scores are ordered
+    // by name here instead to keep suggestions deterministic.
     words.sort_by(|a, b| {
         let da = jaro_winkler_distance(a, &normalized_input);
         let db = jaro_winkler_distance(b, &normalized_input);
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        db.partial_cmp(&da)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
     });
-    words.reverse();
 
     // Correct mistypes.
     let mistype_threshold = (input_len as f64 * 0.25).ceil() as usize;

@@ -21,13 +21,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use crate::ast::MethodKind;
 use crate::ast::TypeParam as AstTypeParam;
 use crate::ast::annotation::Annotation;
 use crate::ast::declarations::{AsMember, Member};
 use crate::ast::members::{AliasKind, AliasMember, AttributeKind, IvarName};
 use crate::ast::ruby::PrismByteRange;
-use crate::ast::ruby::members::{DefMemberOrigin, Member as RubyMember};
+use crate::ast::ruby::members::Member as RubyMember;
 use crate::ast::types::Type as AstType;
 use crate::definition::ancestor_builder::{self, Ancestor, AncestorBuilder, AncestorSource};
 use crate::definition::method::{deprecated_annotation, has_method_missing_annotation};
@@ -220,27 +219,6 @@ pub struct DefinitionBuilder {
     /// Duplicate variable declarations detected from `Variable.parent_variable`
     /// chains during the construction-time scan.
     variable_dups: PerNameCache<VariableDuplication>,
-    /// `(method, kind) -> injection-target owners` index over synthetic
-    /// ActiveSupport::Concern `def`s (`DefMemberOrigin::SyntheticConcernIncluded`
-    /// / `SyntheticConcernPrepended`), built by a single A-layer walk
-    /// (`scan_synthetic_concern_index`) at construction — replaces
-    /// `TypeChecker::synthetic_method_context_targets`'s old per-`def`-node
-    /// full A walk (ADR-0032 Decision 5b). Read by
-    /// [`Self::synthetic_concern_targets`].
-    ///
-    /// Unlike `method_dups` / `variable_dups`, [`Self::update`] does *not*
-    /// carry this over incrementally: `synthetic_concern_targets`'s result
-    /// order drives `TypeChecker::visit_def_node`'s per-target check loop,
-    /// which streams per-file diagnostics straight to output with no
-    /// re-sort downstream (unlike `method_dups`/`variable_dups`, whose
-    /// consumers always re-sort). An `except`-owner carry-over would
-    /// reorder a bucket's tail by `FxHashSet` iteration order instead of
-    /// `a_iter` position, so `update()`'s output could diverge from a
-    /// cold build's for the same env — breaking ADR-0032 Decision 1's
-    /// cache-on/off idempotence contract. A full rescan costs one more
-    /// `class_decls()` walk per `update()` call, no worse than what
-    /// `from_environment` already pays once.
-    synthetic_concern_index: FxHashMap<(Symbol, MethodKind), Vec<SyntheticConcernTarget>>,
 }
 
 impl DefinitionBuilder {
@@ -264,15 +242,13 @@ impl DefinitionBuilder {
     /// `scope`'s owners (ADR-0036 Decision 4-2 — see [`ScanScope`] for
     /// why that is output-preserving under the CLI file filter). The
     /// scans are the only thing `scope` touches: `AncestorBuilder`,
-    /// `ConstantResolver`, the synthetic-concern index and every lazy
-    /// definition cache are built the same way for every scope, so type
-    /// checking never observes it.
+    /// `ConstantResolver` and every lazy definition cache are built the
+    /// same way for every scope, so type checking never observes it.
     pub fn from_environment_scoped(env: Arc<Environment>, scope: &ScanScope) -> Self {
         let ancestor_builder = Arc::new(AncestorBuilder::new(Arc::clone(&env)));
         let (method_dups, alias_cycles) =
             scan_method_builder_diagnostics(&env, ancestor_builder.types(), scope);
         let variable_dups = scan_variable_dups(&env, scope);
-        let synthetic_concern_index = scan_synthetic_concern_index(&env);
         let constant_resolver = ConstantResolver::new(Arc::clone(&ancestor_builder));
 
         Self {
@@ -295,7 +271,6 @@ impl DefinitionBuilder {
             method_dups,
             alias_cycles,
             variable_dups,
-            synthetic_concern_index,
         }
     }
 
@@ -371,10 +346,6 @@ impl DefinitionBuilder {
                 alias_cycles.push(owner, cycles);
             }
         }
-        // Full rescan, not an incremental carry-over — see the field doc
-        // comment on `synthetic_concern_index` for why.
-        let synthetic_concern_index = scan_synthetic_concern_index(&env);
-
         let instance_definition_cache =
             carry_over_definitions(&self.instance_definition_cache, except);
         let singleton_definition_cache =
@@ -409,7 +380,6 @@ impl DefinitionBuilder {
             method_dups,
             alias_cycles,
             variable_dups,
-            synthetic_concern_index,
         }
     }
 
@@ -1235,56 +1205,14 @@ impl DefinitionBuilder {
             .collect()
     }
 
-    /// ADR-0032 Decision 5b: injection-target owners for a synthetic
-    /// ActiveSupport::Concern `def` (index-backed replacement for
-    /// `TypeChecker::synthetic_method_context_targets`'s old per-`def`-node
-    /// full A-layer walk). `(method, kind)` selects the candidate bucket;
-    /// `location` / `source_file` narrow it to the exact `def` (the same
-    /// concern `def` can inject into several classes, all sharing one
-    /// source location — `source_file: None` on a candidate means "any
-    /// file", mirroring the old `Option::is_none_or` match). `current` is
-    /// excluded: a concern module never synthesizes onto itself. Preserves
-    /// the original A-layer iteration order (candidates are pushed in
-    /// `a_iter` order at construction) and dedups by owner, matching the
-    /// old walk's `seen: FxHashSet` guard.
-    pub(crate) fn synthetic_concern_targets(
-        &self,
-        method: Symbol,
-        kind: MethodKind,
-        location: PrismByteRange,
-        source_file: Option<Name>,
-        current: Option<TypeName>,
-    ) -> Vec<TypeName> {
-        let Some(candidates) = self.synthetic_concern_index.get(&(method, kind)) else {
-            return Vec::new();
-        };
-        let mut seen = FxHashSet::default();
-        let mut targets = Vec::new();
-        for candidate in candidates {
-            if Some(candidate.owner) == current || candidate.location != location {
-                continue;
-            }
-            if let Some(file) = candidate.source_file
-                && Some(file) != source_file
-            {
-                continue;
-            }
-            if seen.insert(candidate.owner) {
-                targets.push(candidate.owner);
-            }
-        }
-        targets
-    }
-
     /// Final include / prepend targets of an ActiveSupport::Concern
     /// `included do` / `prepended do` block (the infusion pipeline's
     /// expansion result, [`Environment::concern_block_targets`]). `None`
     /// when the block at `location` is not one the pipeline collected — a
     /// non-Concern module's `included`, or a second `included do` in the
     /// same module — so the caller keeps the default walk. `Some(empty)`
-    /// is a concern block no class includes. `source_file` follows
-    /// [`Self::synthetic_concern_targets`]'s rule: an entry recorded
-    /// without a file matches any file.
+    /// is a concern block no class includes. An entry recorded without a
+    /// `source_file` matches any file.
     pub(crate) fn concern_block_targets(
         &self,
         concern: TypeName,
@@ -4057,103 +3985,6 @@ fn scan_variable_dups(env: &Environment, scope: &ScanScope) -> PerNameCache<Vari
     all_dups
 }
 
-/// A candidate injection-target owner in [`DefinitionBuilder::synthetic_concern_index`].
-/// `location` / `source_file` identify the originating concern `def` node
-/// (shared across every class the concern injects into, since they are
-/// copies of the same node) and are matched against a checked `def` node's
-/// own location/source_file in [`DefinitionBuilder::synthetic_concern_targets`].
-#[derive(Debug, Clone, Copy)]
-struct SyntheticConcernTarget {
-    owner: TypeName,
-    location: PrismByteRange,
-    source_file: Option<Name>,
-}
-
-/// Synthetic-concern index scan, run in full on every construction —
-/// [`DefinitionBuilder::from_environment`] and [`DefinitionBuilder::update`]
-/// alike (see the field doc comment on `synthetic_concern_index` for why
-/// `update` does not carry this over incrementally like its sibling
-/// caches). Walks the A-only layer and indexes every `RubyMember::Def`
-/// with `DefMemberOrigin::SyntheticConcernIncluded` / `SyntheticConcernPrepended`
-/// by `(method, kind)`, replacing `TypeChecker::synthetic_method_context_targets`'s
-/// old per-`def`-node full A walk (ADR-0032 Decision 5b). Unlike
-/// `scan_method_builder_diagnostics` / `scan_variable_dups`, there is no
-/// baked-G splice branch: concerns are a Ruby-only mechanism (G is
-/// `.rbs`-only by construction), so a G entry can never carry a synthetic
-/// concern member — the `Some(g)` branch below only needs the A side.
-fn scan_synthetic_concern_index(
-    env: &Environment,
-) -> FxHashMap<(Symbol, MethodKind), Vec<SyntheticConcernTarget>> {
-    let names = env.names();
-    let mut index: FxHashMap<(Symbol, MethodKind), Vec<SyntheticConcernTarget>> =
-        FxHashMap::default();
-    match env.g_backend() {
-        Some(_) => {
-            for (name, entry) in env.class_decls().a_iter() {
-                index_synthetic_concern_defs_of(*name, entry, names, &mut index);
-            }
-        }
-        None => {
-            for (name, entry) in env.class_decls() {
-                index_synthetic_concern_defs_of(*name, entry, names, &mut index);
-            }
-        }
-    }
-    index
-}
-
-/// Indexes synthetic concern `def`s declared directly on `owner` (own
-/// decls only, matching the old per-`def`-node walk's `context_decls()`
-/// scope). Mirrors the old `ruby_members_include_def`'s origin filter.
-/// `DefMemberOrigin::SyntheticConcerning` is deliberately excluded: those
-/// defs are checked lexically in their owner's instance context and need
-/// no retargeting (see the variant's doc comment).
-fn index_synthetic_concern_defs_of(
-    owner: TypeName,
-    entry: &ClassOrModule,
-    names: &NameTable,
-    index: &mut FxHashMap<(Symbol, MethodKind), Vec<SyntheticConcernTarget>>,
-) {
-    let mut push_members = |members: &[RubyMember]| {
-        for member in members {
-            let RubyMember::Def(def) = member else {
-                continue;
-            };
-            if !matches!(
-                def.origin,
-                DefMemberOrigin::SyntheticConcernIncluded
-                    | DefMemberOrigin::SyntheticConcernPrepended
-            ) {
-                continue;
-            }
-            index
-                .entry((names.intern_symbol(&def.name), def.kind))
-                .or_default()
-                .push(SyntheticConcernTarget {
-                    owner,
-                    location: def.location,
-                    source_file: def.source_file,
-                });
-        }
-    };
-    match entry {
-        ClassOrModule::Class(class) => {
-            for (_, _, decl) in class.context_decls() {
-                if let ClassDeclaration::Ruby(decl) = decl {
-                    push_members(&decl.members);
-                }
-            }
-        }
-        ClassOrModule::Module(module) => {
-            for (_, _, decl) in module.context_decls() {
-                if let ModuleDeclaration::Ruby(decl) = decl {
-                    push_members(&decl.members);
-                }
-            }
-        }
-    }
-}
-
 /// G-only scan results grouped per owner, in cold-scan emission order.
 /// Baked into the snapshot by `encode_g_snapshot` and spliced back by
 /// the warm scans above. Only owners with at least one finding are
@@ -5359,21 +5190,13 @@ pub enum ConsultedKey {
         class: TypeName,
         var: Symbol,
     },
-    SyntheticConcernTargets {
-        method: Symbol,
-        kind: MethodKind,
-        location: PrismByteRange,
-        /// Resolved from the raw `Name` at the call site — see the
-        /// [`ConsultedKey`] doc comment for why the id itself cannot be
-        /// used as a key.
-        source_file: Option<String>,
-        current: Option<TypeName>,
-    },
     /// `DefinitionBuilder::concern_block_targets`.
     ConcernBlockTargets {
         concern: TypeName,
         location: PrismByteRange,
-        /// Resolved from the raw `Name` — see `SyntheticConcernTargets`.
+        /// Resolved from the raw `Name` at the call site — see the
+        /// [`ConsultedKey`] doc comment for why the id itself cannot be
+        /// used as a key.
         source_file: Option<String>,
     },
     ConstantResolution {
@@ -5746,30 +5569,6 @@ impl<'a> ConsultationView<'a> {
         self.record(
             || ConsultedKey::ClassInstanceVariable { class: *class, var },
             result.is_some(),
-        );
-        result
-    }
-
-    pub(crate) fn synthetic_concern_targets(
-        &self,
-        method: Symbol,
-        kind: MethodKind,
-        location: PrismByteRange,
-        source_file: Option<Name>,
-        current: Option<TypeName>,
-    ) -> Vec<TypeName> {
-        let result =
-            self.builder
-                .synthetic_concern_targets(method, kind, location, source_file, current);
-        self.record(
-            || ConsultedKey::SyntheticConcernTargets {
-                method,
-                kind,
-                location,
-                source_file: source_file.map(|n| self.builder.names().resolve(n).to_string()),
-                current,
-            },
-            !result.is_empty(),
         );
         result
     }

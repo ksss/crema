@@ -22,6 +22,88 @@ use super::{ArgSpan, CallArguments, CallTarget, SplatTail, TypeChecker, arg_span
 /// (`TypeChecker::kwsplat_record_keys`).
 pub(super) type KwsplatKeys = Vec<(String, Ty)>;
 
+/// What an overload can reject a call on without looking at any argument
+/// type. Built from the typed `CallArguments` (`narrow_overloads_by_args`)
+/// and from the untyped AST (`pick_hint_overload`), and judged by the one
+/// predicate `accepts`: an overload the narrowing rejects by shape must
+/// never be the hint, or the arguments get typed under the parameters of
+/// an overload that is not the target (`false` widens to `bool` under
+/// `?save: bool`, and the `save: false` overload behind it stops
+/// matching).
+pub(super) struct CallShape {
+    positionals: PositionalShape,
+    /// Symbol-keyed keywords of the braceless hash.
+    keyword_names: Vec<String>,
+    /// One entry per `**h`: its Record keys, or `None` for a splat that
+    /// supplies no known keyword (Hash / untyped).
+    kwsplat_keys: Vec<Option<Vec<String>>>,
+    /// The call has a braceless hash at all (keywords, `**h` or
+    /// non-Symbol pairs), which a keyword-less overload takes as one more
+    /// positional (`fold_braceless_keywords_for`).
+    has_braceless_hash: bool,
+    has_block: bool,
+}
+
+enum PositionalShape {
+    Exact(usize),
+    /// An unexpandable trailing splat. Its length is unknown, so only a
+    /// rest slot can take it, on any prefix length (`g(0, 1, 2, *xs)`
+    /// against `(Integer, *Integer)` is a valid call). An untyped tail is
+    /// held to the same rule so `check_against_method_def`'s rest-less arm
+    /// can emit `UnexpectedPositionalArgument` (Steep parity / user
+    /// decision 2026-06-07: surface the gap rather than silently accept
+    /// opaque splats).
+    SplatTail,
+}
+
+impl CallShape {
+    /// Whether a keyword-less overload sees the braceless hash as a
+    /// trailing positional. Must agree with `fold_braceless_keywords_for`.
+    fn folds_into(&self, overload: &crate::types::MethodType) -> bool {
+        self.has_braceless_hash
+            && !matches!(self.positionals, PositionalShape::SplatTail)
+            && super::takes_no_keywords(overload)
+    }
+
+    /// Arity, required keywords supplied, every keyword declared (or
+    /// `**rest`), and a required block present.
+    pub(super) fn accepts(&self, overload: &crate::types::MethodType) -> bool {
+        if let Some(block) = &overload.block
+            && block.required
+            && !self.has_block
+        {
+            return false;
+        }
+        if overload.is_untyped_function() {
+            return true;
+        }
+        let folds = self.folds_into(overload);
+        let arity_ok = match self.positionals {
+            PositionalShape::Exact(count) => overload.arity_accepts(count + usize::from(folds)),
+            PositionalShape::SplatTail => overload.rest_positional().is_some(),
+        };
+        if !arity_ok {
+            return false;
+        }
+        if folds {
+            return true;
+        }
+        let splat_keys = || self.kwsplat_keys.iter().flatten().flatten();
+        let supplied = |name: &str| {
+            self.keyword_names.iter().any(|k| k == name) || splat_keys().any(|k| k == name)
+        };
+        overload
+            .required_keywords()
+            .iter()
+            .all(|(name, _)| supplied(name))
+            && self
+                .keyword_names
+                .iter()
+                .chain(splat_keys())
+                .all(|name| overload.keyword_param_type(name).is_some())
+    }
+}
+
 /// Abstraction over the two prism nodes that drive argument checking:
 /// `CallNode` (regular method call) and `SuperNode` (explicit `super(args)`).
 ///
@@ -2553,6 +2635,107 @@ impl<'env> TypeChecker<'env> {
         self.hash_instance(symbol, rest)
     }
 
+    fn kwsplat_key_names(&self, ty: Ty) -> Option<Vec<String>> {
+        self.kwsplat_record_keys(ty)
+            .map(|keys| keys.into_iter().map(|(name, _)| name).collect())
+    }
+
+    pub(super) fn call_shape_of_arguments(&self, arguments: &CallArguments) -> CallShape {
+        CallShape {
+            positionals: if arguments.splat_tail.is_some() {
+                PositionalShape::SplatTail
+            } else {
+                PositionalShape::Exact(arguments.positional.len())
+            },
+            keyword_names: arguments
+                .keywords
+                .iter()
+                .map(|(name, ..)| name.clone())
+                .collect(),
+            kwsplat_keys: arguments
+                .kwsplats
+                .iter()
+                .map(|(ty, _)| self.kwsplat_key_names(*ty))
+                .collect(),
+            has_braceless_hash: !arguments.keywords.is_empty()
+                || !arguments.kwsplats.is_empty()
+                || !arguments.non_symbol_pairs.is_empty(),
+            has_block: arguments.has_block,
+        }
+    }
+
+    /// The shape of a call read off its AST, before any argument is
+    /// typed. Splats are counted by the collectors' own rule
+    /// (`absorb_splat_into_args`, element types skipped) and a `**h`
+    /// value is typed unhinted for its Record keys, so the shape is the
+    /// one `call_shape_of_arguments` sees after collection. Read-only
+    /// `infer_type` throughout, as in `argument_matches_hint`: the
+    /// collectors' `infer_argument` carries extract records. `None` for
+    /// `...` forwarding, whose shape is the enclosing method's.
+    fn call_shape_of_site<'pr>(&self, node: CallSite<'_, 'pr>) -> Option<CallShape> {
+        let mut positional = vec![];
+        let mut positional_spans = vec![];
+        let mut splat_tail: Option<SplatTail> = None;
+        let mut unexpandable_seen = false;
+        let mut keyword_names = vec![];
+        let mut kwsplat_keys = vec![];
+        let mut has_braceless_hash = false;
+        if let Some(arguments) = node.arguments() {
+            for arg in arguments.arguments().iter() {
+                if let Some(keyword_hash) = arg.as_keyword_hash_node() {
+                    for elem in keyword_hash.elements().iter() {
+                        has_braceless_hash = true;
+                        if let Some(assoc) = elem.as_assoc_node() {
+                            if let Some(sym) = assoc.key().as_symbol_node() {
+                                keyword_names
+                                    .push(String::from_utf8_lossy(sym.unescaped()).to_string());
+                            }
+                        } else if let Some(splat) = elem.as_assoc_splat_node() {
+                            let value_type = match splat.value() {
+                                Some(value) => self.infer_type(&value, None),
+                                None => self.kwsplat_value_type(&splat),
+                            };
+                            kwsplat_keys.push(self.kwsplat_key_names(value_type));
+                        }
+                    }
+                } else if arg.as_forwarding_arguments_node().is_some() {
+                    return None;
+                } else if let Some(splat) = arg.as_splat_node() {
+                    self.absorb_splat_into_args(
+                        &splat,
+                        &mut positional,
+                        &mut positional_spans,
+                        &mut splat_tail,
+                        |_, _, _| Ty::UNTYPED,
+                    );
+                    unexpandable_seen |= splat_tail.is_some();
+                } else {
+                    if unexpandable_seen {
+                        splat_tail = Some(SplatTail {
+                            element_ty: Ty::UNTYPED,
+                            span: arg_span(
+                                arg.location().start_offset(),
+                                arg.location().end_offset(),
+                            ),
+                        });
+                    }
+                    positional.push(Ty::UNTYPED);
+                }
+            }
+        }
+        Some(CallShape {
+            positionals: if splat_tail.is_some() {
+                PositionalShape::SplatTail
+            } else {
+                PositionalShape::Exact(positional.len())
+            },
+            keyword_names,
+            kwsplat_keys,
+            has_braceless_hash,
+            has_block: node.block().is_some(),
+        })
+    }
+
     /// Union of an `absorb_kwsplat_ty` member pool; untyped when the pool
     /// is empty (every contributor dropped).
     fn union_of_members(&self, members: &[Ty]) -> Ty {
@@ -2566,8 +2749,9 @@ impl<'env> TypeChecker<'env> {
     /// Strict structural filtering shared by all three call-path consumers
     /// (`check_against_method_def`, `infer_return_type`, `lookup_block_type`).
     ///
-    /// Applies arity, positional arg subtyping, keyword shape, and
-    /// required-block presence as hard AND'd filters. Any step that
+    /// Applies the call shape (`CallShape::accepts`: arity, keyword shape,
+    /// required-block presence), positional arg subtyping and keyword
+    /// types as hard AND'd filters. Any step that
     /// empties the candidate set short-circuits to `vec![]`.
     ///
     /// The bound filter and the block-presence *preference* are soft
@@ -2604,6 +2788,15 @@ impl<'env> TypeChecker<'env> {
         } else {
             candidates
         };
+
+        // Shape — strict: arity, keyword shape and required-block presence,
+        // shared with `pick_hint_overload` so the hint is never an overload
+        // rejected here.
+        let shape = self.call_shape_of_arguments(arguments);
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|o| shape.accepts(o))
+            .collect();
         if candidates.is_empty() {
             return vec![];
         }
@@ -2623,42 +2816,6 @@ impl<'env> TypeChecker<'env> {
                 (o, args)
             })
             .collect();
-
-        // Arity — strict. With a splat tail in scope, an exact `arg_count`
-        // can't be enforced (the tail's length is unknown statically), so
-        // the arity filter is relaxed:
-        //   * untyped tail — defer to the diagnostic path (which emits
-        //     `UnexpectedPositionalArgument` for rest-less overloads,
-        //     silent for rest-bearing); accept everything here so the
-        //     diagnostic path can still pick a representative overload.
-        //   * non-untyped tail + overload has a rest slot — accept on any
-        //     prefix length. The rest slot absorbs every surplus arg, so
-        //     bounding `arg_count` is wrong: `g(0, 1, 2, *xs)` against
-        //     `(Integer, *Integer)` is a valid Ruby call.
-        //   * non-untyped tail + no rest slot — reject (the tail has
-        //     nowhere to land; matches Steep's `UnexpectedPositionalArgument`).
-        let candidates: Vec<_> = candidates
-            .into_iter()
-            .filter(|(o, arguments)| {
-                if o.is_untyped_function() {
-                    return true;
-                }
-                let arg_count = arguments.positional.len();
-                match &arguments.splat_tail {
-                    None => o.arity_accepts(arg_count),
-                    // Both untyped and non-untyped tails require a rest
-                    // slot to land in. Untyped tails reject rest-less
-                    // overloads here so `check_against_method_def`'s
-                    // rest-less arm can emit `UnexpectedPositionalArgument`
-                    // (Steep parity / user decision 2026-06-07: surface
-                    // the gap rather than silently accept opaque splats).
-                    Some(_) => o.rest_positional().is_some(),
-                }
-            })
-            .collect();
-        if candidates.is_empty() {
-            return vec![];
-        }
 
         // Positional arg subtyping — strict. `subtyper.check` already
         // wildcard-matches untyped actuals and `TypeVariable` on either
@@ -2720,9 +2877,8 @@ impl<'env> TypeChecker<'env> {
             return vec![];
         }
 
-        // Keyword shape — strict. Required keywords present, each keyword
-        // type-checks, unknown keywords rejected unless the overload
-        // carries `**rest`.
+        // Keyword types — strict. Presence and names were settled by the
+        // shape filter; each supplied keyword type-checks here.
         let candidates: Vec<_> = candidates
             .into_iter()
             .filter(|(o, arguments)| {
@@ -2737,27 +2893,11 @@ impl<'env> TypeChecker<'env> {
                     }
                     ty
                 };
-                // Record `**h` keys count as supplied keywords; Hash /
-                // untyped splats supply nothing (`kwsplat_record_keys`).
                 let splats: Vec<(Option<KwsplatKeys>, Ty)> = arguments
                     .kwsplats
                     .iter()
                     .map(|(ty, _)| (self.kwsplat_record_keys(*ty), *ty))
                     .collect();
-                for (required_name, _) in o.required_keywords() {
-                    let supplied = arguments
-                        .keywords
-                        .iter()
-                        .any(|(name, _, _, _)| name == required_name)
-                        || splats.iter().any(|(keys, _)| {
-                            keys.as_ref().is_some_and(|keys| {
-                                keys.iter().any(|(name, _)| name == required_name)
-                            })
-                        });
-                    if !supplied {
-                        return false;
-                    }
-                }
                 let keyword_fits = |name: &str, actual: Ty| match o.keyword_param_type(name) {
                     Some(expected_type) => subtyper.check(actual, subst(expected_type)),
                     None => false,
@@ -2789,25 +2929,7 @@ impl<'env> TypeChecker<'env> {
                 true
             })
             .collect();
-        if candidates.is_empty() {
-            return vec![];
-        }
-
-        // Required-block presence — strict. A call without a block cannot
-        // reach an overload whose block is required.
-        candidates
-            .into_iter()
-            .filter(|(o, _)| {
-                if let Some(block) = &o.block
-                    && block.required
-                    && !arguments.has_block
-                {
-                    return false;
-                }
-                true
-            })
-            .map(|(o, _)| o)
-            .collect()
+        candidates.into_iter().map(|(o, _)| o).collect()
     }
 
     /// Full overload narrowing: strict structural filtering
@@ -5938,17 +6060,22 @@ impl<'env> TypeChecker<'env> {
             .filter(|a| a.as_keyword_hash_node().is_none())
             .count();
 
+        let shape = self.call_shape_of_site(node);
+
         'next_overload: for raw_overload in method_def.method_types() {
-            let overload = subst_mt(raw_overload);
-            // An overload that cannot take this many positionals cannot
-            // be the call's target; without this gate `(Integer) | (Integer,
-            // 0 | 1)` would hand `one(5, 1)` the first overload as hint
-            // (`positional_param_for_call` returns `None` past its arity
-            // and `argument_matches_hint` passes on `None`), and the `1`
-            // would widen to `::Integer` under the missing hint.
-            if !overload.arity_accepts(positional_count) {
+            // An overload the narrowing rejects by shape cannot be the
+            // call's target. Hinting with it types the arguments under the
+            // wrong parameters: `(Integer) | (Integer, 0 | 1)` would widen
+            // the `1` of `one(5, 1)` to `::Integer` (no slot, no hint), and
+            // `(destination: String, ?save: bool) | (save: false)` would
+            // widen the `false` of `call(save: false)` to `bool`.
+            if shape
+                .as_ref()
+                .is_some_and(|shape| !shape.accepts(raw_overload))
+            {
                 continue 'next_overload;
             }
+            let overload = subst_mt(raw_overload);
             let mut positional_index = 0usize;
             for arg in arguments.arguments().iter() {
                 if let Some(keyword_hash) = arg.as_keyword_hash_node() {

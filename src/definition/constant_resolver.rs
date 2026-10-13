@@ -902,13 +902,74 @@ fn parent_typename(name: TypeName, names: &NameTable) -> Option<TypeName> {
 /// [`ConstantTable::hydrate`].
 type ConstantsMap = FxHashMap<Symbol, ConstantEntry>;
 
+/// What one lexical scope sees, held as references into the maps the
+/// resolver already owns instead of as a merged copy.
+///
+/// rbs's `load_context_constants` folds four layers into one hash —
+/// the `::Object` + toplevel seed, the rest of the innermost scope's
+/// ancestors, the lexical scope chain, the scope itself — and a later
+/// merge wins. A merge only ever inserts, so looking the layers up in
+/// reverse merge order answers exactly what the merged hash would.
+/// Every layer but `itself` already lives in an `Arc` on
+/// [`ConstantTable`] or the resolver; on gitlab the merged copies came
+/// to 1 GiB across 10k contexts, 55% of the whole check.
+#[derive(Debug)]
+pub struct ContextConstants {
+    /// rbs `constants_itself`: the innermost scope as a constant of
+    /// itself. Consulted first.
+    itself: Option<(Symbol, ConstantEntry)>,
+    /// rbs `constants_from_context`, innermost scope first. The chain
+    /// stops at the first scope missing from `children_table` (rbs's
+    /// `or return false`), so scopes inside that one are absent.
+    lexical: Box<[OwnerConstants]>,
+    /// rbs `constants_from_ancestors` minus `seed`: what the innermost
+    /// scope's ancestors contribute beyond `::Object` + toplevel. Shared
+    /// by every context with the same normalized innermost scope.
+    ancestors: Arc<ConstantsMap>,
+    /// `::Object`'s children + toplevel, shared by every context.
+    seed: Arc<ConstantsMap>,
+}
+
+impl ContextConstants {
+    /// The entry `name` resolves to in this scope, or `None`.
+    pub fn get(&self, name: Symbol) -> Option<ConstantEntry> {
+        if let Some((sym, entry)) = self.itself
+            && sym == name
+        {
+            return Some(entry);
+        }
+        for layer in &self.lexical {
+            if let Some(entry) = layer.get(&name) {
+                return Some(*entry);
+            }
+        }
+        if let Some(entry) = self.ancestors.get(&name) {
+            return Some(*entry);
+        }
+        self.seed.get(&name).copied()
+    }
+
+    /// Every name visible in this scope, each once, in no particular
+    /// order. The did_you_mean dictionary.
+    pub fn names(&self) -> Vec<Symbol> {
+        let mut seen: FxHashSet<Symbol> = FxHashSet::default();
+        seen.extend(self.itself.map(|(sym, _)| sym));
+        for layer in &self.lexical {
+            seen.extend(layer.keys().copied());
+        }
+        seen.extend(self.ancestors.keys().copied());
+        seen.extend(self.seed.keys().copied());
+        seen.into_iter().collect()
+    }
+}
+
 /// Port of `RBS::Resolver::ConstantResolver` (constant_resolver.rb
 /// L85-216). Constant-name lookup that honors lexical scope plus the
 /// ancestor chain, with the two cache lanes rbs maintains:
 ///
 /// - `context_constants_cache` keyed by [`ConstantContext`]: every
 ///   `resolve(name, context)` / `constants(context)` hit reuses the
-///   merged map for that lexical scope.
+///   [`ContextConstants`] layers for that lexical scope.
 /// - `child_constants_cache` keyed by [`TypeName`]: every
 ///   `resolve_child(module, name)` / `children(module)` hit reuses the
 ///   merged ancestor-folded children map for that class/module.
@@ -916,9 +977,9 @@ type ConstantsMap = FxHashMap<Symbol, ConstantEntry>;
 /// Both caches are insert-only `OnceMap`s, so the public API stays on
 /// `&self` — matching rbs's `@context_constants_cache = {}` /
 /// `@child_constants_cache = {}` — and threads can share the resolver
-/// (ADR-0034 Decision 3). Returns are `Arc<ConstantsMap>` so
-/// repeat hits do not clone the entire map; when two threads compute the
-/// same key, both get the `Arc` that was stored first.
+/// (ADR-0034 Decision 3). Returns are `Arc`s so repeat hits do not
+/// clone; when two threads compute the same key, both get the `Arc`
+/// that was stored first.
 #[derive(Debug)]
 pub struct ConstantResolver {
     /// Shared with [`super::DefinitionBuilder`]; held so `&self`
@@ -927,20 +988,22 @@ pub struct ConstantResolver {
     builder: Arc<AncestorBuilder>,
     table: ConstantTable,
     /// Precomputed `::Object` `TypeName`. The hot-path filters
-    /// (`load_child_constants`, `constants_from_ancestors`,
+    /// (`load_child_constants`, `load_ancestor_constants`,
     /// `constants_itself`) check `ancestor.name == object` and reuse
     /// this rather than reparsing `"::Object"` per call.
     object: TypeName,
-    context_constants_cache: OnceMap<ConstantContext, Arc<ConstantsMap>>,
+    context_constants_cache: OnceMap<ConstantContext, Arc<ContextConstants>>,
     child_constants_cache: OnceMap<TypeName, Arc<ConstantsMap>>,
+    /// `ContextConstants::ancestors` per normalized innermost scope.
+    /// Not a cache lane rbs has: rbs recomputes the ancestor walk into
+    /// each context's merged hash, crema computes it once per scope
+    /// and shares it among the contexts ending in that scope.
+    ancestor_constants_cache: OnceMap<TypeName, Arc<ConstantsMap>>,
     /// `::Object`'s children merged with `toplevel` — the
-    /// context-independent prefix every `constants_from_ancestors`
-    /// merge starts from (rbs L182-184). Built once per resolver
-    /// generation and cloned into each context's map instead of
-    /// re-inserting every toplevel constant per context: on gitlab
-    /// that was 900 inserts (with growth rehashes) for each of 5,715
-    /// contexts. Not a cache lane rbs has; the per-context maps it
-    /// produces are identical to rbs's.
+    /// context-independent layer every context sees last (rbs
+    /// L182-184). Built once per resolver generation and shared by
+    /// every [`ContextConstants`]. Not a cache lane rbs has; the
+    /// answers it produces are identical to rbs's.
     ancestors_seed: OnceLock<Arc<ConstantsMap>>,
 }
 
@@ -978,25 +1041,27 @@ impl ConstantResolver {
             object,
             context_constants_cache: OnceMap::default(),
             child_constants_cache: OnceMap::default(),
+            ancestor_constants_cache: OnceMap::default(),
             ancestors_seed: OnceLock::new(),
         }
     }
 
-    /// rbs `resolve(name, context:)` (L95-98). Looks up `name` in the
-    /// merged context constants map, then hydrates the matching entry
-    /// into a full [`ResolverConstant`] — this is where `.ty` lowering
-    /// for a `constant_of_constant` name is deferred to.
+    /// rbs `resolve(name, context:)` (L95-98). Looks up `name` through
+    /// the context's layers, then hydrates the matching entry into a
+    /// full [`ResolverConstant`] — this is where `.ty` lowering for a
+    /// `constant_of_constant` name is deferred to.
     pub fn resolve(&self, name: Symbol, context: &ConstantContext) -> Option<ResolverConstant> {
         self.constants(context)
-            .get(&name)
-            .map(|entry| self.table.hydrate(entry, &self.builder))
+            .get(name)
+            .map(|entry| self.table.hydrate(&entry, &self.builder))
     }
 
-    /// rbs `constants(context)` (L100-106). Returns the entire merged
-    /// snapshot for the given lexical scope. The first call for a
-    /// context computes the snapshot from `load_context_constants` and
-    /// stores it; subsequent calls return the cached `Arc`.
-    pub fn constants(&self, context: &ConstantContext) -> Arc<ConstantsMap> {
+    /// rbs `constants(context)` (L100-106). Returns the layers that
+    /// together answer every name visible from the given lexical scope.
+    /// The first call for a context builds them with
+    /// `load_context_constants` and stores them; subsequent calls
+    /// return the cached `Arc`.
+    pub fn constants(&self, context: &ConstantContext) -> Arc<ContextConstants> {
         if let Some(cached) = self.context_constants_cache.get(context) {
             return Arc::clone(cached);
         }
@@ -1020,13 +1085,14 @@ impl ConstantResolver {
     /// parent walk-up. When `scope` is `Some`, defers to
     /// `resolve_child` (ancestor-folded children of that scope). When
     /// `scope` is `None` (top-level), there is no parent scope to walk
-    /// up *to*, so the regular toplevel `resolve` is correct — and
-    /// crucially it sees the toplevel-only entries (class/module
-    /// aliases, bare `CONST: T` decls) that `resolve_child(::Object)`
-    /// would miss, since rbs lands those in the `toplevel` table, not
-    /// in `::Object`'s children. Used by the constant-write diagnostic,
-    /// which must not let a *lexical parent's* same-named declaration
-    /// shadow a fresh inner-scope write.
+    /// up *to*, so the regular toplevel `resolve` is correct: an empty
+    /// context resolves through `::Object` (rbs L126-130), and
+    /// `children(::Object)` folds the toplevel in as well, so both
+    /// routes give the same answer; the `resolve` route is kept because
+    /// it does not depend on `::Object` being declared. Used by the
+    /// constant-write diagnostic, which must not let a *lexical
+    /// parent's* same-named declaration shadow a fresh inner-scope
+    /// write.
     pub fn resolve_in_namespace(
         &self,
         scope: Option<&TypeName>,
@@ -1053,47 +1119,28 @@ impl ConstantResolver {
         )
     }
 
-    /// rbs `load_context_constants(context)` (L122-136). Three-step
-    /// merge: ancestors of the innermost scope (or Object when context
-    /// is empty), the lexical scope chain itself, then the scope's own
-    /// self-constant. Subsequent merges overwrite earlier ones — Ruby's
-    /// inner-shadow-outer semantics expressed as
-    /// `FxHashMap::insert` order.
-    fn load_context_constants(&self, context: &ConstantContext) -> ConstantsMap {
-        let mut consts: ConstantsMap = FxHashMap::default();
-
-        match context.last() {
-            Some(typename) => self.constants_from_ancestors(typename, &mut consts),
-            None => {
-                // rbs L126-130 always routes through `::Object` here.
-                // When `::Object` is in the environment, take the same
-                // path so the ancestor-walk side effects (e.g. children
-                // of `::Kernel` if `::Object` includes it) stay
-                // consistent with rbs. When it's *not* present
-                // (minimum-rbs test envs that don't inject built-ins),
-                // the rbs path would `raise`; crema falls back to
-                // splicing `toplevel` in directly so top-level
-                // resolves still work in those envs. Mirrors the
-                // robustness guarantee crema gives the type checker:
-                // missing built-ins degrade to soft misses, not
-                // panics.
-                if self.builder.env().class_decls().contains_key(&self.object) {
-                    self.seed_toplevel_via_object(&mut consts);
-                } else {
-                    merge_into(&mut consts, &self.table.toplevel());
-                }
-            }
+    /// rbs `load_context_constants(context)` (L122-136). rbs merges
+    /// three steps into one hash — ancestors of the innermost scope (or
+    /// `::Object` when the context is empty), the lexical scope chain,
+    /// then the scope's own self-constant — with later merges winning.
+    /// Here each step becomes a layer of [`ContextConstants`], and the
+    /// lookup consults them in reverse order.
+    fn load_context_constants(&self, context: &ConstantContext) -> ContextConstants {
+        // rbs L126-130 always routes an empty context through
+        // `::Object`. When `::Object` is absent (minimum-rbs test envs
+        // that don't inject built-ins) rbs would `raise`; crema's
+        // `load_ancestor_constants` treats it like any undefined scope
+        // and `ancestors_seed` degrades to `toplevel` alone, so
+        // top-level resolves still work. Mirrors the robustness
+        // guarantee crema gives the type checker: missing built-ins
+        // degrade to soft misses, not panics.
+        let innermost = context.last().copied().unwrap_or(self.object);
+        ContextConstants {
+            itself: self.constants_itself(context),
+            lexical: self.constants_from_context(context),
+            ancestors: self.ancestor_constants(&innermost),
+            seed: self.ancestors_seed(),
         }
-
-        // rbs returns `nil` from `constants_from_context` for a broken
-        // context (missing children_table entry mid-walk). In Rust we
-        // surface the partial result — diagnostic passes catch the
-        // missing reference upstream — but the conditional return path
-        // is mirrored so future divergence stays visible.
-        let _ = self.constants_from_context(context, &mut consts);
-
-        self.constants_itself(context, &mut consts);
-        consts
     }
 
     /// rbs `load_child_constants(name)` (L138-161). Walks the
@@ -1141,86 +1188,101 @@ impl ConstantResolver {
             }
         }
 
+        // `::Object`'s constants are the toplevel constants (Ruby:
+        // `Object::String` is `String`). rbs gets there only as a side
+        // effect: `constants_from_ancestors` (L191-194, "Insert toplevel
+        // constants as ::Object's constants") `merge!`s `toplevel` into
+        // the `table.children(Object)` hash in place, so rbs's
+        // `children(Object)` holds the toplevel iff some `resolve` ran
+        // first. crema pins that post-merge state unconditionally — the
+        // answers rbs gives in its usual call order, independent of
+        // order. Same merge order as `ancestors_seed`: toplevel wins
+        // over `::Object`'s own children on collision.
+        if target_is_object {
+            merge_into(&mut constants, &self.table.toplevel());
+        }
+
         constants
     }
 
     /// rbs `constants_from_context(context, constants:)` (L163-176).
-    /// Recurses parent-first then merges the innermost scope's
-    /// children. Returns `false` if any segment is missing from
-    /// `children_table` (rbs's `or return false`); the caller's value
-    /// would be `nil` in Ruby — Rust callers fold a `false` into a
-    /// silent partial merge.
-    fn constants_from_context(&self, context: &ConstantContext, consts: &mut ConstantsMap) -> bool {
-        let Some(parent) = context.parent() else {
-            return true;
-        };
-        if !self.constants_from_context(&parent, consts) {
-            return false;
-        }
-        let Some(last) = context.last() else {
-            return true;
-        };
-        let normalized = self.builder.env().normalize_module_name(last);
-        match self.table.children(&normalized) {
-            Some(children) => {
-                merge_into(consts, &children);
-                true
+    /// rbs recurses parent-first and merges each scope's children on
+    /// the way back, stopping at the first segment missing from
+    /// `children_table` (its `or return false`; the caller's value
+    /// would be `nil` in Ruby — crema keeps the partial chain and lets
+    /// the diagnostic passes catch the missing reference upstream).
+    /// Returns the children maps innermost first — the order a lookup
+    /// consults them — sharing the table's `Arc`s instead of copying.
+    fn constants_from_context(&self, context: &ConstantContext) -> Box<[OwnerConstants]> {
+        let mut layers = Vec::with_capacity(context.scopes().len());
+        for scope in context.scopes() {
+            let normalized = self.builder.env().normalize_module_name(scope);
+            match self.table.children(&normalized) {
+                Some(children) => layers.push(children),
+                None => break,
             }
-            None => false,
         }
+        layers.reverse();
+        layers.into_boxed_slice()
+    }
+
+    /// `ContextConstants::ancestors` for the scope `name`, computed once
+    /// per normalized scope. Mirrors rbs `module_class_entry(name,
+    /// normalized: true)` (L181): when `name` is an alias,
+    /// `class_decls.get(name)` misses (aliases live in
+    /// `class_alias_decls`), so normalizing routes the walk to the
+    /// alias's real target.
+    fn ancestor_constants(&self, name: &TypeName) -> Arc<ConstantsMap> {
+        let normalized = self.builder.env().normalize_module_name(name);
+        if let Some(cached) = self.ancestor_constants_cache.get(&normalized) {
+            return Arc::clone(cached);
+        }
+        let computed = Arc::new(self.load_ancestor_constants(&normalized));
+        Arc::clone(
+            self.ancestor_constants_cache
+                .insert_first(normalized, computed),
+        )
     }
 
     /// rbs `constants_from_ancestors(module_name, constants:)`
-    /// (L178-199). Seeds the merge with Object's children + toplevel
-    /// (when the root is a class/module entry), then walks
-    /// `instance_ancestors(module_name)` in reverse. Inside the walk,
-    /// hitting `::Object` from a class entry re-merges toplevel into
-    /// Object's effective children (rbs L191-194 — the explicit
+    /// (L178-199), as the delta over [`Self::ancestors_seed`]. rbs
+    /// seeds the merge with Object's children + toplevel (when the root
+    /// is a class/module entry), then walks `instance_ancestors` in
+    /// reverse; hitting `::Object` from a class entry re-merges toplevel
+    /// into Object's effective children (rbs L191-194 — the explicit
     /// "insert toplevel constants as ::Object's constants" comment).
-    fn constants_from_ancestors(&self, name: &TypeName, consts: &mut ConstantsMap) {
-        // Mirror rbs `module_class_entry(name, normalized: true)`
-        // (L181). When `name` is the innermost lexical scope and is an
-        // alias, `class_decls.get(name)` misses (aliases live in
-        // `class_alias_decls`). Normalizing routes the lookup to the
-        // alias's real target so Object/toplevel seeding still fires
-        // for an alias-only context.
-        let name = self.builder.env().normalize_module_name(name);
-        let entry_is_class_or_module = self.builder.env().class_decls().contains_key(&name);
-        let entry_is_class = matches!(
-            self.builder.env().class_decls().get(&name),
-            Some(crate::environment::frozen::ClassOrModule::Class(_))
-        );
-
-        // rbs L182-184 merges Object's children then toplevel into
-        // `constants`. Every caller hands in a fresh map, so the merge
-        // is a straight copy of the shared seed; keep the additive
-        // merge for a non-empty map so the semantics stay rbs's.
-        let seed = self.ancestors_seed();
-        if consts.is_empty() {
-            consts.clone_from(&seed);
-        } else {
-            merge_into(consts, &seed);
-        }
+    ///
+    /// The seed is its own layer, so this returns only the entries the
+    /// walk writes with a value the seed does not have: a lookup that
+    /// misses here falls through to the seed, which is what rbs's
+    /// merged hash holds for that key. `name` is already normalized.
+    fn load_ancestor_constants(&self, name: &TypeName) -> ConstantsMap {
+        let mut delta: ConstantsMap = FxHashMap::default();
+        let entry_is_class_or_module = self.builder.env().class_decls().contains_key(name);
         if !entry_is_class_or_module {
             // Undefined scope: rbs raises here (L179 `or raise`).
-            // crema seeds toplevel so references inside an unknown
-            // module/class body resolve against top-level rather than
-            // producing cascading UnknownConstant false positives.
-            return;
+            // crema lets the seed alone answer so references inside an
+            // unknown module/class body resolve against top-level
+            // rather than producing cascading UnknownConstant false
+            // positives.
+            return delta;
         }
+        let entry_is_class = matches!(
+            self.builder.env().class_decls().get(name),
+            Some(crate::environment::frozen::ClassOrModule::Class(_))
+        );
+        let seed = self.ancestors_seed();
 
         // rbs L188-194: when the chain reaches `::Object` from a class
         // entry, `children(Object) + toplevel` (= the seed) is merged
         // again so it shadows whatever the ancestors *below* Object
-        // (`BasicObject`, `Kernel`, ...) contributed. Re-inserting the
-        // whole seed is O(toplevel) per class context; only the keys
-        // those earlier ancestors wrote (plus Object's own children,
-        // whose toplevel-shadowed values live in the seed) can differ
-        // from the seed, so restoring exactly those keys yields the
-        // same final map.
+        // (`BasicObject`, `Kernel`, ...) contributed. In delta form
+        // "restore to the seed's value" is "drop the key from the
+        // delta": the lookup then falls through to the seed. Keys the
+        // seed lacks keep the below-Object value, as in rbs.
         let mut below_object: Vec<Symbol> = Vec::new();
         let mut reached_object = false;
-        let chain = self.builder.instance_ancestors(&name);
+        let chain = self.builder.instance_ancestors(name);
         for ancestor in chain.ancestors.iter().rev() {
             let Ancestor::Instance {
                 name: ancestor_name,
@@ -1239,22 +1301,28 @@ impl ConstantResolver {
                         if ancestor_name == &self.object {
                             reached_object = true;
                             for sym in below_object.drain(..).chain(children.keys().copied()) {
-                                if let Some(entry) = seed.get(&sym) {
-                                    consts.insert(sym, *entry);
+                                if seed.contains_key(&sym) {
+                                    delta.remove(&sym);
                                 }
                             }
                             continue;
                         }
                         below_object.extend(children.keys().copied());
                     }
-                    merge_into(consts, &children);
+                    merge_into(&mut delta, &children);
                 }
                 AncestorSource::Prepend | AncestorSource::Extend => {}
             }
         }
+
+        // Whatever the walk wrote with the seed's own value is answered
+        // by the seed layer just as well; keep only the differences.
+        delta.retain(|sym, entry| seed.get(sym) != Some(entry));
+        delta.shrink_to_fit();
+        delta
     }
 
-    /// The context-independent seed of `constants_from_ancestors`:
+    /// The context-independent layer under every context:
     /// `::Object`'s children merged with `toplevel` (rbs L182-184, in
     /// that order so toplevel wins on collision). Computed on first use.
     fn ancestors_seed(&self) -> Arc<ConstantsMap> {
@@ -1268,36 +1336,21 @@ impl ConstantResolver {
         }))
     }
 
-    /// Helper for `load_context_constants`'s `None` branch: route
-    /// through `::Object`'s ancestor chain to merge Object's children
-    /// and toplevel into the constants map. Mirrors rbs's
-    /// `constants_from_ancestors(Object, ...)`.
-    fn seed_toplevel_via_object(&self, consts: &mut ConstantsMap) {
-        let object = self.object;
-        self.constants_from_ancestors(&object, consts);
-    }
-
-    /// rbs `constants_itself(context, constants:)` (L201-216). Adds
-    /// the context's innermost scope as a constant of itself, mirroring
+    /// rbs `constants_itself(context, constants:)` (L201-216). The
+    /// context's innermost scope as a constant of itself, mirroring
     /// rbs's "`A` inside `class A`" semantics.
-    fn constants_itself(&self, context: &ConstantContext, consts: &mut ConstantsMap) {
-        let Some(typename) = context.last() else {
-            return;
-        };
+    fn constants_itself(&self, context: &ConstantContext) -> Option<(Symbol, ConstantEntry)> {
+        let typename = context.last()?;
         let names = self.builder.env().names();
-        let Some(last) = names.last_segment(*typename) else {
-            return;
-        };
+        let last = names.last_segment(*typename)?;
         let entry = match parent_typename(*typename, names) {
             None => self.table.toplevel().get(&last).copied(),
             Some(parent) => self
                 .table
                 .children(&parent)
                 .and_then(|map| map.get(&last).copied()),
-        };
-        if let Some(entry) = entry {
-            consts.insert(last, entry);
-        }
+        }?;
+        Some((last, entry))
     }
 }
 

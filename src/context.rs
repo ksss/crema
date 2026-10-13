@@ -45,7 +45,7 @@ struct MethodFrame {
     is_singleton_method: bool,
 }
 
-/// Saved class nesting returned by [`Context::replace_class_stack`] and
+/// Saved class nesting returned by [`Context::replace_class_stack_outside_cref`] and
 /// handed back to [`Context::restore_class_stack`].
 pub struct ClassStackFrames {
     class_stack: Vec<TypeName>,
@@ -183,14 +183,20 @@ impl Context {
         &self.cref_stack
     }
 
-    /// Replace the whole class nesting (synthetic method contexts). The
-    /// cref follows the replacement — a synthesized target is a real
-    /// class body for every purpose — and is restored with it.
-    pub fn replace_class_stack(&mut self, class_stack: Vec<TypeName>) -> ClassStackFrames {
-        let in_cref = vec![true; class_stack.len()];
+    /// Replace the whole class nesting with classes that own `self` /
+    /// `def` but are *not* cref frames — the include targets a Concern
+    /// block or its defs are checked against. Ruby runs those blocks
+    /// with block `class_eval`, which keeps the cref lexical, so constant
+    /// reads and declarations keep resolving against the concern's
+    /// nesting. Restored with [`restore_class_stack`](Self::restore_class_stack).
+    pub fn replace_class_stack_outside_cref(
+        &mut self,
+        class_stack: Vec<TypeName>,
+    ) -> ClassStackFrames {
+        let in_cref = vec![false; class_stack.len()];
         ClassStackFrames {
-            class_stack: std::mem::replace(&mut self.class_stack, class_stack.clone()),
-            cref_stack: std::mem::replace(&mut self.cref_stack, class_stack),
+            class_stack: std::mem::replace(&mut self.class_stack, class_stack),
+            cref_stack: self.cref_stack.clone(),
             class_stack_in_cref: std::mem::replace(&mut self.class_stack_in_cref, in_cref),
         }
     }

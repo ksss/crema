@@ -54,13 +54,31 @@ impl EnvironmentDraft {
         file: Option<&Path>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
+        self.insert_ruby_decl_in_context(decl, &[], source, file, diagnostics);
+    }
+
+    /// [`insert_ruby_decl`](Self::insert_ruby_decl) for a declaration
+    /// whose members were written lexically inside `outer` (outer-first,
+    /// without the root) rather than inside the declaration's own
+    /// namespace: a Concern block expanded onto its include target keeps
+    /// resolving the names written in it against the concern's nesting.
+    pub fn insert_ruby_decl_in_context(
+        &mut self,
+        decl: &Declaration,
+        outer: &[TypeName],
+        source: SourceRef<'_>,
+        file: Option<&Path>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
         let mut ctx = LoadCtx {
             source,
             file,
             diagnostics,
         };
 
-        let draft_ctx: DraftContext = Arc::from([self.names.absolute_root()]);
+        let draft_ctx: DraftContext = std::iter::once(self.names.absolute_root())
+            .chain(outer.iter().copied())
+            .collect();
         let file_name: DeclOrigin = ctx
             .file
             .map(|p| self.names.intern(&p.to_string_lossy()))

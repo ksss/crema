@@ -12,8 +12,8 @@ use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::annotations::ColonMethodTypeAnnotation;
 use crate::ast::ruby::declarations::{ClassDecl, Declaration, ModuleDecl};
 use crate::ast::ruby::members::{
-    DefMember, DefMemberOrigin, ExplicitAnnotation, ExtendMember, Member, MethodTypeAnnotation,
-    MixinMember, TypeAnnotations,
+    DefMember, ExplicitAnnotation, ExtendMember, Member, MethodTypeAnnotation, MixinMember,
+    TypeAnnotations,
 };
 use crate::ast::types::{
     BaseType, BaseTypeKind, BlockType, ClassInstanceType, Function, FunctionParam, FunctionType,
@@ -960,7 +960,6 @@ fn push_overloaded_ctor_def(
             type_annotations: TypeAnnotations::Array(annotations),
         },
         leading_comment: None,
-        origin: DefMemberOrigin::Real,
         source_file: None,
     }));
 }
@@ -1126,7 +1125,6 @@ fn push_typed_def(
             )]),
         },
         leading_comment: None,
-        origin: DefMemberOrigin::Real,
         source_file: None,
     }));
 }
@@ -1454,7 +1452,6 @@ fn collect_scope_call(
             )]),
         },
         leading_comment: None,
-        origin: DefMemberOrigin::Real,
         source_file: None,
     }));
 }
@@ -1747,7 +1744,6 @@ fn push_singleton_typed_def(
             )]),
         },
         leading_comment: None,
-        origin: DefMemberOrigin::Real,
         source_file: None,
     }));
 }
@@ -1782,7 +1778,6 @@ fn push_instance_overloaded_def(
             type_annotations: TypeAnnotations::Array(annotations),
         },
         leading_comment: None,
-        origin: DefMemberOrigin::Real,
         source_file: None,
     }));
 }

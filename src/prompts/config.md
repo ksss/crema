@@ -54,12 +54,6 @@ Whether `# @rbs` inline annotations in Ruby files participate in type checking.
 
 Propose `false` only for sig-only checking; inline annotation syntax errors are then hidden from normal checks.
 
-## incremental
-
-`incremental` — `any value`, ignored. Example: none — remove the key
-
-Has no effect. While the key is present, every run prints a warning on stderr; the next release rejects it as an unknown key. Propose deleting the line; `.crema/cache/incremental_v1.bin`, if present, is unused and can be deleted with it.
-
 ## did_you_mean
 
 `did_you_mean` — `Boolean`, default `false`. Example: `did_you_mean = true`

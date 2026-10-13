@@ -2625,6 +2625,10 @@ impl<'env> TypeChecker<'env> {
     /// - `x.nil?` — both sides via `narrowing::{narrow, subtract}`
     /// - `x.is_a?(C)` / `x.kind_of?(C)` — both sides against the
     ///   instance type derived from a Class/Module literal arg
+    /// - `x.instance_of?(C)` — truthy side only, as `is_a?`. A failed
+    ///   exact-class test leaves `x` possibly a subclass of `C`, so the
+    ///   falsy side removes nothing (Steep subtracts as for `is_a?`,
+    ///   which reports the reachable else branch as unreachable)
     /// - `C === x` — same, with the literal on the receiver side
     /// - `x == <literal>` — same, with the literal on the argument
     ///   side; gated on `x`'s `==` resolving to a builtin value class
@@ -2763,7 +2767,11 @@ impl<'env> TypeChecker<'env> {
         if let Some((scrutinee, current)) = self.nil_predicate_target(call) {
             return self.narrow_pair(scrutinee, current, Ty::NIL);
         }
-        if let Some((scrutinee, current, target_ty)) = self.is_a_predicate_target(call) {
+        if let Some((scrutinee, current, target_ty, exact)) = self.is_a_predicate_target(call) {
+            if exact {
+                let truthy_ty = crate::narrowing::narrow(current, target_ty, self.env);
+                return (CondEnv::single(scrutinee, truthy_ty), CondEnv::empty());
+            }
             return self.narrow_pair(scrutinee, current, target_ty);
         }
         if let Some((scrutinee, current, target_ty)) = self.case_eq_predicate_target(call) {
@@ -3470,18 +3478,24 @@ impl<'env> TypeChecker<'env> {
         })
     }
 
-    /// Recognise `<local_var>.is_a?(<class_literal>)` or
-    /// `<local_var>.kind_of?(<class_literal>)`. Returns
-    /// `(name, current_type, target_instance_type)` where `target_*`
-    /// is the instance type built from the Class/Module literal
-    /// (generics filled with `Ty::UNTYPED`). The user-override
-    /// question is intentionally ignored — see the `nil?` precedent.
-    fn is_a_predicate_target<'pr>(&self, call: &CallNode<'pr>) -> Option<(Scrutinee, Ty, Ty)> {
+    /// Recognise `<local_var>.is_a?(<class_literal>)`,
+    /// `<local_var>.kind_of?(<class_literal>)` or
+    /// `<local_var>.instance_of?(<class_literal>)`. Returns
+    /// `(name, current_type, target_instance_type, exact)` where
+    /// `target_*` is the instance type built from the Class/Module
+    /// literal (generics filled with `Ty::UNTYPED`) and `exact` is true
+    /// for `instance_of?`. The user-override question is intentionally
+    /// ignored — see the `nil?` precedent.
+    fn is_a_predicate_target<'pr>(
+        &self,
+        call: &CallNode<'pr>,
+    ) -> Option<(Scrutinee, Ty, Ty, bool)> {
         let method = call.name();
-        let method_bytes = method.as_slice();
-        if method_bytes != b"is_a?" && method_bytes != b"kind_of?" {
-            return None;
-        }
+        let exact = match method.as_slice() {
+            b"is_a?" | b"kind_of?" => false,
+            b"instance_of?" => true,
+            _ => return None,
+        };
         if call.block().is_some() {
             return None;
         }
@@ -3493,7 +3507,7 @@ impl<'env> TypeChecker<'env> {
         let receiver = call.receiver()?;
         let (scrutinee, current) = self.scrutinee_and_current_ty(&receiver)?;
         let target_ty = self.class_literal_target(&arg_nodes[0])?;
-        Some((scrutinee, current, target_ty))
+        Some((scrutinee, current, target_ty, exact))
     }
 
     /// Recognise `<class_literal> === <local_var>`. The Class/Module

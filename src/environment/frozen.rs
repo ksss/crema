@@ -775,9 +775,9 @@ impl<'env, K: Eq + Hash, V> Decls<'env, K, V> {
     /// A layer.
     ///
     /// **Use only when G entries are structurally irrelevant** to the
-    /// caller's question — e.g. `synthetic_method_context_targets`,
-    /// which searches `class_decls` for `ClassDeclaration::Ruby` /
-    /// `ModuleDeclaration::Ruby` inline entries. The G layer is
+    /// caller's question — e.g. a search of `class_decls` for
+    /// `ClassDeclaration::Ruby` / `ModuleDeclaration::Ruby` inline
+    /// entries. The G layer is
     /// `.rbs`-only (the G-only draft encoding in `main.rs` panics on
     /// Ruby decls; see slice 1a doc), so Ruby decls that could match
     /// live entirely in A — including A-side reopens of G classes,

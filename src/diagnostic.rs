@@ -75,7 +75,7 @@ pub struct Diagnostic {
 // per-file ingest cache planned by ADR-0036 Decision 4 stores them).
 // bincode gives no schema evolution — whatever persists this enum must
 // version its format against layout-affecting edits here.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DiagnosticKind {
     ArgumentTypeMismatch {
         method_name: String,
@@ -758,7 +758,7 @@ impl ConstantKind {
 /// so `None`. `TypeName` is a process-stable id (ADR-0032 Decision 2), so
 /// this stays meaningful against a `DefinitionBuilder` built later than
 /// the one in scope when the diagnostic was first produced.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CandidateScope {
     Context(ConstantContext),
     Children(TypeName),
@@ -776,7 +776,7 @@ fn candidates_for_scope(
 ) -> Vec<String> {
     let resolver = env.constant_resolver();
     let dict: Vec<crate::name::Symbol> = match scope {
-        CandidateScope::Context(ctx) => resolver.constants(ctx).keys().copied().collect(),
+        CandidateScope::Context(ctx) => resolver.constants(ctx).names(),
         CandidateScope::Children(tn) => resolver.children(tn).keys().copied().collect(),
         CandidateScope::None => return Vec::new(),
     };

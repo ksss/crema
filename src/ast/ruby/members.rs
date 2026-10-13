@@ -719,7 +719,6 @@ pub struct DefMember {
     pub name_location: PrismByteRange,
     pub method_type: MethodTypeAnnotation,
     pub leading_comment: Option<CommentBlock>,
-    pub origin: DefMemberOrigin,
     pub source_file: Option<Name>,
     /// crema extension, not part of the rbs `DefMember` contract:
     /// syntactic `@ivar = param` facts harvested from an instance-side
@@ -762,24 +761,6 @@ pub enum InitializeParamRef {
     RequiredPositional(usize),
     OptionalPositional(usize),
     Keyword(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum DefMemberOrigin {
-    Real,
-    SyntheticConcernIncluded,
-    SyntheticConcernPrepended,
-    /// A `def` written directly in a `concerning :Topic do ... end` block
-    /// (not nested under `included do` / `prepended do`): a member of the
-    /// synthesized `<owner>::<Topic>` module, collected by the infusion
-    /// pipeline because the inline parser's block descent stops at
-    /// `concerning`. Unlike the two variants above it is NOT indexed by
-    /// `scan_synthetic_concern_index` — its source node sits lexically
-    /// inside the owner's class body, so the checker's ordinary walk
-    /// already checks it in the owner's instance context (the module is
-    /// really included/prepended there) and no context retargeting is
-    /// needed.
-    SyntheticConcerning,
 }
 
 /// Shared payload for `attr_reader` / `attr_writer` / `attr_accessor`.

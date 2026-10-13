@@ -400,23 +400,9 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
 
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         self.record_extract_implements(node);
-        // Inside a retargeted concern block walk the class stack already
-        // names the one target this pass is for — see the field doc.
-        let synthetic_targets = if self.concern_block_target_walk {
-            Vec::new()
-        } else {
-            self.synthetic_method_context_targets(node)
-        };
-
-        if !synthetic_targets.is_empty() {
-            for target in synthetic_targets {
-                let saved_class_stack = self.ctx.replace_class_stack(vec![target]);
-                self.check_def_node_in_current_context(node);
-                self.ctx.restore_class_stack(saved_class_stack);
-            }
-            return;
-        }
-
+        // A `def` inside a Concern's `included do` / `prepended do` reaches
+        // here once per include target: `walk_concern_block_body` has
+        // already retargeted the class stack.
         self.check_def_node_in_current_context(node);
     }
 
@@ -1609,11 +1595,11 @@ impl<'env> TypeChecker<'env> {
     /// module. Rails `class_eval`s the block on every class that
     /// (transitively) includes the concern, so the body is walked once
     /// per final target with the class stack replaced by `[target]` —
-    /// `self` is `singleton(target)`, the same retargeting
-    /// `visit_def_node` applies to a synthetic concern `def`, and the
-    /// same body entry (`check_node`) `walk_class_construction_block_body`
-    /// uses. A `|base|` block param is bound to that singleton too. The
-    /// block scope itself was already pushed by `check_call`'s
+    /// `self` is `singleton(target)` and a `def` in the body is checked
+    /// in `target`'s instance context, through the same body entry
+    /// (`check_node`) `walk_class_construction_block_body` uses. A
+    /// `|base|` block param is bound to that singleton too. The block
+    /// scope itself was already pushed by `check_call`'s
     /// `setup_block_scope`, so the rebinding lands in it.
     ///
     /// Returns `false` when the call is not a block the infusion pipeline
@@ -1674,16 +1660,16 @@ impl<'env> TypeChecker<'env> {
             .and_then(|p| p.as_required_parameter_node())
             .map(|p| String::from_utf8_lossy(p.name().as_slice()).to_string());
 
-        let saved_walk = std::mem::replace(&mut self.concern_block_target_walk, true);
         // Each target is a separate `class_eval` at runtime, so each walk
         // starts from the same lvar state: without the reset, a binding
         // (or narrowing) from the first target's walk would leak into the
         // next one through the single block scope `check_call` pushed
         // (crema-review adversarial finding).
         let scopes_before = self.ctx.snapshot_scopes();
+        let first_diagnostic = self.diagnostics.borrow().len();
         for target in targets {
             self.ctx.restore_scopes(scopes_before.clone());
-            let saved_class_stack = self.ctx.replace_class_stack(vec![target]);
+            let saved_class_stack = self.ctx.replace_class_stack_outside_cref(vec![target]);
 
             let saved_singleton_class_depth = self.ctx.replace_singleton_class_depth(0);
             if let Some(base) = &base_param {
@@ -1698,8 +1684,31 @@ impl<'env> TypeChecker<'env> {
                 .replace_singleton_class_depth(saved_singleton_class_depth);
             self.ctx.restore_class_stack(saved_class_stack);
         }
-        self.concern_block_target_walk = saved_walk;
+        self.dedup_target_walk_diagnostics(first_diagnostic);
         true
+    }
+
+    /// Drop the repeats of a diagnostic the per-target walks of one
+    /// Concern block emitted identically for every target — those that
+    /// do not depend on the target, like a constant missed in the
+    /// lexical cref. Target-dependent ones (a `NoMethod` whose receiver
+    /// is the target) differ in `kind` and are all kept. The first
+    /// target's copy survives, scope included. Comparisons stay within
+    /// one source location: a concern included by many targets keeps
+    /// every target-dependent copy, so a scan over all kept entries
+    /// would grow with the square of the target count.
+    fn dedup_target_walk_diagnostics(&self, first: usize) {
+        let mut diags = self.diagnostics.borrow_mut();
+        let walked = diags.split_off(first);
+        let mut kept_at: FxHashMap<SourceLocation, Vec<usize>> = FxHashMap::default();
+        for diag in walked {
+            let same_location = kept_at.entry(diag.location.clone()).or_default();
+            if same_location.iter().any(|&i| diags[i].kind == diag.kind) {
+                continue;
+            }
+            same_location.push(diags.len());
+            diags.push(diag);
+        }
     }
 
     /// Records the `<owner>::<Topic>` module of a receiver-less

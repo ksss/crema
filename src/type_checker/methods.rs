@@ -1,6 +1,5 @@
 use ruby_prism::{DefNode, Node, ReturnNode};
 
-use crate::ast::MethodKind;
 use crate::definition_builder::{self, type_params_as_variable_args};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::environment::DeclKindLocal;
@@ -140,34 +139,6 @@ impl<'env> TypeChecker<'env> {
             method_name,
             method_def: method_def.clone(),
         })
-    }
-
-    pub(super) fn synthetic_method_context_targets<'pr>(
-        &self,
-        node: &DefNode<'pr>,
-    ) -> Vec<TypeName> {
-        let method_name = String::from_utf8_lossy(node.name().as_slice()).to_string();
-        let method_kind = if self.is_singleton_method_def(node) {
-            MethodKind::Singleton
-        } else {
-            MethodKind::Instance
-        };
-        let location = crate::inline_parser::prism_location_range(node.location());
-        let source_file = self.env.names().intern(&self.file.to_string_lossy());
-        let current = self.ctx.current_class_typename().copied();
-        let method = self.env.names().intern_symbol(&method_name);
-
-        // ADR-0032 Decision 5b: index lookup replaces the old per-`def`-node
-        // full A-layer walk (cfp-app warm: 8925 entries × N defs). The index
-        // is built once at `DefinitionBuilder` construction
-        // (`scan_synthetic_concern_defs`).
-        self.env.synthetic_concern_targets(
-            method,
-            method_kind,
-            location,
-            Some(source_file),
-            current,
-        )
     }
 
     pub(super) fn is_singleton_method_def<'pr>(&self, node: &DefNode<'pr>) -> bool {

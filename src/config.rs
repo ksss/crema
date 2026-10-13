@@ -62,12 +62,6 @@ pub struct Config {
     /// large trees, so it is off unless a project asks for it
     /// (ADR-0032, amended 2026-09-06).
     pub did_you_mean: Option<bool>,
-    /// Retired key (ADR-0036 Decision 2): the incremental check cache
-    /// is gone. Accepted for one release with any value so existing
-    /// crema.toml files keep loading, and answered with a deprecation
-    /// warning (never a silent no-op); the release after that drops the
-    /// field and `deny_unknown_fields` rejects it.
-    pub incremental: Option<toml::Value>,
     /// Raw `[diagnostic]` table. `preset = "..."` plus per-code
     /// overrides (`"Ruby::NoMethod" = "warning"` etc.). Validated and
     /// resolved into `DiagnosticConfig` by `resolve_with_cli`; see
@@ -367,10 +361,6 @@ pub enum BaselineSetting {
     Enabled(bool),
     Path(PathBuf),
 }
-
-/// Printed whenever crema.toml carries the retired `incremental` key,
-/// whatever its value (ADR-0036 Decision 2).
-pub const INCREMENTAL_RETIRED_WARNING: &str = "warning: crema.toml `incremental` no longer has any effect (incremental check was removed) and will be rejected in the next release; remove the key";
 
 /// File name `baseline = true` resolves to, next to `crema.toml`.
 pub const DEFAULT_BASELINE_FILE: &str = "crema_baseline.jsonl";
@@ -673,8 +663,7 @@ impl Config {
 
     /// Like `resolve_with_cli`, but also returns the list of
     /// config warnings (currently: unknown `[diagnostic]` code keys, the
-    /// `--sig` + `--add-sig` co-usage warning, and the retired
-    /// `incremental` key). The caller decides how
+    /// `--sig` + `--add-sig` co-usage warning). The caller decides how
     /// to surface them (stderr in main, captured vec in tests).
     pub fn resolve_with_cli_collecting_warnings(
         file: Option<Config>,
@@ -692,9 +681,6 @@ impl Config {
             None => (DiagnosticConfig::default(), Vec::new()),
         };
         warnings.extend(sig_warnings);
-        if file.incremental.is_some() {
-            warnings.push(INCREMENTAL_RETIRED_WARNING.to_string());
-        }
         let collection = resolve_collection_mode(cli_collection, file.collection_config);
         let rails_ref = file.infusion.as_ref().and_then(|d| d.rails.as_ref());
         let rails_infusion = rails_ref.is_some_and(|r| r.enabled);

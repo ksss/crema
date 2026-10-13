@@ -18,10 +18,9 @@ use crate::ast::ruby::declarations::{
 };
 use crate::ast::ruby::members::{
     AttrAccessorMember, AttrReaderMember, AttrWriterMember, AttributeMember, AttributeNameNode,
-    DefMember, DefMemberOrigin, ExplicitAnnotation, ExtendMember, IncludeMember,
-    InitializeIvarParamPair, InitializeParamRef, InstanceVariableMember, Member,
-    MethodTypeAnnotation, MixinMember, ModuleSelfMember, PrependMember, TrailingResolution,
-    TypeAnnotations,
+    DefMember, ExplicitAnnotation, ExtendMember, IncludeMember, InitializeIvarParamPair,
+    InitializeParamRef, InstanceVariableMember, Member, MethodTypeAnnotation, MixinMember,
+    ModuleSelfMember, PrependMember, TrailingResolution, TypeAnnotations,
 };
 use crate::ast::ruby::{LineIndex, PrismByteRange};
 use crate::ast::types::{
@@ -136,6 +135,15 @@ struct InlineCollector<'a> {
     /// [`collect_visibility_call`] around the argument visit only, and
     /// consumed by `visit_def_node` / `collect_attr_call`.
     pending_explicit_visibility: Option<Visibility>,
+    /// Inside the block of an infusion-owned call (`concerning`,
+    /// `included`, `prepended`, `class_methods`) and not yet inside a
+    /// nested `class` / `module` / class-body block. Ruby evaluates these
+    /// blocks with block `module_eval` / `class_eval`, which moves `self`
+    /// and the `def` target but keeps the cref lexical: `class` /
+    /// `module` / constant writes still land on the enclosing cref and
+    /// are collected here, while `def` / `attr_*` / mixins /
+    /// `class << self` belong to the infusion pipeline and are skipped.
+    in_concern_block: bool,
 }
 
 /// Ruby-side visibility state of one open class / module body.
@@ -259,6 +267,7 @@ impl<'a> InlineCollector<'a> {
             singleton_class_depth: 0,
             visibility_frames: vec![],
             pending_explicit_visibility: None,
+            in_concern_block: false,
         }
     }
 
@@ -986,6 +995,7 @@ impl<'a> InlineCollector<'a> {
         self.class_stack.push(abs_path);
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
+        let saved_in_concern_block = std::mem::replace(&mut self.in_concern_block, false);
         self.scope_stack.push(Vec::new());
         self.visibility_frames
             .push(VisibilityFrame::new(block_node.body()));
@@ -993,6 +1003,7 @@ impl<'a> InlineCollector<'a> {
         if let Some(body) = block_node.body() {
             self.visit(&body);
         }
+        self.in_concern_block = saved_in_concern_block;
         self.collect_enclosed_instance_variable_members(call.location());
 
         let members = self.scope_stack.pop().unwrap();
@@ -1211,7 +1222,9 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         self.visibility_frames
             .push(VisibilityFrame::new(node.body()));
         self.cref_scope_frames.push(self.scope_stack.len() - 1);
+        let saved_in_concern_block = std::mem::replace(&mut self.in_concern_block, false);
         ruby_prism::visit_class_node(self, node);
+        self.in_concern_block = saved_in_concern_block;
         self.collect_enclosed_instance_variable_members(node.location());
         let mut members = self.scope_stack.pop().unwrap();
         self.visibility_frames.pop();
@@ -1272,7 +1285,9 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             .push(VisibilityFrame::new(node.body()));
         self.cref_scope_frames.push(self.scope_stack.len() - 1);
         self.collect_leading_module_self_members(module_start_line);
+        let saved_in_concern_block = std::mem::replace(&mut self.in_concern_block, false);
         ruby_prism::visit_module_node(self, node);
+        self.in_concern_block = saved_in_concern_block;
         self.collect_enclosed_instance_variable_members(node.location());
         let mut members = self.scope_stack.pop().unwrap();
         self.visibility_frames.pop();
@@ -1290,7 +1305,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
     }
 
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
-        if self.is_node_skipped(node.location()) {
+        if self.is_node_skipped(node.location()) || self.in_concern_block {
             return;
         }
 
@@ -1413,7 +1428,6 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             name_location,
             method_type,
             leading_comment,
-            origin: DefMemberOrigin::Real,
             source_file: self.file_name(),
             ivar_param_pairs,
         });
@@ -1433,6 +1447,21 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         }
         if self.is_infusion_owned_block_call(node) {
             self.mark_enclosed_leading_lines(node.location());
+            if let Some(body) = node
+                .block()
+                .and_then(|block| block.as_block_node())
+                .and_then(|block| block.body())
+            {
+                let saved = std::mem::replace(&mut self.in_concern_block, true);
+                self.visit(&body);
+                self.in_concern_block = saved;
+            }
+            return;
+        }
+        if self.in_concern_block {
+            if !is_concern_block_member_call(node) {
+                ruby_prism::visit_call_node(self, node);
+            }
             return;
         }
         if self.collect_attr_call(node) || self.collect_mixin_call(node) {
@@ -1446,7 +1475,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
     }
 
     fn visit_singleton_class_node(&mut self, node: &SingletonClassNode<'pr>) {
-        if self.is_node_skipped(node.location()) {
+        if self.is_node_skipped(node.location()) || self.in_concern_block {
             return;
         }
         if self.in_singleton_class() {
@@ -2186,7 +2215,6 @@ fn generated_def(
             type_annotations: TypeAnnotations::Array(annotations),
         },
         leading_comment: None,
-        origin: DefMemberOrigin::Real,
         source_file: None,
     })
 }
@@ -2400,6 +2428,25 @@ fn collect_initialize_ivar_param_pairs(node: &DefNode<'_>) -> Vec<InitializeIvar
         });
     }
     pairs
+}
+
+/// Receiverless calls whose effect lands on the block's `self` (the
+/// synthesized / target module), which the infusion pipeline owns while
+/// [`InlineCollector::in_concern_block`] is set. Their arguments
+/// (`private def x`, `include Foo`) are not descended either.
+fn is_concern_block_member_call(call: &CallNode<'_>) -> bool {
+    matches!(
+        call.name().as_slice(),
+        b"attr_reader"
+            | b"attr_writer"
+            | b"attr_accessor"
+            | b"include"
+            | b"extend"
+            | b"prepend"
+            | b"private"
+            | b"public"
+            | b"protected"
+    )
 }
 
 fn is_attr_call(node: &Node<'_>) -> bool {

@@ -9,12 +9,11 @@ use ruby_prism::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::MethodKind;
-use crate::ast::ruby::annotations::LeadingAnnotation;
 use crate::ast::ruby::declarations::{ClassDecl, Declaration, ModuleDecl};
 use crate::ast::ruby::members::{
     AttrAccessorMember, AttrReaderMember, AttrWriterMember, AttributeMember, AttributeNameNode,
-    DefMember, DefMemberOrigin, ExtendMember, IncludeMember, Member, MethodTypeAnnotation,
-    MixinMember, PrependMember, TrailingResolution, TypeAnnotations,
+    DefMember, ExtendMember, IncludeMember, Member, MethodTypeAnnotation, MixinMember,
+    PrependMember, TrailingResolution, TypeAnnotations,
 };
 use crate::ast::ruby::{LineIndex, PrismByteRange};
 use crate::config::InfusionOptions;
@@ -255,7 +254,13 @@ pub fn load_collected<'a>(
             let Some(decl) = class_methods.to_declaration() else {
                 continue;
             };
-            draft.insert_ruby_decl(&decl, source.source, source.file, &mut diagnostics);
+            draft.insert_ruby_decl_in_context(
+                &decl,
+                &concern.lexical_context,
+                source.source,
+                source.file,
+                &mut diagnostics,
+            );
         }
     }
 
@@ -395,8 +400,12 @@ pub fn load_collected<'a>(
                     expansion_contributions
                         .insert((site.target, draft.names().intern(&f.to_string_lossy())));
                 }
-                draft.insert_ruby_decl(
+                let lexical_context = concerns
+                    .get(&synthetic.concern)
+                    .map_or(&[][..], |concern| concern.lexical_context.as_slice());
+                draft.insert_ruby_decl_in_context(
                     &decl,
+                    lexical_context,
                     concern_source.source,
                     concern_source.file,
                     &mut diagnostics,
@@ -686,10 +695,11 @@ enum InfusionBodyOrigin {
     SyntheticConcernPrepended,
     /// The synthesized `<owner>::<Topic>` module body of a
     /// `concerning :Topic do ... end` call. `def`s collected while this
-    /// origin is active become `DefMemberOrigin::SyntheticConcerning`
-    /// members of the synthesized module — see that variant's doc for why
-    /// they need no check-context retargeting (their source nodes are
-    /// checked lexically in the owner's instance context).
+    /// origin is active become members of the synthesized module. They
+    /// need no check-context retargeting: their source nodes sit lexically
+    /// inside the owner's class body, so the checker's ordinary walk
+    /// checks them in the owner's instance context, where the module is
+    /// really included / prepended.
     SyntheticConcerningModule,
 }
 
@@ -774,6 +784,13 @@ struct ConcernDef {
     included_body: Option<InfusionBody>,
     prepended_body: Option<InfusionBody>,
     class_methods: Option<ClassMethodsBody>,
+    /// The cref of the concern's blocks, outer-first and without the
+    /// root: the concern module itself for an `extend
+    /// ActiveSupport::Concern` module, the owner's nesting for a
+    /// `concerning` topic. Blocks run under `class_eval` /
+    /// `module_eval`, which keep the cref lexical, so names written in
+    /// them resolve here even after expansion onto an include target.
+    lexical_context: Vec<TypeName>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -861,7 +878,6 @@ struct ClassMethodsCollector<'a> {
 
 struct IncludedSingletonClassCollector {
     members: Vec<Member>,
-    origin: DefMemberOrigin,
     source_file: Option<Name>,
 }
 
@@ -1010,19 +1026,10 @@ impl ConcernBodyKind {
 }
 
 impl InfusionBodyOrigin {
-    fn synthetic_def_origin(self) -> Option<DefMemberOrigin> {
-        match self {
-            InfusionBodyOrigin::Real => None,
-            InfusionBodyOrigin::SyntheticConcernIncluded => {
-                Some(DefMemberOrigin::SyntheticConcernIncluded)
-            }
-            InfusionBodyOrigin::SyntheticConcerningModule => {
-                Some(DefMemberOrigin::SyntheticConcerning)
-            }
-            InfusionBodyOrigin::SyntheticConcernPrepended => {
-                Some(DefMemberOrigin::SyntheticConcernPrepended)
-            }
-        }
+    /// A body the pipeline synthesized from a Concern / `concerning`
+    /// block, where the inline parser does not collect members itself.
+    fn is_synthetic(self) -> bool {
+        !matches!(self, InfusionBodyOrigin::Real)
     }
 }
 
@@ -1086,33 +1093,84 @@ impl<'a> ClassMethodsCollector<'a> {
             diagnostics: Vec::new(),
         }
     }
+}
 
-    fn unused_annotation_diagnostic(&self, range: PrismByteRange) -> Diagnostic {
-        Diagnostic {
-            scope: None,
-            kind: DiagnosticKind::UnusedInlineAnnotation,
-            location: Diagnostic::location_for_byte_range(
-                self.file.map(|p| p.to_path_buf()).unwrap_or_default(),
-                self.source,
-                range.0 as usize,
-                range.1 as usize,
-            ),
-        }
-    }
+/// What [`annotated_def_method_type`] needs to read a `def`'s inline
+/// annotations. `comments` is `None` in sig mode, where the def is
+/// collected as if unannotated.
+#[derive(Clone, Copy)]
+struct DefAnnotationSource<'a> {
+    names: &'a NameTable,
+    source: &'a [u8],
+    file: Option<&'a Path>,
+    line_index: &'a LineIndex,
+    comments: Option<&'a CommentAssociation>,
+}
 
-    fn report_unused_leading(&mut self, unused: Vec<LeadingAnnotation>) {
-        for a in unused {
-            let diag = self.unused_annotation_diagnostic(a.location());
-            self.diagnostics.push(diag);
+/// The method type a `def`'s leading `# @rbs` / `#:` block and trailing
+/// `#:` comment spell, for defs the inline parser does not collect
+/// (Concern blocks). Unused / malformed annotations are reported into
+/// `diagnostics`, as the inline parser would for its own defs.
+fn annotated_def_method_type(
+    src: DefAnnotationSource<'_>,
+    node: &DefNode<'_>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> MethodTypeAnnotation {
+    let (leading_block, trailing_block) = match src.comments {
+        Some(comments) => {
+            let def_start_line = src.line_index.line(node.location().start_offset());
+            (
+                collect_consecutive_leading(comments, def_start_line),
+                collect_trailing_block(src.source, comments, def_start_line),
+            )
         }
+        None => (None, None),
+    };
+    let (method_type, unused_leading, trailing_resolution) = MethodTypeAnnotation::build(
+        leading_block.as_ref(),
+        trailing_block.as_ref(),
+        &[],
+        node,
+        src.source,
+        src.names,
+    );
+    let unused_annotation = |range: PrismByteRange| Diagnostic {
+        scope: None,
+        kind: DiagnosticKind::UnusedInlineAnnotation,
+        location: Diagnostic::location_for_byte_range(
+            src.file.map(|p| p.to_path_buf()).unwrap_or_default(),
+            src.source,
+            range.0 as usize,
+            range.1 as usize,
+        ),
+    };
+    for annotation in unused_leading {
+        diagnostics.push(unused_annotation(annotation.location()));
     }
+    match trailing_resolution {
+        TrailingResolution::ParseFailed {
+            range,
+            parser_error,
+        } => {
+            diagnostics.push(build_annotation_syntax_error(
+                src.source,
+                src.file,
+                range,
+                parser_error,
+            ));
+        }
+        TrailingResolution::Unused(trailing) => {
+            diagnostics.push(unused_annotation(trailing.range()));
+        }
+        TrailingResolution::None => {}
+    }
+    method_type
 }
 
 impl IncludedSingletonClassCollector {
-    fn new(origin: DefMemberOrigin, source_file: Option<Name>) -> Self {
+    fn new(source_file: Option<Name>) -> Self {
         Self {
             members: Vec::new(),
-            origin,
             source_file,
         }
     }
@@ -1129,40 +1187,17 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
             Some(_) => return,
             None => MethodKind::Instance,
         };
-        let (leading_block, trailing_block) = match self.comments {
-            Some(comments) => {
-                let def_start_line = self.line_index.line(node.location().start_offset());
-                (
-                    collect_consecutive_leading(comments, def_start_line),
-                    collect_trailing_block(self.source, comments, def_start_line),
-                )
-            }
-            None => (None, None),
-        };
-        let (method_type, unused_leading, trailing_resolution) = MethodTypeAnnotation::build(
-            leading_block.as_ref(),
-            trailing_block.as_ref(),
-            &[],
+        let method_type = annotated_def_method_type(
+            DefAnnotationSource {
+                names: self.names,
+                source: self.source,
+                file: self.file,
+                line_index: self.line_index,
+                comments: self.comments,
+            },
             node,
-            self.source,
-            self.names,
+            &mut self.diagnostics,
         );
-        self.report_unused_leading(unused_leading);
-        match trailing_resolution {
-            TrailingResolution::ParseFailed {
-                range,
-                parser_error,
-            } => {
-                let diag =
-                    build_annotation_syntax_error(self.source, self.file, range, parser_error);
-                self.diagnostics.push(diag);
-            }
-            TrailingResolution::Unused(trailing) => {
-                let diag = self.unused_annotation_diagnostic(trailing.range());
-                self.diagnostics.push(diag);
-            }
-            TrailingResolution::None => {}
-        }
         self.members.push(Member::Def(DefMember {
             visibility: None,
             ivar_param_pairs: Vec::new(),
@@ -1172,13 +1207,17 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
             name_location: prism_location_range(node.name_loc()),
             method_type,
             leading_comment: None,
-            origin: DefMemberOrigin::Real,
             source_file: None,
         }));
     }
 
     fn visit_call_node(&mut self, node: &CallNode<'pr>) {
         if node.receiver().is_some() {
+            return;
+        }
+        let mixins = concern_block_mixin_members(node);
+        if !mixins.is_empty() {
+            self.members.extend(mixins);
             return;
         }
         let name = String::from_utf8_lossy(node.name().as_slice());
@@ -1253,13 +1292,12 @@ impl<'pr> Visit<'pr> for IncludedSingletonClassCollector {
         if node.receiver().is_some() {
             return;
         }
-        push_def_with_origin(
+        push_def_with_source_file(
             &mut self.members,
             String::from_utf8_lossy(node.name().as_slice()).to_string(),
             MethodKind::Singleton,
             prism_location_range(node.location()),
             prism_location_range(node.name_loc()),
-            self.origin,
             self.source_file,
         );
     }
@@ -1306,6 +1344,13 @@ impl<'a> Collector<'a> {
             concerns: vec![],
             concern_sites: vec![],
         }
+    }
+
+    fn class_stack_context(&self) -> Vec<TypeName> {
+        self.class_stack
+            .iter()
+            .map(|path| self.names.parse_type_name(path))
+            .collect()
     }
 
     fn current_frame_mut(&mut self) -> Option<&mut ScopeFrame> {
@@ -1561,7 +1606,7 @@ impl<'a> Collector<'a> {
         let Some(frame) = self.current_frame_mut() else {
             return false;
         };
-        if frame.body.origin.synthetic_def_origin().is_none() {
+        if !frame.body.origin.is_synthetic() {
             return false;
         }
         let name = String::from_utf8_lossy(node.name().as_slice());
@@ -1636,9 +1681,18 @@ impl<'a> Collector<'a> {
         }
         let name = String::from_utf8_lossy(node.name().as_slice());
         match name.as_ref() {
-            "extend" => self.collect_extend_concern(node),
-            "include" => self.collect_concern_site(node, ConcernSiteKind::Include),
-            "prepend" => self.collect_concern_site(node, ConcernSiteKind::Prepend),
+            "extend" => {
+                self.collect_extend_concern(node);
+                self.collect_concern_block_mixins(node);
+            }
+            "include" => {
+                self.collect_concern_site(node, ConcernSiteKind::Include);
+                self.collect_concern_block_mixins(node);
+            }
+            "prepend" => {
+                self.collect_concern_site(node, ConcernSiteKind::Prepend);
+                self.collect_concern_block_mixins(node);
+            }
             "included" => self.collect_concern_block(node, ConcernBodyKind::Included),
             "prepended" => self.collect_concern_block(node, ConcernBodyKind::Prepended),
             "class_methods" => self.collect_class_methods_block(node),
@@ -1651,6 +1705,20 @@ impl<'a> Collector<'a> {
             _ => return false,
         }
         true
+    }
+
+    /// `include` / `extend` / `prepend` written directly in a Concern
+    /// block act on the block's `self` — the topic module, or each
+    /// include target — so they become members of the synthesized body.
+    /// The inline parser does not collect them there.
+    fn collect_concern_block_mixins(&mut self, node: &CallNode<'_>) {
+        let Some(frame) = self.current_frame_mut() else {
+            return;
+        };
+        if !frame.body.origin.is_synthetic() {
+            return;
+        }
+        frame.body.members.extend(concern_block_mixin_members(node));
     }
 
     fn collect_extend_concern(&mut self, node: &CallNode<'_>) {
@@ -1875,6 +1943,7 @@ impl<'a> Collector<'a> {
         let class_methods_module = frame
             .class_methods_module
             .or_else(|| self.find_existing_class_methods_module(module_name, &frame.nested_decls));
+        let lexical_context = self.class_stack_context();
         self.concerns.push(ConcernDef {
             name: module_name,
             source_index: self.source_index,
@@ -1883,6 +1952,7 @@ impl<'a> Collector<'a> {
             included_body: frame.included_body.clone(),
             prepended_body: frame.prepended_body.clone(),
             class_methods: frame.class_methods.clone(),
+            lexical_context,
         });
         self.collect_active_record_associations(&frame.body);
 
@@ -2088,24 +2158,15 @@ pub(crate) fn push_def(
     location: PrismByteRange,
     name_location: PrismByteRange,
 ) {
-    push_def_with_origin(
-        members,
-        name,
-        kind,
-        location,
-        name_location,
-        DefMemberOrigin::Real,
-        None,
-    );
+    push_def_with_source_file(members, name, kind, location, name_location, None);
 }
 
-fn push_def_with_origin(
+fn push_def_with_source_file(
     members: &mut Vec<Member>,
     name: String,
     kind: MethodKind,
     location: PrismByteRange,
     name_location: PrismByteRange,
-    origin: DefMemberOrigin,
     source_file: Option<Name>,
 ) {
     Collector::push_member(
@@ -2121,7 +2182,6 @@ fn push_def_with_origin(
                 type_annotations: TypeAnnotations::None,
             },
             leading_comment: None,
-            origin,
             source_file,
         }),
     );
@@ -2329,6 +2389,49 @@ impl InfusionBody {
     }
 }
 
+/// The mixin members a receiverless `include` / `extend` / `prepend`
+/// call spells, one per static constant argument. `extend
+/// ActiveSupport::Concern` is left out: it marks a concern rather than
+/// adding methods, and `concerning` already synthesizes it.
+fn concern_block_mixin_members(node: &CallNode<'_>) -> Vec<Member> {
+    if node.receiver().is_some() {
+        return Vec::new();
+    }
+    let kind = node.name().as_slice();
+    if !matches!(kind, b"include" | b"extend" | b"prepend") {
+        return Vec::new();
+    }
+    let Some(arguments) = node.arguments() else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    for arg in arguments.arguments().iter() {
+        let Some(module_name) = constant_node_to_string(&arg) else {
+            continue;
+        };
+        if kind == b"extend"
+            && matches!(
+                module_name.as_str(),
+                "ActiveSupport::Concern" | "::ActiveSupport::Concern"
+            )
+        {
+            continue;
+        }
+        let mixin = MixinMember {
+            module_name,
+            location: prism_location_range(node.location()),
+            name_location: prism_location_range(arg.location()),
+            annotation: None,
+        };
+        members.push(match kind {
+            b"include" => Member::Include(IncludeMember { mixin }),
+            b"extend" => Member::Extend(ExtendMember { mixin }),
+            _ => Member::Prepend(PrependMember { mixin }),
+        });
+    }
+    members
+}
+
 fn constant_node_to_string(node: &Node<'_>) -> Option<String> {
     if let Some(constant) = node.as_constant_read_node() {
         Some(String::from_utf8_lossy(constant.name().as_slice()).to_string())
@@ -2394,6 +2497,8 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
             let class_methods_module = frame.class_methods_module.or_else(|| {
                 self.find_existing_class_methods_module(frame.body.owner, &frame.nested_decls)
             });
+            let mut lexical_context = self.class_stack_context();
+            lexical_context.push(frame.body.owner);
             self.concerns.push(ConcernDef {
                 name: frame.body.owner,
                 source_index: self.source_index,
@@ -2402,6 +2507,7 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
                 included_body: frame.included_body.clone(),
                 prepended_body: frame.prepended_body.clone(),
                 class_methods: frame.class_methods.clone(),
+                lexical_context,
             });
         }
         self.collect_active_record_associations(&frame.body);
@@ -2456,6 +2562,8 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
             let class_methods_module = frame.class_methods_module.or_else(|| {
                 self.find_existing_class_methods_module(frame.body.owner, &frame.nested_decls)
             });
+            let mut lexical_context = self.class_stack_context();
+            lexical_context.push(frame.body.owner);
             self.concerns.push(ConcernDef {
                 name: frame.body.owner,
                 source_index: self.source_index,
@@ -2464,6 +2572,7 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
                 included_body: frame.included_body.clone(),
                 prepended_body: frame.prepended_body.clone(),
                 class_methods: frame.class_methods.clone(),
+                lexical_context,
             });
         }
         self.collect_active_record_associations(&frame.body);
@@ -2484,44 +2593,62 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
         let Some(frame) = self.current_frame_mut() else {
             return;
         };
-        let Some(origin) = frame.body.origin.synthetic_def_origin() else {
+        if !frame.body.origin.is_synthetic() {
             return;
-        };
+        }
         if node.expression().as_self_node().is_none() {
             return;
         }
         let Some(body) = node.body() else {
             return;
         };
-        let mut collector = IncludedSingletonClassCollector::new(origin, source_file);
+        let mut collector = IncludedSingletonClassCollector::new(source_file);
         collector.visit(&body);
         frame.body.members.extend(collector.members);
     }
 
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         let source_file = self.source_file;
-        if let Some(frame) = self.current_frame_mut()
-            && let Some(origin) = frame.body.origin.synthetic_def_origin()
-            && (node.receiver().is_none()
-                || node
-                    .receiver()
-                    .is_some_and(|receiver| receiver.as_self_node().is_some()))
+        if !self
+            .scope_stack
+            .last()
+            .is_some_and(|frame| frame.body.origin.is_synthetic())
         {
-            let kind = if node.receiver().is_some() {
-                MethodKind::Singleton
-            } else {
-                MethodKind::Instance
-            };
-            push_def_with_origin(
-                &mut frame.body.members,
-                String::from_utf8_lossy(node.name().as_slice()).to_string(),
-                kind,
-                prism_location_range(node.location()),
-                prism_location_range(node.name_loc()),
-                origin,
-                source_file,
-            );
+            return;
         }
+        let kind = match node.receiver() {
+            None => MethodKind::Instance,
+            Some(receiver) if receiver.as_self_node().is_some() => MethodKind::Singleton,
+            Some(_) => return,
+        };
+        // The inline parser skips defs written directly in a Concern
+        // block, so their inline annotations are read here.
+        let method_type = annotated_def_method_type(
+            DefAnnotationSource {
+                names: self.names,
+                source: self.source,
+                file: self.file,
+                line_index: &self.line_index,
+                comments: self.comments.as_ref(),
+            },
+            node,
+            &mut self.diagnostics,
+        );
+        let frame = self.scope_stack.last_mut().unwrap();
+        Self::push_member(
+            &mut frame.body.members,
+            Member::Def(DefMember {
+                visibility: None,
+                ivar_param_pairs: Vec::new(),
+                name: String::from_utf8_lossy(node.name().as_slice()).to_string(),
+                kind,
+                location: prism_location_range(node.location()),
+                name_location: prism_location_range(node.name_loc()),
+                method_type,
+                leading_comment: None,
+                source_file,
+            }),
+        );
         // Method bodies run at call time, not while the class/module body
         // is evaluated, so body-level DSL directives are not collected here.
     }
@@ -2574,7 +2701,6 @@ mod tests {
                     type_annotations: TypeAnnotations::Array(Vec::new()),
                 },
                 leading_comment: None,
-                origin: DefMemberOrigin::Real,
                 source_file: None,
             })],
         }
@@ -2598,6 +2724,7 @@ mod tests {
             )),
             prepended_body: None,
             class_methods: None,
+            lexical_context: Vec::new(),
         };
         let auditable = ConcernDef {
             name: auditable_name,
@@ -2613,6 +2740,7 @@ mod tests {
             )),
             prepended_body: None,
             class_methods: None,
+            lexical_context: Vec::new(),
         };
         let mut concerns = FxHashMap::default();
         concerns.insert(timestamped_name, &timestamped);
@@ -2661,6 +2789,7 @@ mod tests {
             )),
             prepended_body: None,
             class_methods: None,
+            lexical_context: Vec::new(),
         };
         let b = ConcernDef {
             name: b_name,
@@ -2676,6 +2805,7 @@ mod tests {
             )),
             prepended_body: None,
             class_methods: None,
+            lexical_context: Vec::new(),
         };
         let mut concerns = FxHashMap::default();
         concerns.insert(a_name, &a);
@@ -2752,6 +2882,7 @@ end
                 InfusionBodyOrigin::SyntheticConcernPrepended,
             )),
             class_methods: None,
+            lexical_context: Vec::new(),
         };
         let auditable = ConcernDef {
             name: auditable_name,
@@ -2767,6 +2898,7 @@ end
                 InfusionBodyOrigin::SyntheticConcernPrepended,
             )),
             class_methods: None,
+            lexical_context: Vec::new(),
         };
         let mut concerns = FxHashMap::default();
         concerns.insert(timestamped_name, &timestamped);
@@ -2815,6 +2947,7 @@ end
             included_body: None,
             prepended_body: None,
             class_methods: Some(test_class_methods(&names, timestamped_name, "timestamped")),
+            lexical_context: Vec::new(),
         };
         let auditable = ConcernDef {
             name: auditable_name,
@@ -2830,6 +2963,7 @@ end
             included_body: None,
             prepended_body: None,
             class_methods: Some(test_class_methods(&names, auditable_name, "audited")),
+            lexical_context: Vec::new(),
         };
         let mut concerns = FxHashMap::default();
         concerns.insert(timestamped_name, &timestamped);
@@ -2888,6 +3022,7 @@ end
             included_body: None,
             prepended_body: None,
             class_methods: Some(test_class_methods(&names, auditable_name, "audited")),
+            lexical_context: Vec::new(),
         };
         let mut concerns = FxHashMap::default();
         concerns.insert(auditable_name, &auditable);
@@ -2934,6 +3069,7 @@ end
             included_body: None,
             prepended_body: None,
             class_methods: Some(test_class_methods(&names, a_name, "a_method")),
+            lexical_context: Vec::new(),
         };
         let b = ConcernDef {
             name: b_name,
@@ -2948,6 +3084,7 @@ end
             included_body: None,
             prepended_body: None,
             class_methods: Some(test_class_methods(&names, b_name, "b_method")),
+            lexical_context: Vec::new(),
         };
         let mut concerns = FxHashMap::default();
         concerns.insert(a_name, &a);

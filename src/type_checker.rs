@@ -225,13 +225,6 @@ pub struct TypeChecker<'env> {
     /// see that field's doc for why the two stay as separate bools
     /// rather than a single enum.
     suppress_method_body_last_assertion: bool,
-    /// True while `walk_concern_block_body` is checking an
-    /// `included do` / `prepended do` body under one include target.
-    /// `visit_def_node` then checks a `def` in the current (already
-    /// retargeted) context instead of re-expanding it through
-    /// `synthetic_method_context_targets` — otherwise every target's walk
-    /// would re-check the def for every *other* target (N×(N−1)).
-    concern_block_target_walk: bool,
     /// The innermost `concerning :Topic do` block the walk is inside,
     /// as `(lexical owner, <owner>::<Topic>)`. The checker keeps the
     /// class stack at the lexical owner there (a `def` directly under
@@ -411,7 +404,6 @@ impl<'env> TypeChecker<'env> {
             diagnostics: RefCell::new(Vec::new()),
             comments,
             suppress_method_body_last_assertion: false,
-            concern_block_target_walk: false,
             concerning_module: None,
             next_hint: None,
 
@@ -488,31 +480,118 @@ impl<'env> TypeChecker<'env> {
     /// An interface-typed receiver has `implemented_in: None` (an
     /// interface declares without implementing); the declaring
     /// interface is the only nameable owner, so `defined_in` stands in.
+    ///
+    /// The separator names the owner's method table the def sits in —
+    /// the same vocabulary as extract's `definitions` — so it comes from
+    /// the def, not from the site: a singleton receiver reaches instance
+    /// tables through `Class` / `Module` / `Object`. `receiver_type` is
+    /// only consulted where the def alone cannot say (see
+    /// [`Self::extract_def_is_singleton`]).
     fn extract_landing_symbols(
         &self,
         method: &Method,
         method_name: &str,
-        site_singleton: bool,
+        receiver_type: Ty,
     ) -> Vec<String> {
-        let mut owners: Vec<crate::type_name::TypeName> = Vec::new();
+        let site_singleton = match self
+            .env
+            .types()
+            .resolve(self.concrete_self_for_lookup(receiver_type))
+        {
+            crate::types::Type::ClassSingleton { name } => Some(*name),
+            _ => None,
+        };
+        let mut symbols: Vec<String> = Vec::new();
         for td in &method.defs {
             let owner = td.implemented_in.unwrap_or(td.defined_in);
-            if !owners.contains(&owner) {
-                owners.push(owner);
+            let separator = if self.extract_def_is_singleton(td, owner, site_singleton) {
+                "."
+            } else {
+                "#"
+            };
+            let symbol = format!(
+                "{}{}{}",
+                self.env.names().display_type_name(owner),
+                separator,
+                method_name
+            );
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol);
             }
         }
-        let separator = if site_singleton { "." } else { "#" };
-        owners
-            .into_iter()
-            .map(|owner| {
-                format!(
-                    "{}{}{}",
-                    self.env.names().display_type_name(owner),
-                    separator,
-                    method_name
-                )
-            })
-            .collect()
+        symbols
+    }
+
+    /// Whether `td` sits in `owner`'s singleton method table, for a site
+    /// whose resolved receiver is `singleton(site_singleton)` (`None`
+    /// for an instance receiver).
+    fn extract_def_is_singleton(
+        &self,
+        td: &crate::definition::method::TypeDef,
+        owner: TypeName,
+        site_singleton: Option<TypeName>,
+    ) -> bool {
+        use crate::ast::members::{AliasKind, AttributeKind, MethodKind};
+        use crate::definition::method::MemberRef;
+        // A mixed-in interface's def keeps the interface member's
+        // instance kind while `implemented_in` moves to the includer, so
+        // the member cannot say which of the includer's tables it is in.
+        if self.env.names().is_interface(td.defined_in) {
+            return self.extract_singleton_lookup_meets_singleton_side(owner, site_singleton);
+        }
+        let kind = match &td.member {
+            // Only the synthesized `.new` carries this marker.
+            MemberRef::Synthesized => return true,
+            MemberRef::Method(m) => m.kind,
+            MemberRef::RubyDef(d) => d.kind,
+            MemberRef::AttrReader(a) => return a.kind == AttributeKind::Singleton,
+            MemberRef::AttrWriter(a) => return a.kind == AttributeKind::Singleton,
+            MemberRef::AttrAccessor(a) => return a.kind == AttributeKind::Singleton,
+            MemberRef::Alias(a) => return a.kind == AliasKind::Singleton,
+            // `class << self` attrs lower to singleton `RubyDef`s instead.
+            MemberRef::RubyAttrReader(_)
+            | MemberRef::RubyAttrWriter(_)
+            | MemberRef::RubyAttrAccessor(_) => return false,
+        };
+        match kind {
+            MethodKind::Instance => false,
+            MethodKind::Singleton => true,
+            // `def self?.m` is in both of `owner`'s tables.
+            MethodKind::SingletonInstance => {
+                self.extract_singleton_lookup_meets_singleton_side(owner, site_singleton)
+            }
+        }
+    }
+
+    /// For a def that could sit in either of `owner`'s tables: whether a
+    /// lookup on `singleton(site_singleton)` reaches `owner` through its
+    /// singleton side. The first entry naming `owner` in the singleton
+    /// ancestors is the one the lookup stopped at — `Singleton { owner }`
+    /// for `owner` itself or a superclass, `Instance { owner }` for an
+    /// `extend`ed module or a module mixed into `Object`. An instance
+    /// receiver only ever reaches instance tables.
+    ///
+    /// Known miss: an owner that is both (`Object`, whose singleton sits
+    /// ahead of its instance side) answers singleton for a def that only
+    /// its instance side holds, e.g. an interface `include`d into
+    /// `Object` called on a class.
+    fn extract_singleton_lookup_meets_singleton_side(
+        &self,
+        owner: TypeName,
+        site_singleton: Option<TypeName>,
+    ) -> bool {
+        use crate::definition::ancestor_builder::Ancestor;
+        site_singleton.is_some_and(|x| {
+            self.env
+                .singleton_ancestors(&x)
+                .ancestors
+                .iter()
+                .find_map(|a| match a {
+                    Ancestor::Singleton { name } => (*name == owner).then_some(true),
+                    Ancestor::Instance { name, .. } => (*name == owner).then_some(false),
+                })
+                .unwrap_or(false)
+        })
     }
 
     /// Records every resolved call site for `crema extract`. Called
@@ -538,10 +617,6 @@ impl<'env> TypeChecker<'env> {
         let Some(collector) = &self.extract else {
             return;
         };
-        let site_singleton = matches!(
-            self.env.types().resolve(receiver_type),
-            crate::types::Type::ClassSingleton { .. }
-        );
         let mut symbols: Vec<String> = Vec::new();
         match target {
             CallTarget::Method {
@@ -549,7 +624,7 @@ impl<'env> TypeChecker<'env> {
                 method_def,
                 ..
             } => {
-                symbols = self.extract_landing_symbols(method_def, method_name, site_singleton);
+                symbols = self.extract_landing_symbols(method_def, method_name, receiver_type);
             }
             // Union receiver: the site dispatches into every component,
             // so each component's landing definition is "used" here.
@@ -561,7 +636,7 @@ impl<'env> TypeChecker<'env> {
             } => {
                 for c in components {
                     for symbol in
-                        self.extract_landing_symbols(&c.method_def, method_name, site_singleton)
+                        self.extract_landing_symbols(&c.method_def, method_name, c.receiver_type)
                     {
                         if !symbols.contains(&symbol) {
                             symbols.push(symbol);
@@ -600,8 +675,7 @@ impl<'env> TypeChecker<'env> {
     /// — `check_super_node` (`super(args)`) and
     /// `emit_unexpected_super_if_unresolvable` (bare `super`) — on their
     /// lookup-success paths. `method` is the resolved super target; the
-    /// site's singleton kind and the receiver column both come from the
-    /// enclosing `self_ty`.
+    /// receiver column comes from the enclosing `self_ty`.
     fn record_extract_super(
         &self,
         start_offset: usize,
@@ -614,10 +688,6 @@ impl<'env> TypeChecker<'env> {
         let Some(collector) = &self.extract else {
             return;
         };
-        let site_singleton = matches!(
-            self.env.types().resolve(self_ty),
-            crate::types::Type::ClassSingleton { .. }
-        );
         let span = (start_offset as u32, end_offset as u32);
         let state = match self.extract_take_call_state(span) {
             Some(ExtractCallState::Error) => crate::extract::method_call_state::ERROR,
@@ -625,7 +695,7 @@ impl<'env> TypeChecker<'env> {
         };
         let receiver = self.display_type(self_ty);
         let return_type = expr_type.map(|t| self.display_type(t));
-        for symbol in self.extract_landing_symbols(method, method_name, site_singleton) {
+        for symbol in self.extract_landing_symbols(method, method_name, self_ty) {
             collector.push_method_call(crate::extract::MethodCallRecord {
                 state,
                 kind: crate::extract::ReferenceKind::Super.as_str(),
@@ -663,10 +733,10 @@ impl<'env> TypeChecker<'env> {
     /// Record a `def` site as an implementation, on the lexical symbol
     /// axis (see [`crate::extract::ImplementsRecord`]): the enclosing
     /// class/module plus the def name, independent of signature
-    /// resolution. Called from `visit_def_node` *before* the synthetic
-    /// concern-target dispatch replaces the class stack, so a concern
-    /// module's def records its lexical module once — not once per
-    /// including class.
+    /// resolution. Called from `visit_def_node` and reads the current
+    /// class stack, so a `def` inside a Concern's `included do` /
+    /// `prepended do` — walked once per include target by
+    /// `walk_concern_block_body` — records under each target.
     pub(super) fn record_extract_implements<'pr>(&self, node: &ruby_prism::DefNode<'pr>) {
         let Some(collector) = &self.extract else {
             return;

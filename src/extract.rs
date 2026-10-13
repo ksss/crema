@@ -444,11 +444,6 @@ pub fn consulted_symbols(
             InstanceVariable { class: n, .. }
             | ClassVariable { class: n, .. }
             | ClassInstanceVariable { class: n, .. } => out.push(type_name(*n)),
-            SyntheticConcernTargets { current, .. } => {
-                if let Some(n) = current {
-                    out.push(type_name(*n));
-                }
-            }
             ConcernBlockTargets { concern, .. } => out.push(type_name(*concern)),
 
             ConstantResolution { context, .. } => {

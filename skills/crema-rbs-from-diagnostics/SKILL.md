@@ -297,13 +297,12 @@ crema check --no-baseline <smoke file> | jq -r .code | sort | uniq -c
 Iterate on single files; the whole project runs at most twice per cycle
 (after the patch, after the gap fixes).
 
-`.crema/` appears in the project root after the first run. It is
-crema's incremental cache (`incremental = true` in `crema.toml`): the
-parsed files and their diagnostics, keyed on the content of the `.rb`
-and `.rbs` files, so an edit to the patch is picked up on the next run
-by itself. It belongs in `.gitignore`, and it is what makes a re-run
-take seconds instead of minutes. A result that looks stale is a patch
-problem, not a cache problem.
+`.crema/` appears in the project root after the first run. It holds
+crema's caches — the loaded gem environment and the per-file parse
+results — and everything in it is generated and safe to delete. It
+belongs in `.gitignore`. An edit to the patch is picked up on the next
+run by itself, so a result that looks stale is a patch problem, not a
+cache problem.
 
 Then the full run:
 
