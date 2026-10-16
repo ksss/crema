@@ -136,7 +136,7 @@ impl CommentAssociation {
             };
 
             let loc = comment.location();
-            let line = line_index.line(loc.start_offset());
+            let line = line_index.line(loc.start() as usize);
 
             // Record the raw byte range for any trailing-candidate prefix
             // (`#:` type assertion or `#[` type application). Dispatch between
@@ -145,20 +145,20 @@ impl CommentAssociation {
                 || text_str.starts_with("#[")
                 || text_str.starts_with("#$")
             {
-                trailing_ranges.insert(line, (loc.start_offset() as u32, loc.end_offset() as u32));
+                trailing_ranges.insert(line, (loc.start(), loc.end()));
                 if text_str.starts_with("#[") || text_str.starts_with("#$") {
                     has_trailing_type_applications = true;
                 }
             }
 
-            let range = (loc.start_offset() as u32, loc.end_offset() as u32);
+            let range = (loc.start(), loc.end());
             // Only treat a comment as a *leading* annotation when it sits
             // at the head of its line (preceded only by whitespace). Trailing
             // annotations like `attr_reader :name #: String` would otherwise
             // also get picked up as leading candidates for the method on the
             // next line, producing spurious AnnotationSyntaxError reports
             // once the parse failure stops being silently swallowed.
-            if !is_line_head_comment(source, loc.start_offset()) {
+            if !is_line_head_comment(source, loc.start() as usize) {
                 // A non-line-head comment ends any in-flight block: rbs's
                 // `CommentBlock.build` rejects such comments from the
                 // grouping logic (`block_comments << comments.shift` is
@@ -183,7 +183,7 @@ impl CommentAssociation {
             }
 
             // Block bookkeeping — build the rbs `CommentBlock` shape.
-            let column = byte_offset_to_column(source, loc.start_offset());
+            let column = byte_offset_to_column(source, loc.start() as usize);
             let can_append =
                 !block_lines.is_empty() && block_end_line + 1 == line && block_column == column;
             if !can_append {

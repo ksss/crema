@@ -187,8 +187,9 @@ pub struct ConstantRecord {
     pub constant_type: Option<String>,
 }
 
-/// One Ruby `def` site or constant assignment (`FOO = 1`, `A::B = 2`):
-/// the symbol this file implements. The symbol is the *lexical* axis —
+/// One method a Ruby site defines (a `def`, an `attr_*` name, a
+/// `Struct.new` / `Data.define` member) or one constant assignment
+/// (`FOO = 1`, `A::B = 2`): the symbol this file implements. The symbol is the *lexical* axis —
 /// the enclosing class/module (top-level defs are `::Object`, Ruby's
 /// actual owner; top-level constants are rooted `::X`, rbs's spelling)
 /// plus the name — regardless of whether, or where, a signature
@@ -196,6 +197,11 @@ pub struct ConstantRecord {
 /// (`class Sub < Foo; def bar` with only `Foo#bar` declared) still
 /// records `::Sub#bar`: implements answers "what does this file's
 /// source define", not "which declaration was it checked against".
+/// The def / attr sites of a Concern's `class_methods do` and of
+/// `concerning :Topic do` record under the module the Rails infusion
+/// synthesizes for the block (`::C::ClassMethods`, `::Owner::Topic`) —
+/// where Rails defines them, and the module `definitions` names — not
+/// under the lexical class.
 ///
 /// Constant symbols follow the inline collector's rule so the two join
 /// on the same string: `qualify_under(innermost class, path)` with a
@@ -209,9 +215,11 @@ pub struct ImplementsRecord {
     /// Same vocabulary as [`DefinitionRecord`]s: `instance_method` /
     /// `singleton_method` / `constant` (v6).
     pub kind: &'static str,
+    /// Method spans equal the `definitions` member span of the same
+    /// method: the whole `def` node, the whole `attr_*` call, or a
+    /// Struct / Data member's Symbol argument. A constant spans the
+    /// whole write node (name through the end of the RHS).
     pub start_byte: u32,
-    /// Exclusive end of the whole `def` node (keyword through `end`)
-    /// or of the whole write node (name through the end of the RHS).
     pub end_byte: u32,
 }
 
@@ -398,6 +406,7 @@ pub fn consulted_symbols(
         match key {
             ExpandTypeAlias(n)
             | ConstantDeprecated(n)
+            | ConstantDeclSite(n)
             | ClassOrModuleDeprecated(n)
             | ClassAliasDeprecated(n)
             | DeclaredKind(n)
@@ -445,6 +454,7 @@ pub fn consulted_symbols(
             | ClassVariable { class: n, .. }
             | ClassInstanceVariable { class: n, .. } => out.push(type_name(*n)),
             ConcernBlockTargets { concern, .. } => out.push(type_name(*concern)),
+            RubyModuleMemberWithin { module, .. } => out.push(type_name(*module)),
 
             ConstantResolution { context, .. } => {
                 for scope in context.scopes() {

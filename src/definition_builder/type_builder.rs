@@ -36,7 +36,7 @@ use crate::type_param::{
     MethodKind, TypeParam, TypeParamScope, TypeVarKey, TypeVarScope, Variance,
 };
 use crate::types::{
-    Block, Function, FunctionType, Literal, MethodType, RecordKey, Ty, Type, TypeTable,
+    Block, Function, FunctionType, Literal, MethodType, ProcType, RecordKey, Ty, Type, TypeTable,
     UntypedFunction,
 };
 
@@ -154,11 +154,11 @@ pub fn build_type(
                 .block
                 .as_ref()
                 .map(|b| build_block(b, context, env, names, types, type_param_scope));
-            types.intern(Type::Proc {
+            types.intern(Type::Proc(Box::new(ProcType {
                 type_: func,
                 self_type: self_ty,
                 block: blk,
-            })
+            })))
         }
         AstType::Literal(t) => match &t.literal {
             AstLiteral::Integer(s) => types.intern(Type::Literal(Literal::Integer(

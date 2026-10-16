@@ -547,13 +547,16 @@ fn parse_schema_file(
                 kind: DiagnosticKind::InfusionProviderSkipped {
                     provider: PROVIDER.to_string(),
                     subject,
-                    reason: format!("schema.rb parse error: {}", first_err.message()),
+                    reason: format!(
+                        "schema.rb parse error: {}",
+                        String::from_utf8_lossy(first_err.message())
+                    ),
                 },
                 location: Diagnostic::location_for_byte_range(
                     schema_path.to_path_buf(),
                     &source,
-                    err_location.start_offset(),
-                    err_location.end_offset(),
+                    err_location.start() as usize,
+                    err_location.end() as usize,
                 ),
             });
             return None;

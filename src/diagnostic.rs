@@ -573,24 +573,27 @@ pub enum DiagnosticKind {
     /// Steep's `default` preset.
     UnreachableValueBranch,
 
-    /// RHS of an ivar / cvar / gvar assignment is incompatible with the
-    /// variable's declared type (e.g. `@x: Integer` with `@x = "string"`).
+    /// RHS of an ivar / cvar / gvar / constant assignment is incompatible
+    /// with the declared type (e.g. `@x: Integer` with `@x = "string"`).
     /// Mirrors Steep's `Diagnostic::Ruby::IncompatibleAssignment`
-    /// (`lib/steep/type_construction.rb` `ivasgn` / `gvasgn` / `cvasgn`).
+    /// (`lib/steep/type_construction.rb` `ivasgn` / `gvasgn` / `cvasgn`
+    /// / `casgn`).
     ///
     /// Inline `#: T` assertion does not override the declaration here —
     /// the ivar/cvar/gvar declaration is always the source of truth
     /// (Steep parity, measured 2026-06-06). lvar assertion override
     /// stays under `FalseAssertion`.
     ///
-    /// Default severity = `Error` (stricter than Steep's `Hint` default,
-    /// matching crema's `UnknownConstant` policy: preflight signals worth
-    /// failing on).
+    /// Default severity = `Hint`, Steep's `default` preset (see
+    /// `default_severity_for_code`).
     IncompatibleAssignment {
         /// Display of the declared (LHS) type, e.g. `::Integer`.
         lhs_type: String,
         /// Display of the inferred RHS type, e.g. `::String`.
         rhs_type: String,
+        /// What the write targets; only words the message, not emitted
+        /// as a JSON key.
+        target: AssignmentTarget,
     },
 
     /// Multiple assignment (`a, b = rhs`) where the RHS's `to_ary`
@@ -728,6 +731,17 @@ pub enum DiagnosticKind {
         /// (`"LocalVariableWriteNode"`) for `infer_type` sites.
         subject_display: String,
     },
+}
+
+/// The `element` Steep's `IncompatibleAssignment#header_line` names,
+/// picked by the diagnostic's node type: `ivasgn` / `lvasgn` /
+/// `gvasgn` / `cvasgn` → "a variable", `casgn` → "a constant". Steep's
+/// third wording, "an expression" (optarg default / annotated block
+/// param), has no crema emit site yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AssignmentTarget {
+    Variable,
+    Constant,
 }
 
 /// Mirrors Steep's `UnknownConstant#kind` symbol
@@ -1402,7 +1416,9 @@ impl Diagnostic {
                 obj.insert("residue_type".into(), json!(residue_type));
             }
             DiagnosticKind::UnreachableValueBranch => {}
-            DiagnosticKind::IncompatibleAssignment { lhs_type, rhs_type } => {
+            DiagnosticKind::IncompatibleAssignment {
+                lhs_type, rhs_type, ..
+            } => {
                 obj.insert("lhs_type".into(), json!(lhs_type));
                 obj.insert("rhs_type".into(), json!(rhs_type));
             }
@@ -2329,11 +2345,19 @@ impl fmt::Display for DiagnosticKind {
                     "The `else` branch is unreachable: every value of the scrutinee is covered by the preceding `when` clauses",
                 )
             }
-            DiagnosticKind::IncompatibleAssignment { lhs_type, rhs_type } => {
+            DiagnosticKind::IncompatibleAssignment {
+                lhs_type,
+                rhs_type,
+                target,
+            } => {
+                let element = match target {
+                    AssignmentTarget::Variable => "a variable",
+                    AssignmentTarget::Constant => "a constant",
+                };
                 write!(
                     f,
-                    "Cannot assign a value of type `{}` to a variable of type `{}`",
-                    rhs_type, lhs_type,
+                    "Cannot assign a value of type `{}` to {} of type `{}`",
+                    rhs_type, element, lhs_type,
                 )
             }
             DiagnosticKind::MultipleAssignmentConversion {

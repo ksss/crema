@@ -1,6 +1,6 @@
 [package]
 name = "crema"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "An AI-agent-first Ruby type checker"
 license = "MIT"
@@ -11,7 +11,7 @@ license = "MIT"
 autotests = false
 
 [dependencies]
-ruby-prism = "1.9.0"
+ruby-prism = "2.0.0-rc.1"
 ruby-rbs-sys = { path = "vendor/ruby-rbs-sys" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive", "rc"] }

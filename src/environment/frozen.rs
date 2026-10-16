@@ -584,6 +584,16 @@ pub struct Environment {
     /// [`Self::all_names`] for the persistence rationale. Two-layer —
     /// see [`Self::path_index`].
     pub(crate) aliases: FxHashMap<TypeName, (String, Context)>,
+    /// `DuplicatedDeclaration`s `EnvironmentDraft::build` found and
+    /// resolved (voided or merged first-wins) instead of failing on. The
+    /// validator emits one diagnostic per record; nothing else reads them.
+    pub(crate) duplicate_declarations: Vec<crate::environment::draft::DuplicateDeclaration>,
+    /// `constant_decls` keys whose entry is an unannotated Ruby definition
+    /// (`N = 43`, typed by literal inference because no declaration
+    /// exists). Carried so `unload` → rebuild can re-enter the surviving
+    /// entries with the right [`crate::environment::draft::ConstantSource`]
+    /// — a declaration arriving later must still win over them.
+    pub(crate) constant_definitions: FxHashSet<TypeName>,
     /// `included do` / `prepended do` block → final include / prepend
     /// targets, per ActiveSupport::Concern module, computed by the
     /// infusion pipeline's concern expansion
@@ -955,6 +965,12 @@ impl Environment {
         }
     }
 
+    /// Build-time `DuplicatedDeclaration` records — see
+    /// [`crate::environment::draft::DuplicateDeclaration`].
+    pub fn duplicate_declarations(&self) -> &[crate::environment::draft::DuplicateDeclaration] {
+        &self.duplicate_declarations
+    }
+
     pub fn constant_decls(&self) -> Decls<'_, TypeName, SingleEntry<Constant>> {
         match &self.g {
             None => Decls::built(&self.constant_decls),
@@ -1166,6 +1182,10 @@ impl Environment {
             mut all_names,
             mut aliases,
             concern_block_targets,
+            // Reported by the build that produced this generation; the
+            // next build re-derives its own.
+            duplicate_declarations: _,
+            mut constant_definitions,
         } = self;
 
         // Resolver-table delta (ADR-0028 slice S2): a name drops out of
@@ -1260,12 +1280,14 @@ impl Environment {
             .filter(|(_, entries)| !entries.is_empty())
             .collect();
 
+        constant_definitions.retain(|name| constant_decls.contains_key(name));
         draft.overlay = Some(Box::new(FrozenOverlay {
             class_decls,
             interface_decls,
             class_alias_decls,
             type_alias_decls,
             constant_decls,
+            constant_definitions,
             global_decls,
             g_remerge,
             all_names,

@@ -23,7 +23,7 @@ use crate::name::Symbol;
 use crate::subtyping::record_key_union;
 use crate::type_name::TypeName;
 use crate::type_param::TypeVarKey;
-use crate::types::{FunctionType, RecordKey, Ty, Type};
+use crate::types::{FunctionType, ProcType, RecordKey, Ty, Type};
 
 /// Result of a successful per-call resolution.
 pub struct ResolvedMethod {
@@ -60,6 +60,9 @@ pub struct ResolvedMethod {
 /// No `untyped` fallback: lookup failure is reported as `None` so
 /// callers can surface the underlying diagnostic instead of having it
 /// swallowed by gradual typing.
+// The resolver recurses into itself for widened / expanded receivers; that
+// is the lookup, not a dispatch (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
 pub fn lookup_method(
     env: ConsultationView,
     receiver: Ty,
@@ -99,7 +102,8 @@ pub fn lookup_method(
             let widened = env.class_instance_type(env.names().builtins().nil_class);
             lookup_method(env, widened, method_name)
         }
-        Type::Proc { type_, block, .. } => {
+        Type::Proc(p) => {
+            let ProcType { type_, block, .. } = &**p;
             // Steep `interface/builder.rb:157-159` widens `Types::Proc` to
             // `object_shape(AST::Builtin::Proc.module_name)`, then
             // `proc_shape` (`builder.rb:718`) overwrites `.call` / `.[]`

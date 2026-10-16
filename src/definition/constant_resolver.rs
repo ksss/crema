@@ -909,14 +909,27 @@ type ConstantsMap = FxHashMap<Symbol, ConstantEntry>;
 /// the `::Object` + toplevel seed, the rest of the innermost scope's
 /// ancestors, the lexical scope chain, the scope itself — and a later
 /// merge wins. A merge only ever inserts, so looking the layers up in
-/// reverse merge order answers exactly what the merged hash would.
+/// reverse merge order would answer exactly what that hash does.
+///
+/// crema looks them up as `lexical`, `itself`, `ancestors`, `seed`:
+/// reverse merge order except that the lexical chain goes ahead of the
+/// scope itself, as if rbs merged the scope itself between the
+/// ancestors and the lexical chain. This is a deliberate departure from
+/// rbs (ruby/rbs#3224): Ruby's cref walk finds a child of the scope
+/// (`class C; class C; end; C; end` is the inner `C`) before the
+/// scope's own name, and rbs's last-merged self-constant hides it. The
+/// scope itself still beats the ancestor layers, so inside a compact
+/// `class Foo::Bar`, `Bar` stays `::Foo::Bar` even with a toplevel
+/// `::Bar`.
+///
 /// Every layer but `itself` already lives in an `Arc` on
 /// [`ConstantTable`] or the resolver; on gitlab the merged copies came
 /// to 1 GiB across 10k contexts, 55% of the whole check.
 #[derive(Debug)]
 pub struct ContextConstants {
     /// rbs `constants_itself`: the innermost scope as a constant of
-    /// itself. Consulted first.
+    /// itself. Consulted after `lexical` (ruby/rbs#3224), before
+    /// `ancestors`.
     itself: Option<(Symbol, ConstantEntry)>,
     /// rbs `constants_from_context`, innermost scope first. The chain
     /// stops at the first scope missing from `children_table` (rbs's
@@ -933,15 +946,15 @@ pub struct ContextConstants {
 impl ContextConstants {
     /// The entry `name` resolves to in this scope, or `None`.
     pub fn get(&self, name: Symbol) -> Option<ConstantEntry> {
-        if let Some((sym, entry)) = self.itself
-            && sym == name
-        {
-            return Some(entry);
-        }
         for layer in &self.lexical {
             if let Some(entry) = layer.get(&name) {
                 return Some(*entry);
             }
+        }
+        if let Some((sym, entry)) = self.itself
+            && sym == name
+        {
+            return Some(entry);
         }
         if let Some(entry) = self.ancestors.get(&name) {
             return Some(*entry);
@@ -1123,8 +1136,9 @@ impl ConstantResolver {
     /// three steps into one hash — ancestors of the innermost scope (or
     /// `::Object` when the context is empty), the lexical scope chain,
     /// then the scope's own self-constant — with later merges winning.
-    /// Here each step becomes a layer of [`ContextConstants`], and the
-    /// lookup consults them in reverse order.
+    /// Here each step becomes a layer of [`ContextConstants`]. The
+    /// lookup order is not rbs's: the lexical chain wins over the
+    /// self-constant (ruby/rbs#3224, see [`ContextConstants`]).
     fn load_context_constants(&self, context: &ConstantContext) -> ContextConstants {
         // rbs L126-130 always routes an empty context through
         // `::Object`. When `::Object` is absent (minimum-rbs test envs

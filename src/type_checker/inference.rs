@@ -45,14 +45,14 @@ fn literal_cannot_narrow(
 }
 use crate::narrowing::partition_union;
 use crate::types::{
-    self, Function, FunctionType, Literal, RecordKey, Ty, Type, TypeTable, Visibility,
+    self, Function, FunctionType, Literal, ProcType, RecordKey, Ty, Type, TypeTable, Visibility,
     cmp_by_content, partition_truthy, union_of, union_of_many,
 };
 
 use super::calls::{BlockParamShape, LiteralAccessResult, OwnKey, ResolvedCall};
 use super::cond_env::{CondEnv, Scrutinee};
 use super::visitor::{and_write_value_ty, or_write_value_ty};
-use super::{CallArguments, CallTarget, TypeChecker};
+use super::{CallArguments, CallTarget, DispatchSite, TypeChecker};
 use crate::context::{ScopeKind, ScopeSnapshot};
 use crate::pure_call_env::{PureKey, PureNode};
 
@@ -218,7 +218,7 @@ impl<'env> TypeChecker<'env> {
                     // not inside `check_call` — because only the entry
                     // knows whether the check produced a value for the
                     // site (here: yes).
-                    self.record_extract_call_site(&call, &resolved, Some(ret));
+                    self.record_extract_call_site(&call, Some(ret));
                     ret
                 } else {
                     Ty::UNTYPED
@@ -496,7 +496,7 @@ impl<'env> TypeChecker<'env> {
                         w.name().as_slice(),
                         &w.value(),
                         hint,
-                        w.location().start_offset(),
+                        w.location().start() as usize,
                     )
                 })
                 .unwrap_or(Ty::UNTYPED),
@@ -507,7 +507,7 @@ impl<'env> TypeChecker<'env> {
                         w.name().as_slice(),
                         &w.value(),
                         hint,
-                        w.location().start_offset(),
+                        w.location().start() as usize,
                     )
                 })
                 .unwrap_or(Ty::UNTYPED),
@@ -768,8 +768,8 @@ impl<'env> TypeChecker<'env> {
                     let name_str = String::from_utf8_lossy(gvar.name().as_slice()).into_owned();
                     self.check_deprecated_global_ref(
                         &name_str,
-                        gvar.location().start_offset(),
-                        gvar.location().end_offset(),
+                        gvar.location().start() as usize,
+                        gvar.location().end() as usize,
                     );
                 }
                 self.infer_type(node, hint)
@@ -836,11 +836,14 @@ impl<'env> TypeChecker<'env> {
         if is_inline_declaration_call_stmt(stmt) {
             return None;
         }
-        self.lookup_trailing_assertion(stmt.location().start_offset(), stmt.location().end_offset())
+        self.lookup_trailing_assertion(
+            stmt.location().start() as usize,
+            stmt.location().end() as usize,
+        )
     }
 
     fn emit_statement_false_assertion<'pr>(&mut self, stmt: &Node<'pr>, natural: Ty, asserted: Ty) {
-        let position = self.offset_to_location(stmt.location().start_offset());
+        let position = self.offset_to_location(stmt.location().start() as usize);
         self.emit_false_assertion_if_incompatible(natural, asserted, position);
     }
 
@@ -1413,6 +1416,8 @@ impl<'env> TypeChecker<'env> {
     /// is arity-zero, or when the receiver shape is not handled by
     /// `lookup_method` (e.g. `Type::Union`, `Type::Untyped`). Callers
     /// fall back to scalar pass-through in those cases.
+    // Implicit-conversion probe, not a dispatch: consulted only.
+    #[allow(clippy::disallowed_methods)]
     pub(super) fn try_convert_to_a(&self, ty: Ty) -> Option<Ty> {
         let to_a = self.env.names().intern_symbol("to_a");
         let resolved = super::method_resolver::lookup_method(self.env, ty, to_a)?;
@@ -1945,7 +1950,7 @@ impl<'env> TypeChecker<'env> {
             use crate::diagnostic::{Diagnostic, DiagnosticKind};
             let residue = iter_falsy_ty.expect("residue_alive implies iter_falsy_ty is Some");
             if !case_exhausted && else_clause_opt.is_none() {
-                let position = self.offset_to_location(node.location().start_offset());
+                let position = self.offset_to_location(node.location().start() as usize);
                 let scrutinee_str = self.display_type(
                     scrutinee_full_ty.expect("residue_alive implies scrutinee is Some"),
                 );
@@ -1977,7 +1982,7 @@ impl<'env> TypeChecker<'env> {
             if case_exhausted && outcome.last_ty != Ty::BOTTOM {
                 use crate::diagnostic::{Diagnostic, DiagnosticKind};
                 let position =
-                    self.offset_to_location(else_clause.as_node().location().start_offset());
+                    self.offset_to_location(else_clause.as_node().location().start() as usize);
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location: position,
@@ -2043,7 +2048,7 @@ impl<'env> TypeChecker<'env> {
             for e in fp.requireds().iter() {
                 self.check_pattern(&e, None);
             }
-            self.check_pattern(&fp.right(), None);
+            self.check_pattern(&fp.right().as_node(), None);
         } else if let Some(hp) = node.as_hash_pattern_node() {
             if let Some(c) = hp.constant() {
                 self.visit(&c);
@@ -3336,7 +3341,7 @@ impl<'env> TypeChecker<'env> {
         {
             return false;
         }
-        let resolved = ResolvedCall::resolve(self, &call, OwnKey::Unbuilt);
+        let resolved = ResolvedCall::resolve(self, &call, OwnKey::Unbuilt, DispatchSite::Probe);
         let Some(target) = resolved.target.as_ref() else {
             return false;
         };
@@ -3461,6 +3466,8 @@ impl<'env> TypeChecker<'env> {
     /// Empty `defs` is treated as "not primitive": vacuous truth would
     /// let a synthesised empty-method record bypass the gate, and the
     /// safer default with no overload data is to suppress narrowing.
+    // Narrowing gate material, not a dispatch: consulted only.
+    #[allow(clippy::disallowed_methods)]
     fn nil_predicate_resolves_to_primitive(&self, receiver: Ty) -> bool {
         let nil_q = self.env.names().intern_symbol("nil?");
         let Some(resolved) = super::method_resolver::lookup_method(self.env, receiver, nil_q)
@@ -3565,7 +3572,7 @@ impl<'env> TypeChecker<'env> {
         }
         let method_name = String::from_utf8_lossy(call.name().as_slice()).to_string();
         let CallTarget::UnionMethod { components, .. } =
-            self.resolve_call_target_at(current, &method_name)?
+            self.resolve_call_target_at(current, &method_name, DispatchSite::Probe)?
         else {
             return None;
         };
@@ -3667,6 +3674,8 @@ impl<'env> TypeChecker<'env> {
     /// would be unsound. Fail-open semantics mirror
     /// [`Self::nil_predicate_resolves_to_primitive`] — see that doc
     /// comment for the two `None` cases this covers.
+    // Narrowing gate material, not a dispatch: consulted only.
+    #[allow(clippy::disallowed_methods)]
     fn eq_resolves_to_builtin_value_class(&self, receiver: Ty) -> bool {
         let eq = self.env.names().intern_symbol("==");
         let Some(resolved) = super::method_resolver::lookup_method(self.env, receiver, eq) else {
@@ -5553,14 +5562,16 @@ impl<'env> TypeChecker<'env> {
                 let value_node = w.value();
                 let op_bytes = w.binary_operator().as_slice();
                 let op_name = String::from_utf8_lossy(op_bytes);
-                let Some(target) = self.resolve_call_target_at(receiver_ty, &op_name) else {
+                let Some(target) =
+                    self.resolve_call_target_at(receiver_ty, &op_name, DispatchSite::Probe)
+                else {
                     return Ty::UNTYPED;
                 };
                 let arguments = CallArguments {
                     positional: vec![rhs_ty],
                     positional_spans: vec![super::arg_span(
-                        value_node.location().start_offset(),
-                        value_node.location().end_offset(),
+                        value_node.location().start() as usize,
+                        value_node.location().end() as usize,
                     )],
                     keywords: vec![],
                     kwsplats: vec![],
@@ -5698,7 +5709,7 @@ impl<'env> TypeChecker<'env> {
                     .next()
                     .unwrap_or("UnknownNode")
                     .to_string();
-                let location = self.offset_to_location(node.location().start_offset());
+                let location = self.offset_to_location(node.location().start() as usize);
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location,
@@ -5734,8 +5745,8 @@ impl<'env> TypeChecker<'env> {
             return;
         };
         self.record_extract_super(
-            node.location().start_offset(),
-            node.location().end_offset(),
+            node.location().start() as usize,
+            node.location().end() as usize,
             &method,
             &method_name,
             self_ty,
@@ -5775,7 +5786,7 @@ impl<'env> TypeChecker<'env> {
         if self.is_inside_module_definition() {
             return;
         }
-        let position = self.offset_to_location(node.location().start_offset());
+        let position = self.offset_to_location(node.location().start() as usize);
         self.push_diagnostic(Diagnostic {
             scope: None,
             location: position,
@@ -6132,7 +6143,7 @@ impl<'env> TypeChecker<'env> {
                     // read-only re-inference of it doesn't repeat it.
                     let call_offset = call
                         .filter(|c| self.check_walk_types_call(c))
-                        .map(|c| c.location().start_offset());
+                        .map(|c| c.location().start() as usize);
                     self.apply_hint_override(overload, hint_ty, &mut local_bindings, call_offset);
                 }
 
@@ -6335,9 +6346,8 @@ impl<'env> TypeChecker<'env> {
             let Some(param_ty) = super::calls::symbol_to_proc_one_arg_param(&resolved_block) else {
                 return;
             };
-            let sym = self.env.names().intern_symbol(&name);
             let super::calls::SymbolToProcResolution::Resolved(ret) =
-                self.symbol_to_proc_return_type(param_ty, sym)
+                self.symbol_to_proc_return_type(param_ty, &name, DispatchSite::Probe)
             else {
                 return;
             };
@@ -6911,17 +6921,18 @@ impl<'env> TypeChecker<'env> {
             // both the function and the optional block. Proc params are
             // contravariant, but this is a heuristic lower-bound extraction,
             // not a sound variance-aware check.
-            Type::Proc {
-                type_: p_ft,
-                block: p_block,
-                ..
-            } => {
-                if let Type::Proc {
-                    type_: a_ft,
-                    block: a_block,
+            Type::Proc(p) => {
+                let ProcType {
+                    type_: p_ft,
+                    block: p_block,
                     ..
-                } = types_tbl.resolve(arg_widened)
-                {
+                } = &**p;
+                if let Type::Proc(a_p) = types_tbl.resolve(arg_widened) {
+                    let ProcType {
+                        type_: a_ft,
+                        block: a_block,
+                        ..
+                    } = &**a_p;
                     self.unify_function_slots(p_ft, a_ft, bindings, mode);
                     if let (Some(p_blk), Some(a_blk)) = (p_block, a_block) {
                         self.unify_function_slots(&p_blk.type_, &a_blk.type_, bindings, mode);
@@ -7448,7 +7459,7 @@ impl<'env> TypeChecker<'env> {
                     extras.push(RecordExtraKey {
                         key: record_key,
                         known_keys: known_keys.clone(),
-                        offset: key_node.location().start_offset(),
+                        offset: key_node.location().start() as usize,
                     });
                 }
             }
@@ -8025,11 +8036,12 @@ impl<'env> TypeChecker<'env> {
                 members.iter().any(|&m| self.ty_contains_self_type(m))
             }
             Type::Optional(inner) => self.ty_contains_self_type(*inner),
-            Type::Proc {
-                type_,
-                self_type,
-                block,
-            } => {
+            Type::Proc(p) => {
+                let ProcType {
+                    type_,
+                    self_type,
+                    block,
+                } = &**p;
                 self.function_type_contains_self_type(type_)
                     || self_type.is_some_and(|ty| self.ty_contains_self_type(ty))
                     || block
@@ -8206,20 +8218,20 @@ impl<'env> TypeChecker<'env> {
 
             let mut function = function.clone();
             function.return_type = actual_return;
-            return self.env.types().intern(Type::Proc {
+            return self.env.types().intern(Type::Proc(Box::new(ProcType {
                 type_: FunctionType::Typed(function),
                 self_type,
                 block: block.clone(),
-            });
+            })));
         }
 
         if let Some(lambda) = node.as_lambda_node() {
             let function = self.unhinted_lambda_function(lambda);
-            return self.env.types().intern(Type::Proc {
+            return self.env.types().intern(Type::Proc(Box::new(ProcType {
                 type_: FunctionType::Typed(function),
                 self_type: None,
                 block: None,
-            });
+            })));
         }
 
         self.env
@@ -8267,16 +8279,19 @@ impl<'env> TypeChecker<'env> {
         self.collect_lambda_hint_members(hint, &mut members, 0);
         let mut procs = members
             .into_iter()
-            .filter(|&m| matches!(self.env.types().resolve(m), Type::Proc { .. }));
+            .filter(|&m| matches!(self.env.types().resolve(m), Type::Proc(..)));
         let proc_ty = procs.next()?;
         if procs.next().is_some() {
             return None;
         }
-        let Type::Proc {
+        let Type::Proc(p) = self.env.types().resolve(proc_ty) else {
+            return None;
+        };
+        let ProcType {
             type_: FunctionType::Typed(function),
             self_type,
             block,
-        } = self.env.types().resolve(proc_ty)
+        } = &**p
         else {
             return None;
         };
@@ -8414,11 +8429,14 @@ impl<'env> TypeChecker<'env> {
         }
 
         let (hint_function, hint_block) = match hint.map(|h| self.env.types().resolve(h)) {
-            Some(Type::Proc {
-                type_: FunctionType::Typed(function),
-                block,
-                ..
-            }) => (Some(function), block.as_ref()),
+            Some(Type::Proc(p)) => match &**p {
+                ProcType {
+                    type_: FunctionType::Typed(function),
+                    block,
+                    ..
+                } => (Some(function), block.as_ref()),
+                _ => (None, None),
+            },
             _ => (None, None),
         };
 
@@ -8458,7 +8476,7 @@ impl<'env> TypeChecker<'env> {
             overlay.insert(self.checker_names().intern(&name_str), ty);
         }
 
-        if let Some(block_param) = params.block()
+        if let Some(block_param) = params.block().and_then(|b| b.as_block_parameter_node())
             && let Some(name_id) = block_param.name()
         {
             let name_str = String::from_utf8_lossy(name_id.as_slice());
@@ -8466,11 +8484,11 @@ impl<'env> TypeChecker<'env> {
             // `methods.rs` (`bind_parameters`): a Proc of the declared
             // block type, `| nil` when the block is optional.
             let ty = hint_block.map_or(Ty::UNTYPED, |block| {
-                let proc_ty = self.env.types().intern(Type::Proc {
+                let proc_ty = self.env.types().intern(Type::Proc(Box::new(ProcType {
                     type_: block.type_.clone(),
                     self_type: block.self_type,
                     block: None,
-                });
+                })));
                 if block.required {
                     proc_ty
                 } else {
@@ -8514,7 +8532,7 @@ impl<'env> TypeChecker<'env> {
         if let Some(ty) = self.pure_call_cached(key.as_ref()) {
             return ty;
         }
-        let resolved = ResolvedCall::resolve(self, call, OwnKey::Built(key));
+        let resolved = ResolvedCall::resolve(self, call, OwnKey::Built(key), DispatchSite::Probe);
         self.infer_call_return_type(call, hint, &resolved)
     }
 
@@ -8680,8 +8698,8 @@ impl<'env> TypeChecker<'env> {
         use crate::diagnostic::{ConstantKind, Diagnostic, DiagnosticKind};
         let name_str = String::from_utf8_lossy(node.name().as_slice()).to_string();
         let generic = node.as_node();
-        let start_offset = generic.location().start_offset();
-        let end_offset = generic.location().end_offset();
+        let start_offset = generic.location().start() as usize;
+        let end_offset = generic.location().end() as usize;
         match self.try_resolve_constant_read(&name_str) {
             Some(constant) => {
                 let deprecated =
@@ -8842,8 +8860,10 @@ impl<'env> TypeChecker<'env> {
         } else {
             joined
         };
-        let location = self
-            .byte_range_to_location(path.location().start_offset(), path.location().end_offset());
+        let location = self.byte_range_to_location(
+            path.location().start() as usize,
+            path.location().end() as usize,
+        );
         self.push_diagnostic(crate::diagnostic::Diagnostic {
             scope: None,
             location,
@@ -9019,9 +9039,9 @@ impl<'env> TypeChecker<'env> {
             return ConstantPathOutcome::Malformed;
         };
         let leaf = String::from_utf8_lossy(name.as_slice()).into_owned();
-        let leaf_offset = path.name_loc().start_offset();
-        let start = path.location().start_offset();
-        let end = path.location().end_offset();
+        let leaf_offset = path.name_loc().start() as usize;
+        let start = path.location().start() as usize;
+        let end = path.location().end() as usize;
         let path_str = String::from_utf8_lossy(&self.source[start..end]).into_owned();
 
         let parent_ty = Substitution::new()
@@ -9088,8 +9108,8 @@ impl<'env> TypeChecker<'env> {
         if self.extract.is_none() {
             return;
         }
-        let start = path.location().start_offset();
-        let end = path.location().end_offset();
+        let start = path.location().start() as usize;
+        let end = path.location().end() as usize;
         match outcome {
             // Malformed prism tree (no leaf name): resolution was never
             // attempted, so the whole path is one `untyped` site. The
@@ -9475,13 +9495,13 @@ fn collect_constant_path_segments_with_offsets<'pr>(
         return false;
     };
     let child_name = String::from_utf8_lossy(name.as_slice()).to_string();
-    let child_offset = path.name_loc().start_offset();
+    let child_offset = path.name_loc().start() as usize;
 
     match path.parent() {
         Some(parent) => {
             if let Some(constant) = parent.as_constant_read_node() {
                 let parent_name = String::from_utf8_lossy(constant.name().as_slice()).to_string();
-                let parent_offset = constant.location().start_offset();
+                let parent_offset = constant.location().start() as usize;
                 out.push((parent_name, parent_offset));
                 out.push((child_name, child_offset));
                 true
@@ -9669,7 +9689,10 @@ pub(super) fn resolve_cvar_at_self(checker: &TypeChecker<'_>, var_sym: Symbol) -
 /// register a declared method or mixin. The statement-position
 /// assertion gate must not treat the CallNode's return type as a
 /// natural for `FalseAssertion`, since Steep parses these as
-/// declaration nodes rather than calls.
+/// declaration nodes rather than calls. A visibility modifier wrapping
+/// an attr (`private attr_reader :x #: T`) is the same declaration: the
+/// collector reads the `#: T` off the attr call, which ends where the
+/// wrapper does.
 fn is_inline_declaration_call_stmt<'pr>(stmt: &Node<'pr>) -> bool {
     let Some(call) = stmt.as_call_node() else {
         return false;
@@ -9677,10 +9700,22 @@ fn is_inline_declaration_call_stmt<'pr>(stmt: &Node<'pr>) -> bool {
     if call.receiver().is_some() {
         return false;
     }
-    matches!(
-        call.name().as_slice(),
-        b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"include" | b"extend" | b"prepend"
-    )
+    match call.name().as_slice() {
+        b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"include" | b"extend"
+        | b"prepend" => true,
+        b"private" | b"public" | b"protected" => call
+            .arguments()
+            .and_then(|args| args.arguments().iter().last())
+            .and_then(|arg| arg.as_call_node())
+            .is_some_and(|attr| {
+                attr.receiver().is_none()
+                    && matches!(
+                        attr.name().as_slice(),
+                        b"attr_reader" | b"attr_writer" | b"attr_accessor"
+                    )
+            }),
+        _ => false,
+    }
 }
 
 pub(super) fn is_statement_assertion_eligible<'pr>(stmt: &Node<'pr>) -> bool {

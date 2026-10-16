@@ -4,7 +4,7 @@ use crate::name::Symbol;
 use crate::substitution::Substitution;
 use crate::type_name::TypeName;
 use crate::type_param::TypeVarKey;
-use crate::types::{Block, FunctionType, Literal, RecordKey, Ty, Type};
+use crate::types::{Block, FunctionType, Literal, ProcType, RecordKey, Ty, Type};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
@@ -525,28 +525,24 @@ impl<'a> SubtypeChecker<'a> {
             return false;
         }
 
-        if let (Type::Proc { .. }, Type::ClassInstance { name: _, args: _ }) =
-            (&sub_type, &sup_type)
-        {
+        if let (Type::Proc(..), Type::ClassInstance { name: _, args: _ }) = (&sub_type, &sup_type) {
             let proc_instance = self
                 .env
                 .class_instance_type(self.env.names().builtins().proc);
             return self.check(proc_instance, sup);
         }
 
-        if let (
-            Type::Proc {
+        if let (Type::Proc(sub_p), Type::Proc(sup_p)) = (&sub_type, &sup_type) {
+            let ProcType {
                 type_: sub_ft,
                 self_type: sub_self,
                 block: sub_block,
-            },
-            Type::Proc {
+            } = &**sub_p;
+            let ProcType {
                 type_: sup_ft,
                 self_type: sup_self,
                 block: sup_block,
-            },
-        ) = (&sub_type, &sup_type)
-        {
+            } = &**sup_p;
             return self.check_proc(sub_ft, sub_self, sub_block, sup_ft, sup_self, sup_block);
         }
 

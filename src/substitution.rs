@@ -12,7 +12,8 @@ use rustc_hash::FxHashMap;
 
 use crate::type_param::TypeVarKey;
 use crate::types::{
-    Block, Function, FunctionType, MethodType, RecordKey, Ty, Type, TypeTable, UntypedFunction,
+    Block, Function, FunctionType, MethodType, ProcType, RecordKey, Ty, Type, TypeTable,
+    UntypedFunction,
 };
 
 /// Port of `RBS::Substitution`.
@@ -117,19 +118,20 @@ impl Substitution {
                     .collect();
                 types.intern(Type::Record { fields: new_fields })
             }
-            Type::Proc {
-                type_,
-                self_type,
-                block,
-            } => {
+            Type::Proc(p) => {
+                let ProcType {
+                    type_,
+                    self_type,
+                    block,
+                } = &**p;
                 let new_type = self.apply_function_type(type_, types);
                 let new_self = self_type.map(|st| self.apply(st, types));
                 let new_block = block.as_ref().map(|b| self.apply_block(b, types));
-                types.intern(Type::Proc {
+                types.intern(Type::Proc(Box::new(ProcType {
                     type_: new_type,
                     self_type: new_self,
                     block: new_block,
-                })
+                })))
             }
             _ => ty,
         }

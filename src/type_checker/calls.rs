@@ -16,7 +16,7 @@ use crate::types::{
 };
 
 use super::method_resolver;
-use super::{ArgSpan, CallArguments, CallTarget, SplatTail, TypeChecker, arg_span};
+use super::{ArgSpan, CallArguments, CallTarget, DispatchSite, SplatTail, TypeChecker, arg_span};
 
 /// `(keyword name, value type)` per Symbol key of a Record-typed `**h`
 /// (`TypeChecker::kwsplat_record_keys`).
@@ -230,9 +230,10 @@ impl ResolvedCall {
         checker: &TypeChecker<'env>,
         call: &CallNode<'pr>,
         own_key: OwnKey,
+        site: DispatchSite,
     ) -> Self {
         let receiver_ty = checker.infer_receiver_type(call, own_key);
-        let target = checker.resolve_call_target(call, receiver_ty);
+        let target = checker.resolve_call_target(call, receiver_ty, site);
         Self {
             target,
             receiver_ty,
@@ -425,8 +426,9 @@ impl<'env> TypeChecker<'env> {
         call: &CallNode<'pr>,
         own_key: OwnKey,
     ) -> ResolvedCall {
+        let site = DispatchSite::Record(call_node_span(call));
         let Some(receiver) = call.receiver() else {
-            return ResolvedCall::resolve(self, call, own_key);
+            return ResolvedCall::resolve(self, call, own_key, site);
         };
         let receiver_ty = if let Some(inner) = receiver.as_call_node() {
             // Extract-mode hand-off: the receiver call's record gets the
@@ -437,7 +439,7 @@ impl<'env> TypeChecker<'env> {
             let carry = self.extract.is_some()
                 && !call.is_safe_navigation()
                 && self
-                    .trailing_node_assertion_adjacent(receiver.location().end_offset())
+                    .trailing_node_assertion_adjacent(receiver.location().end() as usize)
                     .is_none();
             let inner_key = self.receiver_pure_key(call, own_key);
             let natural = self.walk_receiver_call(&inner, carry, inner_key);
@@ -462,7 +464,7 @@ impl<'env> TypeChecker<'env> {
         // (`(\n a = 1\n a #: T\n).m`) once that statement has actually
         // executed via the walk.
         self.apply_receiver_assertion_gate(&receiver);
-        let target = self.resolve_call_target(call, receiver_ty);
+        let target = self.resolve_call_target(call, receiver_ty, site);
         ResolvedCall {
             target,
             receiver_ty,
@@ -486,7 +488,7 @@ impl<'env> TypeChecker<'env> {
         let cached = self.pure_call_cached(key.as_ref());
         let resolved = self.resolve_call_in_check(call, OwnKey::Built(key));
         let ty = self.check_call_and_infer(call, None, &resolved, cached);
-        self.record_extract_call_site(call, &resolved, carry.then_some(ty));
+        self.record_extract_call_site(call, carry.then_some(ty));
         ty
     }
 
@@ -510,17 +512,14 @@ impl<'env> TypeChecker<'env> {
         let cached = self.pure_call_cached(key.as_ref());
         let resolved = self.resolve_call_in_check(call, OwnKey::Built(key));
         let ty = self.check_call_and_infer(call, hint, &resolved, cached);
-        self.record_extract_call_site(call, &resolved, carry.then_some(ty));
+        self.record_extract_call_site(call, carry.then_some(ty));
         self.park_value(&call.as_node(), hint, ty);
     }
 
     fn park_value<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>, ty: Ty) {
         if let Some(frame) = self.call_frames.borrow_mut().last_mut() {
             frame.arguments.push(super::ArgumentValue {
-                span: (
-                    node.location().start_offset() as u32,
-                    node.location().end_offset() as u32,
-                ),
+                span: (node.location().start(), node.location().end()),
                 hint,
                 ty,
             });
@@ -534,10 +533,7 @@ impl<'env> TypeChecker<'env> {
     /// else is inferred here and, in extract mode, carried to its record
     /// point (`extract_carry_argument`).
     pub(super) fn infer_argument<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>) -> Ty {
-        let span = (
-            node.location().start_offset() as u32,
-            node.location().end_offset() as u32,
-        );
+        let span = (node.location().start(), node.location().end());
         if let Some(frame) = self.call_frames.borrow().last()
             && let Some(value) = frame
                 .arguments
@@ -551,25 +547,17 @@ impl<'env> TypeChecker<'env> {
         ty
     }
 
-    /// Extract record for a walked call site, with `return_type` the
+    /// Extract finalize for a walked call site (phase 2 of
+    /// `extract_register_dispatch`; the site was registered when
+    /// `resolve_call_in_check` dispatched it), with `return_type` the
     /// value the walk computed for it (None when no frame consumed it).
     pub(super) fn record_extract_call_site<'pr>(
         &self,
         call: &CallNode<'pr>,
-        resolved: &ResolvedCall,
         return_type: Option<Ty>,
     ) {
-        if let Some(target) = resolved.target.as_ref() {
-            self.record_extract_call(
-                call.location().start_offset(),
-                call.location().end_offset(),
-                target,
-                resolved.receiver_ty,
-                return_type,
-            );
-        } else {
-            self.record_extract_call_no_target(call, resolved.receiver_ty, return_type);
-        }
+        self.extract_finalize_dispatch(call_node_span(call), return_type);
+        self.record_extract_attr_implements(call);
     }
 
     /// Receiver type of a call currently being checked by `check_call`,
@@ -580,7 +568,10 @@ impl<'env> TypeChecker<'env> {
     /// so a body checked again with another self (concern `included`
     /// blocks) never sees a type from the previous pass.
     pub(super) fn checked_receiver_type<'pr>(&self, call: &CallNode<'pr>) -> Option<Ty> {
-        let span = (call.location().start_offset(), call.location().end_offset());
+        let span = (
+            call.location().start() as usize,
+            call.location().end() as usize,
+        );
         self.call_frames
             .borrow()
             .iter()
@@ -597,7 +588,10 @@ impl<'env> TypeChecker<'env> {
     /// Diagnostics a read-only pass can reach use this to report once,
     /// from the walk, instead of once per inference.
     pub(super) fn check_walk_types_call<'pr>(&self, call: &CallNode<'pr>) -> bool {
-        let span = (call.location().start_offset(), call.location().end_offset());
+        let span = (
+            call.location().start() as usize,
+            call.location().end() as usize,
+        );
         self.call_frames
             .borrow()
             .last()
@@ -643,8 +637,12 @@ impl<'env> TypeChecker<'env> {
 
     fn push_call_frame<'pr>(&self, node: &CallNode<'pr>, resolved: &ResolvedCall) {
         self.call_frames.borrow_mut().push(super::CallFrame {
-            span: (node.location().start_offset(), node.location().end_offset()),
+            span: (
+                node.location().start() as usize,
+                node.location().end() as usize,
+            ),
             receiver_ty: resolved.receiver_ty,
+            has_receiver: node.receiver().is_some(),
             arguments: Vec::new(),
         });
     }
@@ -731,19 +729,20 @@ impl<'env> TypeChecker<'env> {
         errored |= track_error && self.diagnostics_len() > before_block;
         if track_error && errored {
             self.extract_flag_call_state(
-                (
-                    node.location().start_offset() as u32,
-                    node.location().end_offset() as u32,
-                ),
+                (node.location().start(), node.location().end()),
                 super::ExtractCallState::Error,
             );
         }
 
         if let Some(block) = node.block() {
             let saved_concerning = self.enter_concerning_block(node);
-            if !self.walk_concern_block_body(node, &block) {
+            let saved_block_module = self.enter_extract_block_module(node, saved_concerning);
+            if !self.walk_concern_block_body(node, &block)
+                && !self.walk_class_methods_block_body(node, &block)
+            {
                 self.walk_block(&block, body_hint);
             }
+            self.extract_block_module = saved_block_module;
             self.concerning_module = saved_concerning;
         }
         if block_scope_pushed {
@@ -1028,13 +1027,13 @@ impl<'env> TypeChecker<'env> {
         // Check end line for `#[T]` (standard rbs TypeApplication).
         let end_line = self
             .line_index
-            .line(node.location().end_offset().saturating_sub(1));
+            .line((node.location().end() as usize).saturating_sub(1));
         if let Some(TrailingAnnotation::TypeApplication { range, body }) =
             self.comments.trailing_annotation(&self.source, end_line)
         {
             let gap = self
                 .source
-                .get(node.location().end_offset()..range.0 as usize);
+                .get(node.location().end() as usize..range.0 as usize);
             if gap.is_some_and(|g| g.iter().all(u8::is_ascii_whitespace))
                 && let Some(annotation) = crate::ast_builder::parse_trailing_type_application_text(
                     body,
@@ -1053,7 +1052,7 @@ impl<'env> TypeChecker<'env> {
         // (e.g. the `each` in `arr.each.with_object({}) do ... #$ T`) are skipped so
         // that only the block-owning call (`with_object`) receives the annotation.
         let block = node.block()?;
-        let selector_line = self.line_index.line(node.message_loc()?.start_offset());
+        let selector_line = self.line_index.line(node.message_loc()?.start() as usize);
         let TrailingAnnotation::DollarTypeApplication { range, body } = self
             .comments
             .trailing_annotation(&self.source, selector_line)?
@@ -1075,10 +1074,10 @@ impl<'env> TypeChecker<'env> {
         if let Some(block_node) = block.as_block_node() {
             let is_brace = self
                 .source
-                .get(block_node.opening_loc().start_offset())
+                .get(block_node.opening_loc().start() as usize)
                 .is_some_and(|&b| b == b'{');
             if is_brace {
-                let call_end = node.location().end_offset();
+                let call_end = node.location().end() as usize;
                 if range.0 as usize > call_end {
                     let gap = self.source.get(call_end..range.0 as usize);
                     if !gap.is_some_and(|g| g.iter().all(u8::is_ascii_whitespace)) {
@@ -1228,13 +1227,7 @@ impl<'env> TypeChecker<'env> {
     /// extract mode.
     fn extract_carry_argument<'pr>(&self, arg: &Node<'pr>, ty: Ty) {
         if self.extract_carry_armed.get() && arg.as_call_node().is_some() {
-            self.extract_carry_type(
-                (
-                    arg.location().start_offset() as u32,
-                    arg.location().end_offset() as u32,
-                ),
-                ty,
-            );
+            self.extract_carry_type((arg.location().start(), arg.location().end()), ty);
         }
     }
 
@@ -1284,15 +1277,18 @@ impl<'env> TypeChecker<'env> {
                             let name = String::from_utf8_lossy(sym.unescaped()).to_string();
                             let value = assoc.value();
                             let value_type = self.infer_argument(&value, None);
-                            let key_location = sym.value_loc().unwrap_or_else(|| sym.location());
+                            let key_location = sym.content_loc();
                             keywords.push((
                                 name,
                                 value_type,
                                 arg_span(
-                                    assoc.location().start_offset(),
-                                    assoc.location().end_offset(),
+                                    assoc.location().start() as usize,
+                                    assoc.location().end() as usize,
                                 ),
-                                arg_span(key_location.start_offset(), key_location.end_offset()),
+                                arg_span(
+                                    key_location.start() as usize,
+                                    key_location.end() as usize,
+                                ),
                             ));
                         } else {
                             let value = assoc.value();
@@ -1302,8 +1298,8 @@ impl<'env> TypeChecker<'env> {
                                 key_type,
                                 value_type,
                                 arg_span(
-                                    assoc.location().start_offset(),
-                                    assoc.location().end_offset(),
+                                    assoc.location().start() as usize,
+                                    assoc.location().end() as usize,
                                 ),
                             ));
                         }
@@ -1312,8 +1308,8 @@ impl<'env> TypeChecker<'env> {
                         kwsplats.push((
                             value_type,
                             arg_span(
-                                splat.location().start_offset(),
-                                splat.location().end_offset(),
+                                splat.location().start() as usize,
+                                splat.location().end() as usize,
                             ),
                         ));
                     }
@@ -1332,8 +1328,8 @@ impl<'env> TypeChecker<'env> {
                     splat_tail = Some(SplatTail {
                         element_ty: Ty::UNTYPED,
                         span: arg_span(
-                            splat.location().start_offset(),
-                            splat.location().end_offset(),
+                            splat.location().start() as usize,
+                            splat.location().end() as usize,
                         ),
                     });
                 }
@@ -1343,20 +1339,23 @@ impl<'env> TypeChecker<'env> {
             } else if unexpandable_seen {
                 splat_tail = Some(SplatTail {
                     element_ty: Ty::UNTYPED,
-                    span: arg_span(arg.location().start_offset(), arg.location().end_offset()),
+                    span: arg_span(
+                        arg.location().start() as usize,
+                        arg.location().end() as usize,
+                    ),
                 });
                 let arg_ty = self.infer_argument(&arg, None);
                 positional.push(arg_ty);
                 positional_spans.push(arg_span(
-                    arg.location().start_offset(),
-                    arg.location().end_offset(),
+                    arg.location().start() as usize,
+                    arg.location().end() as usize,
                 ));
             } else {
                 let arg_ty = self.infer_argument(&arg, None);
                 positional.push(arg_ty);
                 positional_spans.push(arg_span(
-                    arg.location().start_offset(),
-                    arg.location().end_offset(),
+                    arg.location().start() as usize,
+                    arg.location().end() as usize,
                 ));
             }
         }
@@ -1407,8 +1406,8 @@ impl<'env> TypeChecker<'env> {
         F: FnMut(&Self, usize, &Node<'pr>) -> Ty,
     {
         let splat_span = arg_span(
-            splat.location().start_offset(),
-            splat.location().end_offset(),
+            splat.location().start() as usize,
+            splat.location().end() as usize,
         );
         let Some(expr) = splat.expression() else {
             *splat_tail = Some(SplatTail {
@@ -1426,8 +1425,8 @@ impl<'env> TypeChecker<'env> {
                     let ty = infer_elem(self, idx, el);
                     positional.push(ty);
                     positional_spans.push(arg_span(
-                        el.location().start_offset(),
-                        el.location().end_offset(),
+                        el.location().start() as usize,
+                        el.location().end() as usize,
                     ));
                 }
                 return;
@@ -1531,15 +1530,18 @@ impl<'env> TypeChecker<'env> {
                             let hint = overload.and_then(|o| o.keyword_param_for_call(&name));
                             let value = assoc.value();
                             let value_type = self.infer_argument(&value, hint);
-                            let key_location = sym.value_loc().unwrap_or_else(|| sym.location());
+                            let key_location = sym.content_loc();
                             keywords.push((
                                 name,
                                 value_type,
                                 arg_span(
-                                    assoc.location().start_offset(),
-                                    assoc.location().end_offset(),
+                                    assoc.location().start() as usize,
+                                    assoc.location().end() as usize,
                                 ),
-                                arg_span(key_location.start_offset(), key_location.end_offset()),
+                                arg_span(
+                                    key_location.start() as usize,
+                                    key_location.end() as usize,
+                                ),
                             ));
                         } else {
                             let value = assoc.value();
@@ -1549,8 +1551,8 @@ impl<'env> TypeChecker<'env> {
                                 key_type,
                                 value_type,
                                 arg_span(
-                                    assoc.location().start_offset(),
-                                    assoc.location().end_offset(),
+                                    assoc.location().start() as usize,
+                                    assoc.location().end() as usize,
                                 ),
                             ));
                         }
@@ -1559,8 +1561,8 @@ impl<'env> TypeChecker<'env> {
                         kwsplats.push((
                             value_type,
                             arg_span(
-                                splat.location().start_offset(),
-                                splat.location().end_offset(),
+                                splat.location().start() as usize,
+                                splat.location().end() as usize,
                             ),
                         ));
                     }
@@ -1599,8 +1601,8 @@ impl<'env> TypeChecker<'env> {
                     splat_tail = Some(SplatTail {
                         element_ty: Ty::UNTYPED,
                         span: arg_span(
-                            splat.location().start_offset(),
-                            splat.location().end_offset(),
+                            splat.location().start() as usize,
+                            splat.location().end() as usize,
                         ),
                     });
                 }
@@ -1611,15 +1613,18 @@ impl<'env> TypeChecker<'env> {
             } else if unexpandable_seen {
                 splat_tail = Some(SplatTail {
                     element_ty: Ty::UNTYPED,
-                    span: arg_span(arg.location().start_offset(), arg.location().end_offset()),
+                    span: arg_span(
+                        arg.location().start() as usize,
+                        arg.location().end() as usize,
+                    ),
                 });
                 let hint = overload
                     .and_then(|o| o.positional_param_for_call(positional_index, positional_count));
                 let ty = self.infer_argument(&arg, hint);
                 positional.push(ty);
                 positional_spans.push(arg_span(
-                    arg.location().start_offset(),
-                    arg.location().end_offset(),
+                    arg.location().start() as usize,
+                    arg.location().end() as usize,
                 ));
                 positional_index += 1;
             } else {
@@ -1628,8 +1633,8 @@ impl<'env> TypeChecker<'env> {
                 let ty = self.infer_argument(&arg, hint);
                 positional.push(ty);
                 positional_spans.push(arg_span(
-                    arg.location().start_offset(),
-                    arg.location().end_offset(),
+                    arg.location().start() as usize,
+                    arg.location().end() as usize,
                 ));
                 positional_index += 1;
             }
@@ -1675,8 +1680,8 @@ impl<'env> TypeChecker<'env> {
             positional: func.required_positionals.clone(),
             positional_spans: vec![
                 arg_span(
-                    first.location().start_offset(),
-                    first.location().end_offset(),
+                    first.location().start() as usize,
+                    first.location().end() as usize,
                 );
                 func.required_positionals.len()
             ],
@@ -1864,21 +1869,40 @@ impl<'env> TypeChecker<'env> {
         &self,
         node: &CallNode<'pr>,
         receiver_type: Ty,
+        site: DispatchSite,
     ) -> Option<CallTarget> {
         let method_name = String::from_utf8_lossy(node.name().as_slice());
-        self.resolve_call_target_at(receiver_type, &method_name)
+        self.resolve_call_target_at(receiver_type, &method_name, site)
     }
 
     /// CallNode-free core of `resolve_call_target`: dispatches on
     /// `(receiver_type, method_name)` alone, so synthetic call sites
-    /// without a Prism `CallNode` (`x += rhs` ≡ `x = x.+(rhs)`) reuse the
-    /// same target-resolution rules — alias peel, sugar widen, per-component
-    /// union dispatch, block-shape survival.
+    /// without a Prism `CallNode` (`x += rhs` ≡ `x = x.+(rhs)`) and the
+    /// `&:sym` block pass reuse the same target-resolution rules — alias
+    /// peel, sugar widen, per-component union dispatch, block-shape
+    /// survival.
+    ///
+    /// This is the dispatch entry: every method the check resolves in
+    /// order to type-check a call comes through here (clippy
+    /// `disallowed_methods` keeps `lookup_method` out of the other
+    /// paths), and a `DispatchSite::Record` registers the site for
+    /// `crema extract` before the result is returned, resolved or not.
     pub(super) fn resolve_call_target_at(
         &self,
         receiver_type: Ty,
         method_name: &str,
+        site: DispatchSite,
     ) -> Option<CallTarget> {
+        let target = self.lookup_call_target(receiver_type, method_name);
+        if let DispatchSite::Record(span) = site {
+            self.extract_register_dispatch(span, method_name, receiver_type, target.as_ref());
+        }
+        target
+    }
+
+    /// The resolution rules of `resolve_call_target_at`, without the
+    /// extract registration. Only that entry calls this.
+    fn lookup_call_target(&self, receiver_type: Ty, method_name: &str) -> Option<CallTarget> {
         let lookup_type = self.concrete_self_for_lookup(receiver_type);
         if lookup_type.is_untyped() {
             return None;
@@ -1910,6 +1934,7 @@ impl<'env> TypeChecker<'env> {
         if let Type::Union(members) = self.env.types().resolve(lookup_type) {
             let mut components = Vec::with_capacity(members.len());
             for &member in members {
+                #[allow(clippy::disallowed_methods)] // the dispatch entry itself
                 let resolved = method_resolver::lookup_method(self.env, member, method_name_n)?;
                 components.push(super::UnionComponent {
                     method_def: resolved.method,
@@ -1931,6 +1956,7 @@ impl<'env> TypeChecker<'env> {
             });
         }
 
+        #[allow(clippy::disallowed_methods)] // the dispatch entry itself
         let resolved = method_resolver::lookup_method(self.env, lookup_type, method_name_n)?;
 
         Some(CallTarget::Method {
@@ -1943,7 +1969,7 @@ impl<'env> TypeChecker<'env> {
     /// Argument / block diagnostics for one resolved call. No `hint`
     /// parameter: the diagnostic logic never read one — it existed only
     /// for the removed extract-mode occurrence-type thunk (recording now
-    /// happens at the walk entries; see `record_extract_call`).
+    /// happens at the walk entries; see `extract_finalize_dispatch`).
     pub(super) fn check_call_arguments<'pr>(
         &mut self,
         node: &CallNode<'pr>,
@@ -1958,10 +1984,7 @@ impl<'env> TypeChecker<'env> {
         // helper chain (`check_against_method_def`,
         // `check_forwarding_call`, `check_union_call_arguments`)
         // forwards the span and lifts it lazily in its own emit sites.
-        let loc_span: ArgSpan = (
-            node.location().start_offset() as u32,
-            node.location().end_offset() as u32,
-        );
+        let loc_span: ArgSpan = (node.location().start(), node.location().end());
 
         // `receiver_type` is threaded in from `ResolvedCall::resolve`, which
         // already inferred it (`calls.rs` `ResolvedCall::resolve`). Inferring
@@ -2019,7 +2042,7 @@ impl<'env> TypeChecker<'env> {
         // The extract-mode record is NOT pushed here: its `return_type`
         // field is the check's own answer for the site, which the two
         // walk entries (`check_node`'s CallNode arm / `visit_call_node`)
-        // know — this helper does not. See `record_extract_call`.
+        // know — this helper does not. See `extract_finalize_dispatch`.
 
         if let CallTarget::UnionMethod {
             method_name,
@@ -2064,11 +2087,11 @@ impl<'env> TypeChecker<'env> {
             let name_location = if let Some(message_loc) = node.message_loc() {
                 let end_offset = if node.opening_loc().is_none() {
                     node.equal_loc()
-                        .map_or(message_loc.end_offset(), |eq| eq.end_offset())
+                        .map_or(message_loc.end() as usize, |eq| eq.end() as usize)
                 } else {
-                    message_loc.end_offset()
+                    message_loc.end() as usize
                 };
-                self.byte_range_to_location(message_loc.start_offset(), end_offset)
+                self.byte_range_to_location(message_loc.start() as usize, end_offset)
             } else {
                 self.span_to_location(loc_span)
             };
@@ -2287,7 +2310,7 @@ impl<'env> TypeChecker<'env> {
             // Mirror `emit_unexpected_super_if_unresolvable`: module methods
             // defer super resolution to the include site, so stay silent.
             if has_rbs_decl && !self.is_inside_module_definition() {
-                let position = self.offset_to_location(node.location().start_offset());
+                let position = self.offset_to_location(node.location().start() as usize);
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location: position,
@@ -2311,10 +2334,7 @@ impl<'env> TypeChecker<'env> {
         // block-clause checks below), excluding the child-subtree
         // visits in between.
         let track_error = self.extract.is_some();
-        let super_span = (
-            node.location().start_offset() as u32,
-            node.location().end_offset() as u32,
-        );
+        let super_span = (node.location().start(), node.location().end());
         let before = if track_error {
             self.diagnostics_len()
         } else {
@@ -2329,7 +2349,7 @@ impl<'env> TypeChecker<'env> {
         // span anchored at the call's start. Preserves the diagnostic
         // location bytes (start_byte == end_byte) the super-arg path has
         // emitted historically.
-        let start_byte = node.location().start_offset() as u32;
+        let start_byte = node.location().start();
         let span = (start_byte, start_byte);
         self.check_against_method_def(
             span,
@@ -2415,10 +2435,7 @@ impl<'env> TypeChecker<'env> {
         self.setup_block_scope(site, target_ref, None);
         self.check_block(site, target_ref, None);
         if track_error && self.diagnostics_len() > before {
-            let span = (
-                node.location().start_offset() as u32,
-                node.location().end_offset() as u32,
-            );
+            let span = (node.location().start(), node.location().end());
             self.extract_flag_call_state(span, super::ExtractCallState::Error);
         }
         self.walk_block(&block.as_node(), None);
@@ -2714,8 +2731,8 @@ impl<'env> TypeChecker<'env> {
                         splat_tail = Some(SplatTail {
                             element_ty: Ty::UNTYPED,
                             span: arg_span(
-                                arg.location().start_offset(),
-                                arg.location().end_offset(),
+                                arg.location().start() as usize,
+                                arg.location().end() as usize,
                             ),
                         });
                     }
@@ -3116,7 +3133,7 @@ impl<'env> TypeChecker<'env> {
                 _ => method_name.to_string(),
             }
         };
-        let location = self.offset_to_location(site.location().start_offset());
+        let location = self.offset_to_location(site.location().start() as usize);
 
         for violation in violations {
             // BoundViolation carries the raw RBS-written name as a Symbol
@@ -3152,15 +3169,15 @@ impl<'env> TypeChecker<'env> {
             // reconstruct `[]=` and only pulls in an unrelated `=` token.
             let end_offset = if node.opening_loc().is_none() {
                 node.equal_loc()
-                    .map_or(message_loc.end_offset(), |eq| eq.end_offset())
+                    .map_or(message_loc.end() as usize, |eq| eq.end() as usize)
             } else {
-                message_loc.end_offset()
+                message_loc.end() as usize
             };
-            self.byte_range_to_location(message_loc.start_offset(), end_offset)
+            self.byte_range_to_location(message_loc.start() as usize, end_offset)
         } else {
             self.byte_range_to_location(
-                node.location().start_offset(),
-                node.location().end_offset(),
+                node.location().start() as usize,
+                node.location().end() as usize,
             )
         };
         // Re-concretize a `self` receiver inside `check_no_method_at`: NoMethod
@@ -3376,7 +3393,11 @@ impl<'env> TypeChecker<'env> {
                     return;
                 }
             }
-            match method_resolver::lookup_method(self.env, member, method_sym) {
+            // NoMethod detail for a union the entry already failed to
+            // dispatch: which members lack the method. Not a dispatch.
+            #[allow(clippy::disallowed_methods)]
+            let member_lookup = method_resolver::lookup_method(self.env, member, method_sym);
+            match member_lookup {
                 None => missing_from.push(self.display_type(member)),
                 Some(resolved) => methods.push(resolved.method),
             }
@@ -3475,27 +3496,30 @@ impl<'env> TypeChecker<'env> {
         arg_types: Vec<Ty>,
         name_location: SourceLocation,
     ) -> Ty {
-        let Some(target) = self.resolve_call_target_at(receiver_type, method_name) else {
-            self.check_no_method_at(receiver_type, method_name, name_location);
-            return Ty::UNTYPED;
-        };
-
         // Synthetic operator calls (`x += rhs`) carry only a pre-built name
         // `SourceLocation`, whose byte fields are already `u32` — read them
         // directly rather than routing through `arg_span` (which takes the
         // `usize` Prism offsets the real-call paths start from).
         let name_span: ArgSpan = (name_location.range.start_byte, name_location.range.end_byte);
 
-        // The synthetic dispatch is recorded for `crema extract`
-        // occurrences — a `h[k] ||= v` really runs `[]` and `[]=`, so
-        // reference consumers must see both. The speculative siblings
-        // (`resolve_synthetic_*` / `infer_synthetic_method_return_type`)
-        // never reach here, so no duplicate records from value-position
-        // inference. Extract occurrence is recorded after the match below, with the
-        // return type the check itself computes there — extract runs no
-        // inference of its own. The clone is behind the extract gate so
-        // the plain check path pays nothing.
-        let extract_target = self.extract.as_ref().map(|_| target.clone());
+        // The synthetic dispatch is recorded for `crema extract` — a
+        // `h[k] ||= v` really runs `[]` and `[]=`, so reference consumers
+        // must see both. The read-only sibling
+        // (`infer_synthetic_method_return_type`) probes without
+        // registering, so value-position inference adds no record. An
+        // unresolved synthetic site is registered and finalized without a
+        // record (no flag): only real call sites feed the `untyped` state.
+        let Some(target) = self.resolve_call_target_at(
+            receiver_type,
+            method_name,
+            DispatchSite::Record(name_span),
+        ) else {
+            self.check_no_method_at(receiver_type, method_name, name_location);
+            self.extract_finalize_dispatch(name_span, None);
+            return Ty::UNTYPED;
+        };
+
+        let track_error = self.extract.is_some();
 
         let positional_spans = vec![name_span; arg_types.len()];
         let arguments = CallArguments {
@@ -3514,7 +3538,7 @@ impl<'env> TypeChecker<'env> {
         // this synthetic call's own diagnostics (no child subtree is
         // visited), so a single delta suffices. Gated to keep the
         // default check path borrow-free.
-        let before = if extract_target.is_some() {
+        let before = if track_error {
             self.diagnostics_len()
         } else {
             0
@@ -3636,18 +3660,10 @@ impl<'env> TypeChecker<'env> {
                 }
             }
         };
-        if let Some(t) = extract_target {
-            if self.diagnostics_len() > before {
-                self.extract_flag_call_state(name_span, super::ExtractCallState::Error);
-            }
-            self.record_extract_call(
-                name_span.0 as usize,
-                name_span.1 as usize,
-                &t,
-                receiver_type,
-                Some(ret),
-            );
+        if track_error && self.diagnostics_len() > before {
+            self.extract_flag_call_state(name_span, super::ExtractCallState::Error);
         }
+        self.extract_finalize_dispatch(name_span, Some(ret));
         ret
     }
 
@@ -3671,7 +3687,9 @@ impl<'env> TypeChecker<'env> {
         method_name: &str,
         arg_types: Vec<Ty>,
     ) -> Ty {
-        let Some(target) = self.resolve_call_target_at(receiver_type, method_name) else {
+        let Some(target) =
+            self.resolve_call_target_at(receiver_type, method_name, DispatchSite::Probe)
+        else {
             return Ty::UNTYPED;
         };
         let positional_spans = vec![arg_span(0, 0); arg_types.len()];
@@ -3737,28 +3755,26 @@ impl<'env> TypeChecker<'env> {
         arg_node: &Node<'pr>,
         name_location: SourceLocation,
     ) -> Ty {
-        let Some(target) = self.resolve_call_target_at(receiver_type, method_name) else {
-            self.check_no_method_at(receiver_type, method_name, name_location);
+        let location = name_location;
+        let record_span = (location.range.start_byte, location.range.end_byte);
+        let Some(target) = self.resolve_call_target_at(
+            receiver_type,
+            method_name,
+            DispatchSite::Record(record_span),
+        ) else {
+            self.check_no_method_at(receiver_type, method_name, location);
+            self.extract_finalize_dispatch(record_span, None);
             return Ty::UNTYPED;
         };
 
-        let location = name_location;
-        // Extract occurrence for the union arm is recorded after the
-        // match below, with the return type the check computes there —
-        // extract runs no inference of its own. The Method arm
-        // delegates to `check_synthetic_method_call`, which records the
-        // site itself. Clone behind the extract gate: plain check pays
-        // nothing.
-        let extract_target = match &target {
-            CallTarget::UnionMethod { .. } => self.extract.as_ref().map(|_| target.clone()),
-            _ => None,
-        };
-        let record_span = (location.range.start_byte, location.range.end_byte);
-        // Extract-mode `error` attribution for the union arm (the
+        // Extract: the union arm finalizes the site after the match
+        // below, with the return type the check computes there. The
         // Method arm delegates to `check_synthetic_method_call`, which
-        // flags and records itself under the same span). Gated to keep
-        // the default check path borrow-free.
-        let before = if extract_target.is_some() {
+        // re-registers the same span, flags and finalizes it itself; the
+        // finalize at the end is then a no-op. Gated to keep the default
+        // check path borrow-free.
+        let track_error = self.extract.is_some();
+        let before = if track_error {
             self.diagnostics_len()
         } else {
             0
@@ -3828,18 +3844,10 @@ impl<'env> TypeChecker<'env> {
                 }
             }
         };
-        if let Some(t) = extract_target {
-            if self.diagnostics_len() > before {
-                self.extract_flag_call_state(record_span, super::ExtractCallState::Error);
-            }
-            self.record_extract_call(
-                record_span.0 as usize,
-                record_span.1 as usize,
-                &t,
-                receiver_type,
-                Some(ret),
-            );
+        if track_error && self.diagnostics_len() > before {
+            self.extract_flag_call_state(record_span, super::ExtractCallState::Error);
         }
+        self.extract_finalize_dispatch(record_span, Some(ret));
         ret
     }
 
@@ -3882,8 +3890,8 @@ impl<'env> TypeChecker<'env> {
             let arguments = CallArguments {
                 positional: vec![self.infer_type(arg_node, hint)],
                 positional_spans: vec![arg_span(
-                    arg_node.location().start_offset(),
-                    arg_node.location().end_offset(),
+                    arg_node.location().start() as usize,
+                    arg_node.location().end() as usize,
                 )],
                 keywords: vec![],
                 kwsplats: vec![],
@@ -3904,8 +3912,8 @@ impl<'env> TypeChecker<'env> {
         let fallback = CallArguments {
             positional: vec![fallback_arg_type],
             positional_spans: vec![arg_span(
-                arg_node.location().start_offset(),
-                arg_node.location().end_offset(),
+                arg_node.location().start() as usize,
+                arg_node.location().end() as usize,
             )],
             keywords: vec![],
             kwsplats: vec![],
@@ -3956,7 +3964,7 @@ impl<'env> TypeChecker<'env> {
             // Steep `proc_shape` merges in `::Proc` methods but keeps the
             // proc type as `Shape.type`, so its NoMethod names the signature
             // (`^() -> bool`) — the same as-written display every arm gets.
-            Type::Proc { .. } => self
+            Type::Proc(..) => self
                 .env
                 .class_instance_type(self.env.names().builtins().proc),
             Type::ClassInstance { .. } | Type::ClassSingleton { .. } | Type::Interface { .. } => ty,
@@ -4058,11 +4066,11 @@ impl<'env> TypeChecker<'env> {
             let name_location = if let Some(message_loc) = node.message_loc() {
                 let end_offset = if node.opening_loc().is_none() {
                     node.equal_loc()
-                        .map_or(message_loc.end_offset(), |eq| eq.end_offset())
+                        .map_or(message_loc.end() as usize, |eq| eq.end() as usize)
                 } else {
-                    message_loc.end_offset()
+                    message_loc.end() as usize
                 };
-                self.byte_range_to_location(message_loc.start_offset(), end_offset)
+                self.byte_range_to_location(message_loc.start() as usize, end_offset)
             } else {
                 self.span_to_location(loc_span)
             };
@@ -4941,58 +4949,124 @@ impl<'env> TypeChecker<'env> {
     /// `T?` / `bool` / aliases resolve as their expanded unions. The
     /// untyped / type-variable gate runs on the normalized type: an alias
     /// can expand into either.
+    ///
+    /// The method is resolved through the dispatch entry
+    /// (`resolve_call_target_at`), so a union parameter follows the
+    /// regular union rule — every component must have the method, else
+    /// the whole union is NoMethod — and the check-side caller's
+    /// `DispatchSite::Record` registers the symbol literal as an extract
+    /// site; the inference-side caller probes.
     pub(super) fn symbol_to_proc_return_type(
         &self,
         param_ty: Ty,
-        method_name: crate::name::Symbol,
+        method_name: &str,
+        site: DispatchSite,
     ) -> SymbolToProcResolution {
         let param_ty = definition_builder::normalize_receiver(self.env, param_ty);
-        if param_ty.is_untyped() || crate::types::contains_type_variable(param_ty, self.env.types())
+        // `self` stays opaque here as it did before the entry took over
+        // (the entry would substitute the current self type); widening
+        // that is a check-side change, not an extract one.
+        if param_ty.is_untyped()
+            || param_ty == Ty::SELF_TYPE
+            || crate::types::contains_type_variable(param_ty, self.env.types())
         {
             return SymbolToProcResolution::Skip;
         }
-        if let Type::Union(members) = self.env.types().resolve(param_ty) {
-            let members = members.clone();
-            let mut returns = Vec::new();
-            let mut missing = Vec::new();
-            for member in members {
-                match self.symbol_to_proc_return_type(member, method_name) {
-                    SymbolToProcResolution::Resolved(ty) => returns.push(ty),
-                    SymbolToProcResolution::NoMethod { missing: m } => missing.extend(m),
-                    SymbolToProcResolution::Skip => return SymbolToProcResolution::Skip,
+        match self.resolve_call_target_at(param_ty, method_name, site) {
+            Some(CallTarget::Method {
+                method_def,
+                bindings,
+                ..
+            }) => match self.symbol_to_proc_arg_free_return(&method_def, bindings, param_ty) {
+                Some(ty) => SymbolToProcResolution::Resolved(ty),
+                None => SymbolToProcResolution::Skip,
+            },
+            Some(CallTarget::UnionMethod { components, .. }) => {
+                let mut returns = Vec::with_capacity(components.len());
+                for c in components {
+                    let Some(ty) = self.symbol_to_proc_arg_free_return(
+                        &c.method_def,
+                        c.bindings,
+                        c.receiver_type,
+                    ) else {
+                        return SymbolToProcResolution::Skip;
+                    };
+                    returns.push(ty);
                 }
+                SymbolToProcResolution::Resolved(crate::types::union_of_many(
+                    &returns,
+                    self.env.types(),
+                ))
             }
-            if !missing.is_empty() {
-                return SymbolToProcResolution::NoMethod { missing };
+            None => self.symbol_to_proc_missing(param_ty, method_name),
+        }
+    }
+
+    /// Per-member outcome for a `&:sym` parameter type the dispatch entry
+    /// failed on, with the precedence the pre-entry resolver had: a
+    /// member the entry cannot answer for (untyped, type variable, a
+    /// receiver kind `lookup_method` does not handle — the NoMethod
+    /// receiver classifier decides) or a member whose method needs
+    /// arguments silences the whole site (`Skip`); otherwise the members
+    /// lacking the method are the NoMethod detail, and a union whose
+    /// members all have the method but whose block clauses fail to
+    /// combine (the entry's block-survival drop) still yields the joined
+    /// return. Not a dispatch: the entry already performed it, and the
+    /// site is registered by then.
+    #[allow(clippy::disallowed_methods)]
+    fn symbol_to_proc_missing(&self, param_ty: Ty, method_name: &str) -> SymbolToProcResolution {
+        let method_sym = self.env.names().intern_symbol(method_name);
+        let members: Vec<Ty> = match self.env.types().resolve(param_ty) {
+            Type::Union(members) => members.clone(),
+            _ => vec![param_ty],
+        };
+        let mut missing = Vec::new();
+        let mut returns = Vec::new();
+        for member in members {
+            match method_resolver::lookup_method(self.env, member, method_sym) {
+                Some(resolved) => {
+                    let Some(ty) = self.symbol_to_proc_arg_free_return(
+                        &resolved.method,
+                        resolved.bindings,
+                        member,
+                    ) else {
+                        return SymbolToProcResolution::Skip;
+                    };
+                    returns.push(ty);
+                }
+                None => match self.classify_no_method_receiver(member) {
+                    NoMethodReceiverGate::Pass => missing.push(member),
+                    _ => return SymbolToProcResolution::Skip,
+                },
             }
+        }
+        if missing.is_empty() {
             return SymbolToProcResolution::Resolved(crate::types::union_of_many(
                 &returns,
                 self.env.types(),
             ));
         }
-        // `lookup_method` also returns `None` for receiver kinds it does not
-        // handle (Var, Self, Bool, ...). Gate through the NoMethod receiver
-        // classifier so only kinds the regular NoMethod path would report on
-        // produce a NoMethod here; everything else stays silent.
-        let Some(resolved) = method_resolver::lookup_method(self.env, param_ty, method_name) else {
-            return match self.classify_no_method_receiver(param_ty) {
-                NoMethodReceiverGate::Pass => SymbolToProcResolution::NoMethod {
-                    missing: vec![param_ty],
-                },
-                _ => SymbolToProcResolution::Skip,
-            };
-        };
-        let Some(arg_free) = resolved.method.method_types().find(|mt| {
+        SymbolToProcResolution::NoMethod { missing }
+    }
+
+    /// Return type of `method`'s zero-argument overload under
+    /// `receiver`'s substitution, `None` when every overload needs
+    /// arguments (Steep's Symbol#to_proc branch takes the first
+    /// arg-free overload).
+    fn symbol_to_proc_arg_free_return(
+        &self,
+        method: &crate::definition::method::Method,
+        bindings: FxHashMap<crate::type_param::TypeVarKey, Ty>,
+        receiver: Ty,
+    ) -> Option<Ty> {
+        let arg_free = method.method_types().find(|mt| {
             mt.is_untyped_function()
                 || (mt.required_positionals().is_empty()
                     && mt.required_keywords().is_empty()
                     && mt.trailing_positionals().is_empty())
-        }) else {
-            return SymbolToProcResolution::Skip;
-        };
-        let subst =
-            definition_builder::substitution_for_receiver(self.env, param_ty, resolved.bindings);
-        SymbolToProcResolution::Resolved(subst.apply(arg_free.return_type(), self.env.types()))
+        })?;
+        let subst = definition_builder::substitution_for_receiver(self.env, receiver, bindings);
+        Some(subst.apply(arg_free.return_type(), self.env.types()))
     }
 
     /// NoMethod check for a `&:sym` block pass: when the expected block takes
@@ -5000,12 +5074,18 @@ impl<'env> TypeChecker<'env> {
     /// (typed) parameter type, report `NoMethod` at the symbol. Diverges from
     /// Steep's opaque `Cannot pass a value of type ::Proc ...` wording by
     /// design — the diagnostic names the receiver type and method directly.
+    ///
+    /// The symbol literal's span is the extract site: registered by the
+    /// dispatch entry under `sym_span`, finalized here with the resolved
+    /// method's return type (the value the check hands the block), or as
+    /// `no_method_error` when the diagnostic fires, or silently when the
+    /// classifier gate suppresses it.
     fn check_symbol_to_proc_block_pass<'pr>(
         &mut self,
         node: CallSite<'_, 'pr>,
         target: &CallTarget,
         method_name: &str,
-        sym_offset: usize,
+        sym_span: (u32, u32),
         call_hint: Option<Ty>,
     ) {
         let Some(expected_block) = self.lookup_block_type(node, target, call_hint) else {
@@ -5014,20 +5094,37 @@ impl<'env> TypeChecker<'env> {
         let Some(param_ty) = symbol_to_proc_one_arg_param(&expected_block) else {
             return;
         };
-        let sym = self.env.names().intern_symbol(method_name);
-        let SymbolToProcResolution::NoMethod { missing } =
-            self.symbol_to_proc_return_type(param_ty, sym)
-        else {
-            return;
+        let resolution =
+            self.symbol_to_proc_return_type(param_ty, method_name, DispatchSite::Record(sym_span));
+        let return_type = match &resolution {
+            SymbolToProcResolution::Resolved(ty) => Some(*ty),
+            _ => None,
         };
+        if let SymbolToProcResolution::NoMethod { missing } = &resolution
+            && self.report_symbol_to_proc_no_method(param_ty, method_name, missing, sym_span)
+        {
+            self.extract_flag_call_state(sym_span, super::ExtractCallState::NoMethodError);
+        }
+        self.extract_finalize_dispatch(sym_span, return_type);
+    }
+
+    /// The NoMethod report of `check_symbol_to_proc_block_pass`; `true`
+    /// when the diagnostic was pushed.
+    fn report_symbol_to_proc_no_method(
+        &mut self,
+        param_ty: Ty,
+        method_name: &str,
+        missing: &[Ty],
+        sym_span: (u32, u32),
+    ) -> bool {
         // Union members must all pass the classifier gate, mirroring
         // `check_no_method_union_at`: partial RBS suppresses the whole report.
-        for &member in &missing {
+        for &member in missing {
             if !matches!(
                 self.classify_no_method_receiver(member),
                 NoMethodReceiverGate::Pass
             ) {
-                return;
+                return false;
             }
         }
         // Display rule of `check_no_method_at`: a top-level alias shows by
@@ -5043,7 +5140,7 @@ impl<'env> TypeChecker<'env> {
         } else {
             Vec::new()
         };
-        let location = self.offset_to_location(sym_offset);
+        let location = self.offset_to_location(sym_span.0 as usize);
         self.push_diagnostic(Diagnostic {
             scope: None,
             location,
@@ -5053,6 +5150,7 @@ impl<'env> TypeChecker<'env> {
                 missing_from,
             },
         });
+        true
     }
 
     /// Check block parameter types and return type against the RBS block type.
@@ -5068,8 +5166,8 @@ impl<'env> TypeChecker<'env> {
     ) -> Option<Ty> {
         let block_node = node.block()?;
         let target = target?;
-        if let Some((name, sym_offset)) = block_pass_symbol(&block_node) {
-            self.check_symbol_to_proc_block_pass(node, target, &name, sym_offset, call_hint);
+        if let Some((name, sym_span)) = block_pass_symbol(&block_node) {
+            self.check_symbol_to_proc_block_pass(node, target, &name, sym_span, call_hint);
             return None;
         }
         let block = block_node.as_block_node()?;
@@ -5084,7 +5182,7 @@ impl<'env> TypeChecker<'env> {
             let subtyper = self.subtyper();
             if !subtyper.check(Ty::NIL, block_return_type) {
                 let method_name = self.method_name_for_site(node);
-                let location = self.offset_to_location(block.location().start_offset());
+                let location = self.offset_to_location(block.location().start() as usize);
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location,
@@ -5127,13 +5225,7 @@ impl<'env> TypeChecker<'env> {
                 .and_then(|stmts| stmts.body().iter().last());
             let tail = tail.as_ref().unwrap_or(&body);
             if tail.as_call_node().is_some() {
-                self.extract_carry_type(
-                    (
-                        tail.location().start_offset() as u32,
-                        tail.location().end_offset() as u32,
-                    ),
-                    actual,
-                );
+                self.extract_carry_type((tail.location().start(), tail.location().end()), actual);
             }
         }
         if actual.is_untyped() {
@@ -5143,7 +5235,7 @@ impl<'env> TypeChecker<'env> {
         let subtyper = self.subtyper();
         if !subtyper.check(actual, block_return_type) {
             let method_name = self.method_name_for_site(node);
-            let location = self.offset_to_location(block.location().start_offset());
+            let location = self.offset_to_location(block.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location,
@@ -5463,7 +5555,7 @@ impl<'env> TypeChecker<'env> {
                 // typed block never passes one: `|&blk|` is nil (Ruby runtime
                 // and Steep agree). Unlike the def-side `&block` in
                 // `methods.rs` there is no Proc to synthesize.
-                if let Some(block_param) = params.block()
+                if let Some(block_param) = params.block().and_then(|b| b.as_block_parameter_node())
                     && let Some(name_id) = block_param.name()
                 {
                     let name_str = String::from_utf8_lossy(name_id.as_slice());
@@ -6597,17 +6689,22 @@ pub(super) enum SymbolToProcResolution {
 }
 
 /// If the call's block argument is a `&:sym` literal (a `BlockArgumentNode`
-/// wrapping a `SymbolNode`), return the method name and the symbol's start
-/// offset. `&var` / `&proc` and brace blocks return `None` — Steep's
+/// wrapping a `SymbolNode`), return the method name and the symbol's byte
+/// span. `&var` / `&proc` and brace blocks return `None` — Steep's
 /// Symbol#to_proc special case is literal-only.
-pub(super) fn block_pass_symbol(block_arg: &Node<'_>) -> Option<(String, usize)> {
+pub(super) fn block_pass_symbol(block_arg: &Node<'_>) -> Option<(String, (u32, u32))> {
     let pass = block_arg.as_block_argument_node()?;
     let expr = pass.expression()?;
     let sym = expr.as_symbol_node()?;
     Some((
         String::from_utf8_lossy(sym.unescaped()).to_string(),
-        expr.location().start_offset(),
+        (expr.location().start(), expr.location().end()),
     ))
+}
+
+/// Byte span of a call node: the key extract bookkeeping uses for the site.
+pub(super) fn call_node_span(call: &CallNode<'_>) -> (u32, u32) {
+    (call.location().start(), call.location().end())
 }
 
 /// Steep `one_arg?`: the expected block takes exactly one required

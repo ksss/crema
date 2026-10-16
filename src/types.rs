@@ -153,11 +153,12 @@ impl Ty {
                     format!("{{ {} }}", parts.join(", "))
                 }
             }
-            Type::Proc {
-                type_,
-                self_type,
-                block,
-            } => {
+            Type::Proc(p) => {
+                let ProcType {
+                    type_,
+                    self_type,
+                    block,
+                } = &**p;
                 let mut out = String::from("^");
                 out.push_str(&format_function_type(type_, types, names));
                 append_self_type_binding(&mut out, *self_type, types, names);
@@ -235,7 +236,6 @@ impl fmt::Debug for Ty {
 /// Internal type representation for type checking.
 /// Stored inside a `TypeTable`; external code uses `Ty` handles.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[allow(clippy::large_enum_variant)]
 pub enum Type {
     /// A class instance type, e.g. `Integer`, `Array[String]`.
     /// Mirrors `RBS::Types::ClassInstance`.
@@ -318,14 +318,12 @@ pub enum Type {
     /// here to escape the Rust keyword; the build-layer port escapes the
     /// same field as `function` instead (see ADR-0014 layer-drift notes).
     ///
-    /// `self_type` is the `[self: T]` binding when present.
-    /// `block` is a block argument attached to the proc (RBS allows procs to
-    /// declare blocks, though it is rarely used in practice).
-    Proc {
-        type_: FunctionType,
-        self_type: Option<Ty>,
-        block: Option<Block>,
-    },
+    /// The payload is boxed: it inlines two `FunctionType`s (function +
+    /// block, ~300 B) while every other variant fits in ~40 B, and `Type`
+    /// is the slot type of every `ChunkedTypeStore` chunk, so an inline
+    /// payload would be paid by every interned type. The build-layer port
+    /// boxes its `ProcType` the same way.
+    Proc(Box<ProcType>),
     /// A Tuple type, e.g. `[Integer, String]`.
     /// Mirrors `RBS::Types::Tuple`. Fixed-length heterogeneous array.
     /// Element count is part of the type identity: `[A]` and `[A, A]` are distinct.
@@ -856,6 +854,19 @@ fn merge_keywords(
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct UntypedFunction {
     pub return_type: Ty,
+}
+
+/// Payload of [`Type::Proc`]. Mirrors the fields of `RBS::Types::Proc`;
+/// the rbs field `type` is renamed `type_` here to escape the Rust keyword.
+///
+/// `self_type` is the `[self: T]` binding when present.
+/// `block` is a block argument attached to the proc (RBS allows procs to
+/// declare blocks, though it is rarely used in practice).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ProcType {
+    pub type_: FunctionType,
+    pub self_type: Option<Ty>,
+    pub block: Option<Block>,
 }
 
 /// Union of typed and untyped function types. crema-only fold:
@@ -1478,11 +1489,12 @@ pub fn fallback_unbound_type_vars_to_untyped(ty: Ty, types: &TypeTable) -> Ty {
                 .collect();
             types.intern(Type::Record { fields: new_fields })
         }
-        Type::Proc {
-            type_,
-            self_type,
-            block,
-        } => {
+        Type::Proc(p) => {
+            let ProcType {
+                type_,
+                self_type,
+                block,
+            } = &**p;
             let new_type = fallback_unbound_in_function_type(type_, types);
             let new_self = self_type.map(|st| fallback_unbound_type_vars_to_untyped(st, types));
             let new_block = block.as_ref().map(|b| Block {
@@ -1492,11 +1504,11 @@ pub fn fallback_unbound_type_vars_to_untyped(ty: Ty, types: &TypeTable) -> Ty {
                     .self_type
                     .map(|st| fallback_unbound_type_vars_to_untyped(st, types)),
             });
-            types.intern(Type::Proc {
+            types.intern(Type::Proc(Box::new(ProcType {
                 type_: new_type,
                 self_type: new_self,
                 block: new_block,
-            })
+            })))
         }
         _ => ty,
     }
@@ -1547,11 +1559,12 @@ pub fn contains_type_variable(ty: Ty, types: &TypeTable) -> bool {
         Type::Record { fields } => fields
             .iter()
             .any(|(_, t, _)| contains_type_variable(*t, types)),
-        Type::Proc {
-            type_,
-            self_type,
-            block,
-        } => {
+        Type::Proc(p) => {
+            let ProcType {
+                type_,
+                self_type,
+                block,
+            } = &**p;
             function_type_contains_type_variable(type_, types)
                 || self_type.is_some_and(|st| contains_type_variable(st, types))
                 || block.as_ref().is_some_and(|b| {
@@ -1588,7 +1601,7 @@ pub fn hole_path_len(ty: Ty, types: &TypeTable) -> Option<usize> {
         Type::Record { fields } => shortest(&mut fields.iter().map(|(_, t, _)| *t)),
         // Proc members are rare in a param union; fall back to "has a var
         // somewhere" at the shallowest depth a child can sit.
-        Type::Proc { .. } => contains_type_variable(ty, types).then_some(2),
+        Type::Proc(..) => contains_type_variable(ty, types).then_some(2),
         _ => None,
     }
 }

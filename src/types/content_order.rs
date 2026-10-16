@@ -14,7 +14,7 @@
 
 use std::cmp::Ordering;
 
-use super::{Block, Function, FunctionType, Literal, Ty, Type, TypeTable};
+use super::{Block, Function, FunctionType, Literal, ProcType, Ty, Type, TypeTable};
 use crate::type_param::{MethodKind, TypeVarScope};
 
 /// Compare two types by content. See the module docs.
@@ -48,7 +48,7 @@ fn variant_rank(ty: &Type) -> u8 {
         Type::TypeVariable { .. } => 15,
         Type::Interface { .. } => 16,
         Type::Alias { .. } => 17,
-        Type::Proc { .. } => 18,
+        Type::Proc(..) => 18,
         Type::Tuple(_) => 19,
         Type::Record { .. } => 20,
     }
@@ -73,20 +73,21 @@ fn cmp_same_variant(a: &Type, b: &Type, types: &TypeTable) -> Ordering {
         (Type::TypeVariable { raw: r1, scope: s1 }, Type::TypeVariable { raw: r2, scope: s2 }) => {
             r1.cmp(r2).then_with(|| cmp_scope(s1, s2))
         }
-        (
-            Type::Proc {
+        (Type::Proc(p1), Type::Proc(p2)) => {
+            let ProcType {
                 type_: f1,
                 self_type: s1,
                 block: b1,
-            },
-            Type::Proc {
+            } = &**p1;
+            let ProcType {
                 type_: f2,
                 self_type: s2,
                 block: b2,
-            },
-        ) => cmp_function_type(f1, f2, types)
-            .then_with(|| cmp_opt_ty(*s1, *s2, types))
-            .then_with(|| cmp_opt(b1.as_ref(), b2.as_ref(), |x, y| cmp_block(x, y, types))),
+            } = &**p2;
+            cmp_function_type(f1, f2, types)
+                .then_with(|| cmp_opt_ty(*s1, *s2, types))
+                .then_with(|| cmp_opt(b1.as_ref(), b2.as_ref(), |x, y| cmp_block(x, y, types)))
+        }
         (Type::Record { fields: f1 }, Type::Record { fields: f2 }) => {
             cmp_seq(f1, f2, |(k1, t1, r1), (k2, t2, r2)| {
                 k1.cmp(k2)

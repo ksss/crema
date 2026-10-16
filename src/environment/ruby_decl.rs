@@ -18,8 +18,9 @@ use crate::ast_builder;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::environment::DeclOrigin;
 use crate::environment::draft::{
-    BuildError, ClassAliasDraft, ClassDeclarationDraft, ClassOrModuleDraft,
-    Context as DraftContext, EnvironmentDraft, ModuleDeclarationDraft,
+    BuildError, ClassAliasDraft, ClassDeclarationDraft, ClassOrModuleDraft, ConstantSource,
+    Context as DraftContext, DeclKind, EnvironmentDraft, ModuleDeclarationDraft,
+    duplicated_declaration_detail,
 };
 use crate::location::{LocationRange, SourceLocation};
 use crate::name::NameTable;
@@ -87,6 +88,7 @@ impl EnvironmentDraft {
             Declaration::Class(class_decl) => {
                 let name_raw = class_decl.class_name;
                 let conflicting_source = self.conflicting_constant_source(name_raw);
+                let kind = self.existing_decl_kind(name_raw).unwrap_or(DeclKind::Class);
                 if let Err(err) = self.insert_ruby_class_decl(
                     file_name,
                     Arc::clone(&draft_ctx),
@@ -95,6 +97,7 @@ impl EnvironmentDraft {
                 ) {
                     push_build_error_diagnostic(
                         err,
+                        kind,
                         &self.names,
                         &mut ctx,
                         Some(class_decl.name_location),
@@ -108,6 +111,9 @@ impl EnvironmentDraft {
             Declaration::Module(module_decl) => {
                 let name_raw = module_decl.module_name;
                 let conflicting_source = self.conflicting_constant_source(name_raw);
+                let kind = self
+                    .existing_decl_kind(name_raw)
+                    .unwrap_or(DeclKind::Module);
                 if let Err(err) = self.insert_ruby_module_decl(
                     file_name,
                     Arc::clone(&draft_ctx),
@@ -116,6 +122,7 @@ impl EnvironmentDraft {
                 ) {
                     push_build_error_diagnostic(
                         err,
+                        kind,
                         &self.names,
                         &mut ctx,
                         Some(module_decl.name_location),
@@ -129,6 +136,9 @@ impl EnvironmentDraft {
             Declaration::Constant(constant_decl) => {
                 let name_raw = constant_decl.constant_name;
                 let conflicting_source = self.conflicting_constant_source(name_raw);
+                let kind = self
+                    .existing_decl_kind(name_raw)
+                    .unwrap_or(DeclKind::Constant);
                 let ty = constant_decl_ast_type(constant_decl, &mut ctx, &self.names);
                 let rbs_constant = Arc::new(Constant {
                     name: name_raw,
@@ -137,9 +147,15 @@ impl EnvironmentDraft {
                     annotations: Vec::new(),
                     comment: None,
                 });
-                if let Err(err) = self.insert_constant(file_name, draft_ctx, rbs_constant) {
+                if let Err(err) = self.insert_constant_from(
+                    file_name,
+                    draft_ctx,
+                    rbs_constant,
+                    ruby_constant_source(constant_decl),
+                ) {
                     push_build_error_diagnostic(
                         err,
+                        kind,
                         &self.names,
                         &mut ctx,
                         Some(constant_decl.name_location),
@@ -150,10 +166,14 @@ impl EnvironmentDraft {
             Declaration::ClassModuleAlias(alias_decl) => {
                 let name_raw = alias_decl.new_name;
                 let conflicting_source = self.conflicting_constant_source(name_raw);
+                let kind = self
+                    .existing_decl_kind(name_raw)
+                    .unwrap_or(DeclKind::ClassAlias);
                 let arc = Arc::new(alias_decl.clone());
                 if let Err(err) = self.insert_ruby_alias(file_name, draft_ctx, arc) {
                     push_build_error_diagnostic(
                         err,
+                        kind,
                         &self.names,
                         &mut ctx,
                         Some(alias_decl.name_location),
@@ -191,12 +211,16 @@ impl EnvironmentDraft {
                         annotations: Vec::new(),
                         comment: None,
                     });
-                    if let Err(err) = self.insert_constant(
+                    let kind = self
+                        .existing_decl_kind(constant_decl.constant_name)
+                        .unwrap_or(DeclKind::Constant);
+                    if let Err(err) = self.insert_constant_from(
                         ctx.file_name(&self.names).into(),
                         Arc::clone(&draft_ctx),
                         rbs_constant,
+                        ruby_constant_source(constant_decl),
                     ) {
-                        push_build_error_diagnostic(err, &self.names, ctx, None, None);
+                        push_build_error_diagnostic(err, kind, &self.names, ctx, None, None);
                     }
                 }
                 Declaration::Class(class_decl) => {
@@ -217,11 +241,12 @@ impl EnvironmentDraft {
         if let Some(entry) = self.class_decls.get(&name) {
             return class_or_module_source_location(entry, &self.names);
         }
-        if let Some(entry) = self.constant_decls.get(&name) {
+        if let Some(entry) = self.constant_decls.get(&name).and_then(|v| v.first()) {
             return entry
+                .entry
                 .file
                 .file()
-                .zip(entry.decl.location)
+                .zip(entry.entry.decl.location)
                 .map(|(file, location)| source_location(file, location.name_range, &self.names));
         }
         if let Some(entry) = self.class_alias_decls.get(&name) {
@@ -229,20 +254,85 @@ impl EnvironmentDraft {
         }
         None
     }
+
+    /// Kind of the entry `name` is already bound to, across the draft, the
+    /// G snapshot, and the overlay — the `detail` of a namespace-collision
+    /// diagnostic names what the Ruby decl ran into, not what it is.
+    fn existing_decl_kind(&self, name: TypeName) -> Option<DeclKind> {
+        if let Some(entry) = self.class_decls.get(&name) {
+            return Some(match entry {
+                ClassOrModuleDraft::Class(_) => DeclKind::Class,
+                ClassOrModuleDraft::Module(_) => DeclKind::Module,
+            });
+        }
+        if self.constant_decls.contains_key(&name) {
+            return Some(DeclKind::Constant);
+        }
+        if self.class_alias_decls.contains_key(&name) {
+            return Some(DeclKind::ClassAlias);
+        }
+        if let Some(kind) = self.g.as_ref().and_then(|g| g.class_kind(&name)) {
+            return Some(match kind {
+                crate::snapshot::backend::GClassKind::Class => DeclKind::Class,
+                crate::snapshot::backend::GClassKind::Module => DeclKind::Module,
+            });
+        }
+        if self.g.as_ref().is_some_and(|g| g.constant_contains(&name)) {
+            return Some(DeclKind::Constant);
+        }
+        if self.g.as_ref().is_some_and(|g| g.alias_contains(&name)) {
+            return Some(DeclKind::ClassAlias);
+        }
+        if let Some(overlay) = &self.overlay {
+            if let Some(entry) = overlay.class_decls.get(&name) {
+                return Some(match entry {
+                    crate::environment::frozen::ClassOrModule::Class(_) => DeclKind::Class,
+                    crate::environment::frozen::ClassOrModule::Module(_) => DeclKind::Module,
+                });
+            }
+            if overlay.constant_decls.contains_key(&name) {
+                return Some(DeclKind::Constant);
+            }
+            if overlay.class_alias_decls.contains_key(&name) {
+                return Some(DeclKind::ClassAlias);
+            }
+        }
+        None
+    }
 }
 
+/// The annotation is the declaration marker: `N = v #: T` declares,
+/// `N = v` only defines (specs/inline.md Goal 2).
+fn ruby_constant_source(decl: &ConstantDecl) -> ConstantSource {
+    if decl.type_text.is_some() {
+        ConstantSource::RubyDeclaration
+    } else {
+        ConstantSource::RubyDefinition
+    }
+}
+
+/// `kind` is the kind of the entry the Ruby decl collided with (see
+/// `existing_decl_kind`), spelled into `detail` the same way the
+/// build-time path does.
 fn push_build_error_diagnostic(
     err: BuildError,
+    kind: DeclKind,
     names: &NameTable,
     ctx: &mut LoadCtx<'_>,
     range: Option<PrismByteRange>,
     conflicting_source: Option<SourceLocation>,
 ) {
-    let name = match &err {
-        BuildError::DuplicatedDeclaration { name }
-        | BuildError::GenericParameterMismatch { name }
-        | BuildError::SuperclassConflict { name } => names.display_type_name(*name),
-        BuildError::DuplicatedGlobal { name } => names.resolve(*name).to_string(),
+    let (name, detail) = match &err {
+        BuildError::DuplicatedDeclaration { name } => (
+            names.display_type_name(*name),
+            duplicated_declaration_detail(names, *name, kind),
+        ),
+        BuildError::GenericParameterMismatch { name } | BuildError::SuperclassConflict { name } => {
+            (names.display_type_name(*name), err.format_with(names))
+        }
+        BuildError::DuplicatedGlobal { name } => {
+            (names.resolve(*name).to_string(), err.format_with(names))
+        }
     };
     let range = match (&err, range) {
         (BuildError::DuplicatedDeclaration { .. }, Some(range)) => range,
@@ -252,7 +342,7 @@ fn push_build_error_diagnostic(
         scope: None,
         kind: DiagnosticKind::DuplicatedDeclaration {
             name,
-            detail: err.format_with(names),
+            detail,
             conflicting_source,
         },
         location: Diagnostic::location_for_byte_range(

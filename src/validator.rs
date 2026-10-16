@@ -109,6 +109,7 @@ pub fn full_validate_scoped(
         Some(g) => full_applied_type_args_a(&ctx, g, scope),
         None => full_applied_type_args(&ctx, scope),
     };
+    diagnostics.extend(validate_duplicate_declarations(env));
     diagnostics.extend(validate_method_dups(env, sources));
     diagnostics.extend(validate_alias_cycles(env, sources));
     let (type_aliases, type_alias_diags) = full_type_alias_cycles(env, scope);
@@ -162,6 +163,7 @@ pub fn validate_update(
         Some(g) => incremental_applied_type_args_a(&old_state.arity, invalidated, &ctx, g),
         None => incremental_applied_type_args(&old_state.arity, invalidated, &ctx),
     };
+    diagnostics.extend(validate_duplicate_declarations(env));
     diagnostics.extend(validate_method_dups(env, sources));
     diagnostics.extend(validate_alias_cycles(env, sources));
     let (type_aliases, type_alias_diags) =
@@ -1401,6 +1403,32 @@ fn type_alias_successors(env: &DefinitionBuilder, name: &TypeName) -> Vec<TypeNa
     collect_direct_alias_deps(&entry.decl.ty, &mut deps);
     deps.into_iter()
         .filter(|next| environment.type_alias_decls().contains_key(next))
+        .collect()
+}
+
+/// Emit `DuplicatedDeclaration` diagnostics for the declaration collisions
+/// `EnvironmentDraft::build` resolved instead of failing on (constants,
+/// nested type / class aliases, nested class-vs-module). Same shape as the
+/// insert-time path in `environment::ruby_decl` — `detail` through
+/// `duplicated_declaration_detail`, the other side in `conflicting_source`.
+/// Mirrors the `RBS::DuplicatedDeclarationError` raise in
+/// `environment.rb#insert_decl`, collected rather than raised.
+fn validate_duplicate_declarations(env: &DefinitionBuilder) -> Vec<Diagnostic> {
+    let names = env.names();
+    env.env()
+        .duplicate_declarations()
+        .iter()
+        .map(|dup| Diagnostic {
+            scope: None,
+            kind: DiagnosticKind::DuplicatedDeclaration {
+                name: names.display_type_name(dup.name),
+                detail: crate::environment::draft::duplicated_declaration_detail(
+                    names, dup.name, dup.kind,
+                ),
+                conflicting_source: dup.conflicting_source.clone(),
+            },
+            location: resolve_or_default(dup.location.as_ref()),
+        })
         .collect()
 }
 

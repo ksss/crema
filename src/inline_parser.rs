@@ -173,7 +173,7 @@ impl VisibilityFrame {
             .map(|s| {
                 s.body()
                     .iter()
-                    .map(|stmt| stmt.location().start_offset() as u32)
+                    .map(|stmt| stmt.location().start())
                     .collect()
             })
             .unwrap_or_default();
@@ -217,10 +217,81 @@ struct DataStructAttribute {
 }
 
 #[derive(Default)]
-struct DataStructOptions {
+pub(crate) struct DataStructOptions {
     keyword_init: Option<bool>,
     required_new_args: bool,
     readonly_attributes: bool,
+}
+
+impl DataStructOptions {
+    /// Read the `keyword_init:` argument and the leading
+    /// `# @rbs %a{rbs-inline:...}` flags of a `Struct.new` /
+    /// `Data.define` constant assignment starting at `decl_location`.
+    /// Shared by the collector and the checker's extract records so the
+    /// two agree on which members get a writer.
+    pub(crate) fn read(
+        comments: &CommentAssociation,
+        line_index: &LineIndex,
+        call: &CallNode<'_>,
+        decl_location: ruby_prism::Location<'_>,
+    ) -> Self {
+        let mut options = DataStructOptions::default();
+        if let Some(arguments) = call.arguments() {
+            for arg in arguments.arguments().iter() {
+                let Some(kw_hash) = arg.as_keyword_hash_node() else {
+                    continue;
+                };
+                for elem in kw_hash.elements().iter() {
+                    let Some(assoc) = elem.as_assoc_node() else {
+                        continue;
+                    };
+                    let Some(sym) = assoc.key().as_symbol_node() else {
+                        continue;
+                    };
+                    if String::from_utf8_lossy(sym.unescaped()) != "keyword_init" {
+                        continue;
+                    }
+                    let value = assoc.value();
+                    if value.as_true_node().is_some() {
+                        options.keyword_init = Some(true);
+                    } else if value.as_false_node().is_some() {
+                        options.keyword_init = Some(false);
+                    }
+                }
+            }
+        }
+
+        let start_line = line_index.line(decl_location.start() as usize);
+        if let Some(block) = comments.leading_block_for(start_line) {
+            for annotation in rbs_inline_annotation_strings(block) {
+                match annotation.as_str() {
+                    "rbs-inline:new-args=required" => options.required_new_args = true,
+                    "rbs-inline:readonly-attributes=true" => options.readonly_attributes = true,
+                    _ => {}
+                }
+            }
+        }
+        options
+    }
+
+    /// Whether each member also gets a writer (`x=`): a Struct unless
+    /// declared readonly; never a Data.
+    pub(crate) fn defines_writers(&self, kind: DataStructConstructionKind) -> bool {
+        matches!(kind, DataStructConstructionKind::Struct) && !self.readonly_attributes
+    }
+}
+
+/// The member-name arguments of a `Struct.new` / `Data.define` call:
+/// Symbol literals only. A Struct's leading class-name String and its
+/// `keyword_init:` hash are not members, and neither is any other
+/// non-Symbol argument.
+pub(crate) fn data_struct_member_symbols<'pr>(
+    call: &CallNode<'pr>,
+) -> impl Iterator<Item = ruby_prism::SymbolNode<'pr>> {
+    call.arguments()
+        .into_iter()
+        .flat_map(|args| args.arguments().iter())
+        .filter_map(|arg| arg.as_symbol_node())
 }
 
 /// Recognized `Const = Class.new(Parent?) do ... end` shape. The
@@ -382,10 +453,7 @@ impl<'a> InlineCollector<'a> {
             return true;
         }
 
-        let byte_range = (
-            node.location().start_offset() as u32,
-            node.location().end_offset() as u32,
-        );
+        let byte_range = (node.location().start(), node.location().end());
 
         // Extract attr names from arguments (symbol nodes)
         let arguments = match node.arguments() {
@@ -409,7 +477,7 @@ impl<'a> InlineCollector<'a> {
 
         let end_line = self
             .line_index
-            .line(node.location().end_offset().saturating_sub(1));
+            .line((node.location().end() as usize).saturating_sub(1));
         let (type_text, annotation_range) =
             match self.comments.trailing_annotation(self.source, end_line) {
                 Some(TrailingAnnotation::NodeTypeAssertion { range, type_text }) => {
@@ -492,7 +560,7 @@ impl<'a> InlineCollector<'a> {
         };
         if !frame
             .direct_statement_starts
-            .contains(&(node.location().start_offset() as u32))
+            .contains(&{ node.location().start() })
         {
             return false;
         }
@@ -582,7 +650,7 @@ impl<'a> InlineCollector<'a> {
         let annotation = if arguments.arguments().len() == 1 {
             let call_end_line = self
                 .line_index
-                .line(node.location().end_offset().saturating_sub(1));
+                .line((node.location().end() as usize).saturating_sub(1));
             match self
                 .comments
                 .trailing_annotation(self.source, call_end_line)
@@ -673,6 +741,7 @@ impl<'a> InlineCollector<'a> {
                     MethodKind::Singleton,
                     location,
                     vec![method_type_returning(ty)],
+                    attribute.source_file,
                 )),
                 AttributeCallSiteKind::Writer => self.push_member(generated_def(
                     &format!("{name}="),
@@ -682,6 +751,7 @@ impl<'a> InlineCollector<'a> {
                         ty,
                         void_ast_type(),
                     )],
+                    attribute.source_file,
                 )),
                 AttributeCallSiteKind::Accessor => {
                     self.push_member(generated_def(
@@ -689,6 +759,7 @@ impl<'a> InlineCollector<'a> {
                         MethodKind::Singleton,
                         location,
                         vec![method_type_returning(ty.clone())],
+                        attribute.source_file,
                     ));
                     self.push_member(generated_def(
                         &format!("{name}="),
@@ -698,6 +769,7 @@ impl<'a> InlineCollector<'a> {
                             ty,
                             void_ast_type(),
                         )],
+                        attribute.source_file,
                     ));
                 }
             }
@@ -766,25 +838,13 @@ impl<'a> InlineCollector<'a> {
         kind: DataStructConstructionKind,
         options: &DataStructOptions,
     ) -> Vec<DataStructAttribute> {
-        let Some(arguments) = call.arguments() else {
-            return Vec::new();
-        };
         let mut attributes = Vec::new();
-        for arg in arguments.arguments().iter() {
-            if matches!(kind, DataStructConstructionKind::Struct)
-                && (arg.as_string_node().is_some() || arg.as_keyword_hash_node().is_some())
-            {
-                continue;
-            }
-
-            let Some(sym) = arg.as_symbol_node() else {
-                continue;
-            };
+        for sym in data_struct_member_symbols(call) {
             let name = String::from_utf8_lossy(sym.unescaped()).to_string();
             let name_location = prism_location_range(sym.location());
             let arg_end_line = self
                 .line_index
-                .line(arg.location().end_offset().saturating_sub(1));
+                .line((sym.location().end() as usize).saturating_sub(1));
             let (type_text, annotation_range) =
                 match self.comments.trailing_annotation(self.source, arg_end_line) {
                     Some(TrailingAnnotation::NodeTypeAssertion { range, type_text }) => {
@@ -798,7 +858,7 @@ impl<'a> InlineCollector<'a> {
                 .unwrap_or_else(untyped_ast_type);
             let attribute = AttributeMember {
                 visibility: None,
-                location: prism_location_range(arg.location()),
+                location: name_location,
                 name_nodes: vec![AttributeNameNode {
                     name: name.clone(),
                     location: name_location,
@@ -807,16 +867,10 @@ impl<'a> InlineCollector<'a> {
                 annotation_range,
                 source_file: self.file_name(),
             };
-            let member = match kind {
-                DataStructConstructionKind::Struct if options.readonly_attributes => {
-                    Member::AttrReader(AttrReaderMember { attribute })
-                }
-                DataStructConstructionKind::Struct => {
-                    Member::AttrAccessor(AttrAccessorMember { attribute })
-                }
-                DataStructConstructionKind::Data => {
-                    Member::AttrReader(AttrReaderMember { attribute })
-                }
+            let member = if options.defines_writers(kind) {
+                Member::AttrAccessor(AttrAccessorMember { attribute })
+            } else {
+                Member::AttrReader(AttrReaderMember { attribute })
             };
             attributes.push(DataStructAttribute { name, ty, member });
         }
@@ -828,43 +882,7 @@ impl<'a> InlineCollector<'a> {
         call: &CallNode<'_>,
         decl_location: ruby_prism::Location<'_>,
     ) -> DataStructOptions {
-        let mut options = DataStructOptions::default();
-        if let Some(arguments) = call.arguments() {
-            for arg in arguments.arguments().iter() {
-                let Some(kw_hash) = arg.as_keyword_hash_node() else {
-                    continue;
-                };
-                for elem in kw_hash.elements().iter() {
-                    let Some(assoc) = elem.as_assoc_node() else {
-                        continue;
-                    };
-                    let Some(sym) = assoc.key().as_symbol_node() else {
-                        continue;
-                    };
-                    if String::from_utf8_lossy(sym.unescaped()) != "keyword_init" {
-                        continue;
-                    }
-                    let value = assoc.value();
-                    if value.as_true_node().is_some() {
-                        options.keyword_init = Some(true);
-                    } else if value.as_false_node().is_some() {
-                        options.keyword_init = Some(false);
-                    }
-                }
-            }
-        }
-
-        let start_line = self.line_index.line(decl_location.start_offset());
-        if let Some(block) = self.comments.leading_block_for(start_line) {
-            for annotation in rbs_inline_annotation_strings(block) {
-                match annotation.as_str() {
-                    "rbs-inline:new-args=required" => options.required_new_args = true,
-                    "rbs-inline:readonly-attributes=true" => options.readonly_attributes = true,
-                    _ => {}
-                }
-            }
-        }
-        options
+        DataStructOptions::read(self.comments, &self.line_index, call, decl_location)
     }
 
     fn data_struct_super_class(
@@ -1110,6 +1128,7 @@ impl<'a> InlineCollector<'a> {
                     MethodKind::Singleton,
                     location,
                     overloads,
+                    None,
                 ));
             }
             DataStructConstructionKind::Data => {
@@ -1121,6 +1140,7 @@ impl<'a> InlineCollector<'a> {
                         method_type_with_required_positionals(attributes),
                         method_type_with_required_keywords(attributes, self.names),
                     ],
+                    None,
                 ));
                 let members_method =
                     method_type_returning(symbol_tuple_type(attributes, self.names));
@@ -1129,12 +1149,14 @@ impl<'a> InlineCollector<'a> {
                     MethodKind::Singleton,
                     location,
                     vec![members_method.clone()],
+                    None,
                 ));
                 members.push(generated_def(
                     "members",
                     MethodKind::Instance,
                     location,
                     vec![members_method],
+                    None,
                 ));
             }
         }
@@ -1188,10 +1210,10 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             };
             if name.is_some() && data_struct_super.is_none() {
                 let loc = super_node.location();
-                byte_range = Some((loc.start_offset() as u32, loc.end_offset() as u32));
+                byte_range = Some((loc.start(), loc.end()));
                 let super_end_line = self
                     .line_index
-                    .line(super_node.location().end_offset().saturating_sub(1));
+                    .line((super_node.location().end() as usize).saturating_sub(1));
                 if let Some(TrailingAnnotation::TypeApplication { range, body }) = self
                     .comments
                     .trailing_annotation(self.source, super_end_line)
@@ -1276,7 +1298,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
 
         let module_name = self.current_class_typename().unwrap();
         let name_location = prism_location_range(node.constant_path().location());
-        let module_start_line = self.line_index.line(node.location().start_offset());
+        let module_start_line = self.line_index.line(node.location().start() as usize);
 
         let saved_singleton_class_depth = self.singleton_class_depth;
         self.singleton_class_depth = 0;
@@ -1316,7 +1338,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
                 self.diagnostics.push(
                     self.singleton_scope_diagnostic(loc, DiagnosticKind::NestedSingletonScope),
                 );
-                let def_start_line = self.line_index.line(node.location().start_offset());
+                let def_start_line = self.line_index.line(node.location().start() as usize);
                 let leading_comment = collect_consecutive_leading(self.comments, def_start_line);
                 self.mark_comment_block_associated(leading_comment.as_ref());
                 self.mark_enclosed_leading_lines(node.location());
@@ -1335,7 +1357,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         // `TopLevelMethodDefinition` (rbs `RBS::InlineParser` parity).
         let top_level = self.class_stack.is_empty();
         if top_level && kind != MethodKind::Instance {
-            let def_start_line = self.line_index.line(node.location().start_offset());
+            let def_start_line = self.line_index.line(node.location().start() as usize);
             let leading_comment = collect_consecutive_leading(self.comments, def_start_line);
             self.report_unused_comment_block(leading_comment.as_ref());
             self.diagnostics
@@ -1347,7 +1369,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         let location = prism_location_range(node.location());
         let name_location = prism_location_range(node.name_loc());
 
-        let def_start_line = self.line_index.line(node.location().start_offset());
+        let def_start_line = self.line_index.line(node.location().start() as usize);
         let leading_comment = collect_consecutive_leading(self.comments, def_start_line);
         self.mark_comment_block_associated(leading_comment.as_ref());
         self.mark_enclosed_leading_lines(node.location());
@@ -1358,7 +1380,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         // annotation (`def foo(...) #: T`) the same way it consumes
         // the leading block. Mirrors rbs's `trailing_block` argument.
         //
-        // `node.location().end_offset()` points at the `end` keyword on
+        // `node.location().end() as usize` points at the `end` keyword on
         // multi-line defs, so using it here would miss header-line
         // trailing comments. The start-line approximation handles the
         // common single-line-header case; multi-line signatures whose
@@ -1571,7 +1593,7 @@ impl<'a> InlineCollector<'a> {
     /// decl, no diagnostic). Plain comments and other annotation kinds
     /// in the same leading block are silently ignored.
     fn is_node_skipped(&self, node_location: ruby_prism::Location<'_>) -> bool {
-        let start_line = self.line_index.line(node_location.start_offset());
+        let start_line = self.line_index.line(node_location.start() as usize);
         let Some(block) = self.comments.leading_block_for(start_line) else {
             return false;
         };
@@ -1593,13 +1615,10 @@ impl<'a> InlineCollector<'a> {
     ) {
         let end_line = self
             .line_index
-            .line(node_location.end_offset().saturating_sub(1));
+            .line((node_location.end() as usize).saturating_sub(1));
         let trailing = self.comments.trailing_annotation(self.source, end_line);
 
-        let byte_range = (
-            node_location.start_offset() as u32,
-            node_location.end_offset() as u32,
-        );
+        let byte_range = (node_location.start(), node_location.end());
 
         match trailing {
             Some(TrailingAnnotation::ClassAlias {
@@ -2187,11 +2206,16 @@ fn record_type(attributes: &[DataStructAttribute], names: &NameTable) -> Type {
     })
 }
 
+/// A `DefMember` crema synthesizes from a non-`def` site. `source_file`
+/// is the file of a site that literally names the method (`class <<
+/// self; attr_reader :x`), so `definitions` anchors it there; `None`
+/// for methods no literal names (Struct's `new`, Data's `members`).
 fn generated_def(
     name: &str,
     kind: MethodKind,
     location: PrismByteRange,
     overloads: Vec<AstMethodType>,
+    source_file: Option<Name>,
 ) -> Member {
     let annotations = overloads
         .into_iter()
@@ -2215,7 +2239,7 @@ fn generated_def(
             type_annotations: TypeAnnotations::Array(annotations),
         },
         leading_comment: None,
-        source_file: None,
+        source_file,
     })
 }
 
@@ -2274,10 +2298,10 @@ impl<'a> InlineCollector<'a> {
     }
 
     fn mark_enclosed_leading_lines(&mut self, location: ruby_prism::Location<'_>) {
-        let start_line = self.line_index.line(location.start_offset());
+        let start_line = self.line_index.line(location.start() as usize);
         let end_line = self
             .line_index
-            .line(location.end_offset().saturating_sub(1));
+            .line((location.end() as usize).saturating_sub(1));
         if start_line + 1 >= end_line {
             return;
         }
@@ -2315,10 +2339,10 @@ impl<'a> InlineCollector<'a> {
     }
 
     fn collect_enclosed_instance_variable_members(&mut self, location: ruby_prism::Location<'_>) {
-        let start_line = self.line_index.line(location.start_offset());
+        let start_line = self.line_index.line(location.start() as usize);
         let end_line = self
             .line_index
-            .line(location.end_offset().saturating_sub(1));
+            .line((location.end() as usize).saturating_sub(1));
         if start_line + 1 >= end_line {
             return;
         }
@@ -2467,7 +2491,7 @@ fn single_attr_name(attr: &AttributeMember) -> Option<&str> {
 }
 
 pub(crate) fn prism_location_range(location: ruby_prism::Location<'_>) -> PrismByteRange {
-    (location.start_offset() as u32, location.end_offset() as u32)
+    (location.start(), location.end())
 }
 
 fn offset_range(range: PrismByteRange, offset: u32) -> PrismByteRange {

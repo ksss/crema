@@ -3873,13 +3873,13 @@ fn ingest_file<'a>(
     // checking for this file. Build / validator still see other
     // files' declarations.
     if let Some(first_err) = parse_result.errors().next() {
-        let offset = first_err.location().start_offset();
-        let message = first_err.message().to_string();
+        let offset = first_err.location().start() as usize;
+        let message = String::from_utf8_lossy(first_err.message()).into_owned();
         let location = crema::diagnostic::Diagnostic::location_for_byte_range(
             file.path.to_path_buf(),
             source,
             offset,
-            first_err.location().end_offset(),
+            first_err.location().end() as usize,
         );
         return (
             None,

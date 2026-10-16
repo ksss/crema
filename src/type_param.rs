@@ -5,7 +5,8 @@ use crate::rbs_raw::TypeParamVariance;
 use crate::substitution::Substitution;
 use crate::type_name::TypeName;
 use crate::types::{
-    Block, Function, FunctionType, MethodType, RecordKey, Ty, Type, TypeTable, UntypedFunction,
+    Block, Function, FunctionType, MethodType, ProcType, RecordKey, Ty, Type, TypeTable,
+    UntypedFunction,
 };
 
 
@@ -222,21 +223,22 @@ where
                 .collect();
             types.intern(Type::Record { fields: new_fields })
         }
-        Type::Proc {
-            type_,
-            self_type,
-            block,
-        } => {
+        Type::Proc(p) => {
+            let ProcType {
+                type_,
+                self_type,
+                block,
+            } = &**p;
             let new_func = normalize_function_type_defaults(type_, types, params_of);
             let new_self = self_type.map(walk);
             let new_block = block
                 .as_ref()
                 .map(|b| normalize_block_defaults(b, types, params_of));
-            types.intern(Type::Proc {
+            types.intern(Type::Proc(Box::new(ProcType {
                 type_: new_func,
                 self_type: new_self,
                 block: new_block,
-            })
+            })))
         }
         _ => ty,
     }

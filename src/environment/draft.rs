@@ -29,6 +29,7 @@ use crate::ast::declarations::{
     ModuleDeclaration as Module, TypeAliasDeclaration as TypeAlias,
 };
 use crate::ast::directives::Directive;
+use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::annotations::InlineAliasKind;
 use crate::ast::ruby::declarations::{
     ClassDecl as RubyClassDecl, ClassModuleAliasDecl as RubyClassModuleAliasDecl,
@@ -45,10 +46,11 @@ use crate::environment::frozen::{
 };
 use crate::environment::resolution::{self, FlattenedDecls, TypeNameResolver};
 use crate::environment::use_map::UseMap;
-use crate::location::RubyLocation;
+use crate::location::{LocationRange, RubyLocation, SourceLocation};
 use crate::name::{Name, NameTable, Symbol};
 use crate::snapshot::backend::{GClassKind, GSnapshotBackend};
 use crate::type_name::TypeName;
+use std::path::PathBuf;
 
 
 /// The namespace stack visible to a declaration at the point it was
@@ -201,6 +203,82 @@ pub type ConstantEntry = SingleEntry<Constant>;
 pub type TypeAliasEntryDraft = SingleEntryDraft<TypeAlias>;
 pub type ConstantEntryDraft = SingleEntryDraft<Constant>;
 
+/// Where a draft constant came from. The annotation is the declaration
+/// marker (specs/inline.md Goal 2): a bare `N = v` in a Ruby file is a
+/// *definition* that defers to any declaration of the same name and only
+/// becomes a declaration itself (typed by literal inference, rbs's own
+/// rule) when none exists. `build` resolves the candidates per name.
+///
+/// The variant order is the report order for a duplicate: the RBS side is
+/// the `conflicting_source`, the Ruby side carries the diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConstantSource {
+    /// `N: T` in an RBS file, top-level or nested.
+    Signature,
+    /// `N = v #: T` in a Ruby file.
+    RubyDeclaration,
+    /// `N = v` in a Ruby file, no annotation.
+    RubyDefinition,
+}
+
+impl ConstantSource {
+    pub fn is_declaration(self) -> bool {
+        !matches!(self, ConstantSource::RubyDefinition)
+    }
+}
+
+/// One constant candidate in the draft. Several may share a name until
+/// `build` picks the surviving one (or drops them all as duplicates).
+#[derive(Debug, Clone)]
+pub struct ConstantDraft {
+    pub entry: ConstantEntryDraft,
+    pub source: ConstantSource,
+}
+
+/// Kind of the environment entry a name is bound to, for the `detail` of
+/// a `DuplicatedDeclaration` diagnostic. `NameTable::type_name_kind` is
+/// syntactic and files every capitalised name under `Class`, so a
+/// constant collision used to read `(Class)`; this is read off the entry
+/// instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclKind {
+    Class,
+    Module,
+    Interface,
+    TypeAlias,
+    ClassAlias,
+    Constant,
+}
+
+/// `detail` text of a `DuplicatedDeclaration` diagnostic, shared by the
+/// insert-time (`ruby_decl`) and build-time (`validator`) emitters so the
+/// two paths produce the same shape.
+pub fn duplicated_declaration_detail(names: &NameTable, name: TypeName, kind: DeclKind) -> String {
+    format!(
+        "DuplicatedDeclaration {{ name: {} ({kind:?}) }}",
+        names.display_type_name(name)
+    )
+}
+
+/// A `DuplicatedDeclaration` found by [`EnvironmentDraft::build`]. The
+/// build no longer fails on it: the record is carried on the frozen
+/// [`Environment`] and the validator turns it into a diagnostic. By the
+/// time it is read the colliding declarations are already gone from the
+/// environment (constants, type aliases, class aliases — "as if never
+/// written", so references cascade into the ordinary `UnknownConstant` /
+/// `UnknownTypeName`) or merged first-wins (a class/module kind mismatch
+/// keeps the entry that was there, like the insert-time path).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateDeclaration {
+    pub name: TypeName,
+    pub kind: DeclKind,
+    /// The declaration being reported — the Ruby side when there is one.
+    pub location: Option<SourceLocation>,
+    /// The declaration it collided with. `None` when that side has no
+    /// file location (a G-snapshot entry).
+    pub conflicting_source: Option<SourceLocation>,
+}
+
 /// Single-decl entry for global declarations.
 ///
 /// Distinct from [`SingleEntry`] because globals are keyed by [`Name`]
@@ -334,7 +412,9 @@ pub struct EnvironmentDraft {
     pub(crate) interface_decls: FxHashMap<TypeName, InterfaceEntryDraft>,
     pub(crate) class_alias_decls: FxHashMap<TypeName, ClassAliasEntry>,
     pub(crate) type_alias_decls: FxHashMap<TypeName, TypeAliasEntryDraft>,
-    pub(crate) constant_decls: FxHashMap<TypeName, ConstantEntryDraft>,
+    /// Every constant candidate per name; resolved in `build` (see
+    /// [`ConstantSource`]).
+    pub(crate) constant_decls: FxHashMap<TypeName, Vec<ConstantDraft>>,
     pub(crate) global_decls: FxHashMap<Symbol, GlobalEntry>,
     pub(crate) sources: Vec<Option<RubyLocation>>,
     pub(crate) names: NameTable,
@@ -422,6 +502,10 @@ pub(crate) struct FrozenOverlay {
     pub(crate) class_alias_decls: FxHashMap<TypeName, ClassOrModuleAliasEntry>,
     pub(crate) type_alias_decls: FxHashMap<TypeName, TypeAliasEntry>,
     pub(crate) constant_decls: FxHashMap<TypeName, ConstantEntry>,
+    /// Surviving `constant_decls` keys whose entry is an unannotated Ruby
+    /// definition (see [`Environment::constant_definitions`]); `build`
+    /// re-enters them as [`ConstantSource::RubyDefinition`] candidates.
+    pub(crate) constant_definitions: FxHashSet<TypeName>,
     pub(crate) global_decls: FxHashMap<Symbol, GlobalEntry>,
     /// `class_decls` keys [`Environment::unload`](crate::environment::frozen::Environment::unload)
     /// stripped of their G-origin (`DeclOrigin::GSnapshot`) decl(s) because
@@ -483,7 +567,7 @@ impl BuildError {
     /// The bare `Debug` impl prints `Symbol(<spur-id>)` which is opaque to
     /// humans and AIs alike (`src/name.rs:54`); this helper resolves every
     /// embedded name so the message reads like
-    /// `DuplicatedDeclaration { name: ::JSON::_Reader (Interface) }`.
+    /// `GenericParameterMismatch { name: ::JSON::Reader (Class) }`.
     pub fn format_with(&self, names: &NameTable) -> String {
         // Roots cannot be declared, so a missing kind never reaches a
         // BuildError in practice; label it explicitly rather than
@@ -493,11 +577,13 @@ impl BuildError {
             None => String::from("Root"),
         };
         match self {
+            // No kind label: `type_name_kind` is syntactic and would call a
+            // constant a `Class`. The diagnostic path carries the real
+            // entry kind via `duplicated_declaration_detail` instead.
             BuildError::DuplicatedDeclaration { name } => {
                 format!(
-                    "DuplicatedDeclaration {{ name: {} ({}) }}",
+                    "DuplicatedDeclaration {{ name: {} }}",
                     names.display_type_name(*name),
-                    kind_label(name),
                 )
             }
             BuildError::DuplicatedGlobal { name } => {
@@ -933,23 +1019,45 @@ impl EnvironmentDraft {
         Ok(())
     }
 
+    /// Insert an RBS constant declaration (`N: T`). See
+    /// [`Self::insert_constant_from`] for the collision rules.
     pub fn insert_constant(
         &mut self,
         file: DeclOrigin,
         context: Context,
         decl: Arc<Constant>,
     ) -> Result<(), BuildError> {
+        self.insert_constant_from(file, context, decl, ConstantSource::Signature)
+    }
+
+    /// Insert a constant candidate. A name already held by a class,
+    /// module, or class alias is a duplicate here, as for every other
+    /// insert; a constant-vs-constant collision is *not* — all candidates
+    /// for a name are kept and `build` resolves them (declaration vs
+    /// definition, duplicate declarations voided), so the outcome depends
+    /// on neither the load order nor whether the RBS side spelled the
+    /// constant nested or top-level.
+    pub fn insert_constant_from(
+        &mut self,
+        file: DeclOrigin,
+        context: Context,
+        decl: Arc<Constant>,
+        source: ConstantSource,
+    ) -> Result<(), BuildError> {
         let name = decl.name;
-        self.check_constant_namespace_free(&name, false, false, false)?;
-        self.constant_decls.insert(
-            name,
-            SingleEntryDraft {
-                name,
-                file,
-                context,
-                decl,
-            },
-        );
+        self.check_constant_namespace_free(&name, false, true, false)?;
+        self.constant_decls
+            .entry(name)
+            .or_default()
+            .push(ConstantDraft {
+                entry: SingleEntryDraft {
+                    name,
+                    file,
+                    context,
+                    decl,
+                },
+                source,
+            });
         self.record_path(file, PathIndexKey::Constant(name));
         Ok(())
     }
@@ -1111,6 +1219,10 @@ impl EnvironmentDraft {
             // forward — ADR-0028 slice S2's delta path is `unload`-only).
             all_names: _,
             aliases: _,
+            // Already reported by the build that produced `env`; the
+            // colliding decls are not in the maps re-inserted below.
+            duplicate_declarations: _,
+            constant_definitions,
             // Concerns are A-layer only; a G snapshot env carries none.
             concern_block_targets: _,
         } = env;
@@ -1248,11 +1360,16 @@ impl EnvironmentDraft {
             }
         }
 
-        for (_, e) in constant_decls {
+        for (name, e) in constant_decls {
             if e.context.len() != 1 {
                 continue;
             }
-            if let Err(err) = draft.insert_constant(e.file, e.context, e.decl) {
+            let source = if constant_definitions.contains(&name) {
+                ConstantSource::RubyDefinition
+            } else {
+                ConstantSource::Signature
+            };
+            if let Err(err) = draft.insert_constant_from(e.file, e.context, e.decl, source) {
                 return Err(err.format_with(draft.names()));
             }
         }
@@ -1582,6 +1699,7 @@ impl EnvironmentDraft {
                 mut class_alias_decls,
                 mut type_alias_decls,
                 mut constant_decls,
+                constant_definitions: overlay_constant_definitions,
                 mut global_decls,
                 g_remerge: overlay_g_remerge,
                 // Already moved out at the top of Pass 1 (`mem::take`);
@@ -1607,6 +1725,9 @@ impl EnvironmentDraft {
                 .collect();
 
             let mut nested = FlattenedDecls::default();
+            // Build-time `DuplicatedDeclaration`s, carried on the frozen
+            // environment for the validator (see [`DuplicateDeclaration`]).
+            let mut duplicate_declarations: Vec<DuplicateDeclaration> = Vec::new();
 
             // Top-level class/module entries. Each draft (Context, Arc<Class>)
             // is rewritten to a resolved Arc<Class>; nested class/module/interface
@@ -1711,8 +1832,26 @@ impl EnvironmentDraft {
                 // decls first, freshly drafted decls after.
                 match class_decls.remove(&resolved_key) {
                     Some(existing) => {
-                        let merged = merge_g_class_or_module(&resolved_key, &existing, frozen)?;
-                        class_decls.insert(resolved_key, merged);
+                        let a_location = class_or_module_entry_location(&frozen, &names);
+                        match merge_g_class_or_module(&resolved_key, &existing, frozen) {
+                            Ok(merged) => {
+                                class_decls.insert(resolved_key, merged);
+                            }
+                            // Kind mismatch against the retained entry:
+                            // report, keep what was there (first wins).
+                            Err(BuildError::DuplicatedDeclaration { .. }) => {
+                                duplicate_declarations.push(DuplicateDeclaration {
+                                    name: resolved_key,
+                                    kind: class_or_module_kind(&existing),
+                                    location: a_location,
+                                    conflicting_source: class_or_module_entry_location(
+                                        &existing, &names,
+                                    ),
+                                });
+                                class_decls.insert(resolved_key, existing);
+                            }
+                            Err(other) => return Err(other),
+                        }
                     }
                     None => {
                         class_decls.insert(resolved_key, frozen);
@@ -1746,48 +1885,68 @@ impl EnvironmentDraft {
             // Ruby decls flatten the same way — the absolute `class_name` /
             // `module_name` has been pre-built by the inline collector, so
             // the flat entry's key comes straight from there.
-            for (key, ctx, decl, file) in nested.classes {
-                merge_nested_class(
-                    &mut class_decls,
-                    key,
-                    file,
-                    ctx,
-                    ClassDeclaration::Signature(decl),
-                    &names,
-                )?;
+            // A nested class landing on a module name (or vice versa) is a
+            // `DuplicatedDeclaration` record, not a build failure; the entry
+            // already there stays (first wins, as on the insert-time path).
+            // Any other `BuildError` (type-param mismatch) still fails.
+            let nested_class_decls = nested
+                .classes
+                .into_iter()
+                .map(|(key, ctx, decl, file)| (key, ctx, ClassDeclaration::Signature(decl), file))
+                .chain(
+                    nested
+                        .ruby_classes
+                        .into_iter()
+                        .map(|(key, ctx, decl, file)| {
+                            (key, ctx, ClassDeclaration::Ruby(decl), file)
+                        }),
+                );
+            for (key, ctx, decl, file) in nested_class_decls {
+                let location = class_decl_location(file, &decl, &names);
+                match merge_nested_class(&mut class_decls, key, file, ctx, decl) {
+                    Ok(()) => {}
+                    Err(BuildError::DuplicatedDeclaration { .. }) => {
+                        duplicate_declarations.push(DuplicateDeclaration {
+                            name: key,
+                            kind: DeclKind::Module,
+                            location,
+                            conflicting_source: class_decls
+                                .get(&key)
+                                .and_then(|e| class_or_module_entry_location(e, &names)),
+                        });
+                    }
+                    Err(other) => return Err(other),
+                }
                 record_path_index(&mut self.path_index, file, PathIndexKey::ClassOrModule(key));
             }
-            for (key, ctx, decl, file) in nested.modules {
-                merge_nested_module(
-                    &mut class_decls,
-                    key,
-                    file,
-                    ctx,
-                    ModuleDeclaration::Signature(decl),
-                    &names,
-                )?;
-                record_path_index(&mut self.path_index, file, PathIndexKey::ClassOrModule(key));
-            }
-            for (key, ctx, decl, file) in nested.ruby_classes {
-                merge_nested_class(
-                    &mut class_decls,
-                    key,
-                    file,
-                    ctx,
-                    ClassDeclaration::Ruby(decl),
-                    &names,
-                )?;
-                record_path_index(&mut self.path_index, file, PathIndexKey::ClassOrModule(key));
-            }
-            for (key, ctx, decl, file) in nested.ruby_modules {
-                merge_nested_module(
-                    &mut class_decls,
-                    key,
-                    file,
-                    ctx,
-                    ModuleDeclaration::Ruby(decl),
-                    &names,
-                )?;
+            let nested_module_decls = nested
+                .modules
+                .into_iter()
+                .map(|(key, ctx, decl, file)| (key, ctx, ModuleDeclaration::Signature(decl), file))
+                .chain(
+                    nested
+                        .ruby_modules
+                        .into_iter()
+                        .map(|(key, ctx, decl, file)| {
+                            (key, ctx, ModuleDeclaration::Ruby(decl), file)
+                        }),
+                );
+            for (key, ctx, decl, file) in nested_module_decls {
+                let location = module_decl_location(file, &decl, &names);
+                match merge_nested_module(&mut class_decls, key, file, ctx, decl) {
+                    Ok(()) => {}
+                    Err(BuildError::DuplicatedDeclaration { .. }) => {
+                        duplicate_declarations.push(DuplicateDeclaration {
+                            name: key,
+                            kind: DeclKind::Class,
+                            location,
+                            conflicting_source: class_decls
+                                .get(&key)
+                                .and_then(|e| class_or_module_entry_location(e, &names)),
+                        });
+                    }
+                    Err(other) => return Err(other),
+                }
                 record_path_index(&mut self.path_index, file, PathIndexKey::ClassOrModule(key));
             }
             for (key, ctx, decl, file) in nested.interfaces {
@@ -1829,8 +1988,25 @@ impl EnvironmentDraft {
                     }
                     let a_entry = class_decls.remove(&name).expect("key collected above");
                     let g_entry = g.class_entry(&name).expect("class_contains checked above");
-                    let merged = merge_g_class_or_module(&name, g_entry, a_entry)?;
-                    class_decls.insert(name, merged);
+                    let a_location = class_or_module_entry_location(&a_entry, &names);
+                    match merge_g_class_or_module(&name, g_entry, a_entry) {
+                        Ok(merged) => {
+                            class_decls.insert(name, merged);
+                        }
+                        // Reopening a gem class as a module (or the
+                        // reverse): the gem entry stays, the A entry is
+                        // dropped — it is no longer an overlap.
+                        Err(BuildError::DuplicatedDeclaration { .. }) => {
+                            duplicate_declarations.push(DuplicateDeclaration {
+                                name,
+                                kind: class_or_module_kind(g_entry),
+                                location: a_location,
+                                conflicting_source: None,
+                            });
+                            g_overlap.class -= 1;
+                        }
+                        Err(other) => return Err(other),
+                    }
                 }
                 // Interfaces are single-decl; a flatten-generated A
                 // interface shadows the G one (`merge_nested_interface`'s
@@ -1919,9 +2095,107 @@ impl EnvironmentDraft {
                 )
             }));
 
-            // Same overlay-seeded extend as `class_alias_decls` above.
-            constant_decls.extend(self.constant_decls.into_iter().map(|(raw_name, draft)| {
-                let resolved = raw_name;
+            // ---- Constants: declaration vs definition ----
+            //
+            // Every candidate for a name is resolved here, in one place:
+            // the draft's own inserts (RBS top-level, Ruby top-level, the
+            // Ruby nested constants `ruby_decl` flattens eagerly) and the
+            // RBS nested constants the walk above just flattened. One
+            // place means the outcome depends on neither the RBS spelling
+            // (`S::N: T` vs `class S; N: T; end`) nor the load order.
+            //
+            // Rules (specs/inline.md Goal 2, "the annotation is the
+            // declaration marker"):
+            // - declarations (RBS, annotated Ruby) win over definitions
+            //   (unannotated Ruby), which are dropped silently;
+            // - two or more declarations are a `DuplicatedDeclaration`
+            //   and *all* of them are dropped — as if never written;
+            // - with no declaration at all, the definitions are the
+            //   declarations (rbs's own rule), duplicates included.
+            // A G-snapshot constant is an outer declaration that wins: A
+            // declarations against it are reported (the gem side stays),
+            // A definitions dropped silently. Overlay-carried constants
+            // (ADR-0028 `unload`) are *not* outer: they are the other
+            // files' candidates, re-entered here with the source they had
+            // so an incremental build resolves exactly like a full one.
+            let g_constant_taken =
+                |key: &TypeName| g_backend.as_ref().is_some_and(|g| g.constant_contains(key));
+            let mut constant_candidates: FxHashMap<TypeName, Vec<ConstantDraft>> =
+                self.constant_decls;
+            for (key, entry) in constant_decls.drain() {
+                let source = if overlay_constant_definitions.contains(&key) {
+                    ConstantSource::RubyDefinition
+                } else {
+                    ConstantSource::Signature
+                };
+                constant_candidates
+                    .entry(key)
+                    .or_default()
+                    .push(ConstantDraft {
+                        entry: SingleEntryDraft {
+                            name: key,
+                            file: entry.file,
+                            context: entry.context,
+                            decl: entry.decl,
+                        },
+                        source,
+                    });
+            }
+            let mut constant_definitions: FxHashSet<TypeName> = FxHashSet::default();
+            for (key, ctx, decl, file) in nested.constants {
+                constant_candidates
+                    .entry(key)
+                    .or_default()
+                    .push(ConstantDraft {
+                        entry: SingleEntryDraft {
+                            name: key,
+                            file,
+                            context: ctx,
+                            decl,
+                        },
+                        source: ConstantSource::Signature,
+                    });
+                record_path_index(&mut self.path_index, file, PathIndexKey::Constant(key));
+            }
+            for (key, mut candidates) in constant_candidates {
+                let g_declared = g_constant_taken(&key);
+                if candidates.iter().any(|c| c.source.is_declaration()) {
+                    candidates.retain(|c| c.source.is_declaration());
+                } else if g_declared {
+                    // Definitions of a gem declaration: nothing to say.
+                    continue;
+                }
+                candidates.sort_by(|a, b| constant_report_order(a, b, &names));
+                let (winner, duplicates, conflicting) = if g_declared {
+                    // The snapshot carries no entry-level file location.
+                    (None, &candidates[..], None)
+                } else if candidates.len() > 1 {
+                    let conflicting = constant_draft_location(&candidates[0], &names);
+                    (None, &candidates[1..], conflicting)
+                } else {
+                    (candidates.first(), &candidates[..0], None)
+                };
+                for dup in duplicates {
+                    duplicate_declarations.push(DuplicateDeclaration {
+                        name: key,
+                        kind: DeclKind::Constant,
+                        location: constant_draft_location(dup, &names),
+                        conflicting_source: conflicting.clone(),
+                    });
+                }
+                let Some(ConstantDraft {
+                    entry: draft,
+                    source,
+                }) = winner
+                else {
+                    continue;
+                };
+                if *source == ConstantSource::RubyDefinition {
+                    constant_definitions.insert(key);
+                }
+                // Nested RBS constants (and overlay-carried entries) were
+                // resolved already; resolving again is a no-op on absolute
+                // names.
                 let r = resolver_for(draft.file.file());
                 let resolved_decl = Arc::new(resolution::resolve_constant_decl(
                     &draft.decl,
@@ -1929,16 +2203,16 @@ impl EnvironmentDraft {
                     &r,
                     &names,
                 ));
-                (
-                    resolved,
+                constant_decls.insert(
+                    key,
                     SingleEntry {
-                        name: resolved,
+                        name: key,
                         file: draft.file,
-                        context: draft.context,
+                        context: Arc::clone(&draft.context),
                         decl: resolved_decl,
                     },
-                )
-            }));
+                );
+            }
 
             // Flatten nested type-alias / constant / class-alias / module-alias
             // decls discovered during the recursive walk. These are single-decl
@@ -1952,66 +2226,115 @@ impl EnvironmentDraft {
                     .as_ref()
                     .is_some_and(|g| g.type_alias_contains(key))
             };
-            let g_constant_taken =
-                |key: &TypeName| g_backend.as_ref().is_some_and(|g| g.constant_contains(key));
             let g_alias_taken =
                 |key: &TypeName| g_backend.as_ref().is_some_and(|g| g.alias_contains(key));
 
+            // Single-decl kinds: a collision voids both sides (the entry
+            // already in the map is removed and the name is remembered so
+            // a third candidate does not re-insert it); a G-snapshot entry
+            // wins and the A side is dropped. Both are records, not errors.
+            let mut voided_type_aliases: FxHashSet<TypeName> = FxHashSet::default();
             for (key, ctx, decl, file) in nested.type_aliases {
-                if g_type_alias_taken(&key) {
-                    return Err(duplicate_decl_error(&key, &names));
-                }
-                insert_single_or_duplicate(&mut type_alias_decls, key, file, ctx, decl, &names)?;
-                record_path_index(&mut self.path_index, file, PathIndexKey::TypeAlias(key));
-            }
-            for (key, ctx, decl, file) in nested.constants {
-                if g_constant_taken(&key) {
-                    return Err(duplicate_decl_error(&key, &names));
-                }
-                insert_single_or_duplicate(&mut constant_decls, key, file, ctx, decl, &names)?;
-                record_path_index(&mut self.path_index, file, PathIndexKey::Constant(key));
-            }
-            for (key, ctx, decl, file) in nested.class_aliases {
-                if g_alias_taken(&key) {
-                    return Err(duplicate_decl_error(&key, &names));
-                }
-                insert_alias_or_duplicate(
-                    &mut class_alias_decls,
-                    key,
+                let location = entry_source_location(
                     file,
-                    ctx,
-                    ClassAliasDraft::Class(decl),
+                    decl.source_file,
+                    decl.location.map(|l| l.name_range),
                     &names,
-                )?;
-                record_path_index(&mut self.path_index, file, PathIndexKey::ClassAlias(key));
+                );
+                let conflicting_source =
+                    if voided_type_aliases.contains(&key) || g_type_alias_taken(&key) {
+                        None
+                    } else {
+                        match type_alias_decls.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(SingleEntry {
+                                    name: key,
+                                    file,
+                                    context: ctx,
+                                    decl,
+                                });
+                                record_path_index(
+                                    &mut self.path_index,
+                                    file,
+                                    PathIndexKey::TypeAlias(key),
+                                );
+                                continue;
+                            }
+                            std::collections::hash_map::Entry::Occupied(o) => {
+                                let existing = o.remove();
+                                voided_type_aliases.insert(key);
+                                entry_source_location(
+                                    existing.file,
+                                    existing.decl.source_file,
+                                    existing.decl.location.map(|l| l.name_range),
+                                    &names,
+                                )
+                            }
+                        }
+                    };
+                duplicate_declarations.push(DuplicateDeclaration {
+                    name: key,
+                    kind: DeclKind::TypeAlias,
+                    location,
+                    conflicting_source,
+                });
             }
-            for (key, ctx, decl, file) in nested.module_aliases {
-                if g_alias_taken(&key) {
-                    return Err(duplicate_decl_error(&key, &names));
-                }
-                insert_alias_or_duplicate(
-                    &mut class_alias_decls,
-                    key,
-                    file,
-                    ctx,
-                    ClassAliasDraft::Module(decl),
-                    &names,
-                )?;
-                record_path_index(&mut self.path_index, file, PathIndexKey::ClassAlias(key));
-            }
-            for (key, ctx, decl, file) in nested.ruby_aliases {
-                if g_alias_taken(&key) {
-                    return Err(duplicate_decl_error(&key, &names));
-                }
-                insert_alias_or_duplicate(
-                    &mut class_alias_decls,
-                    key,
-                    file,
-                    ctx,
-                    ClassAliasDraft::Ruby(decl),
-                    &names,
-                )?;
-                record_path_index(&mut self.path_index, file, PathIndexKey::ClassAlias(key));
+            let mut voided_class_aliases: FxHashSet<TypeName> = FxHashSet::default();
+            let nested_aliases = nested
+                .class_aliases
+                .into_iter()
+                .map(|(key, ctx, decl, file)| (key, ctx, ClassAliasDraft::Class(decl), file))
+                .chain(
+                    nested
+                        .module_aliases
+                        .into_iter()
+                        .map(|(key, ctx, decl, file)| {
+                            (key, ctx, ClassAliasDraft::Module(decl), file)
+                        }),
+                )
+                .chain(
+                    nested
+                        .ruby_aliases
+                        .into_iter()
+                        .map(|(key, ctx, decl, file)| {
+                            (key, ctx, ClassAliasDraft::Ruby(decl), file)
+                        }),
+                );
+            for (key, ctx, decl, file) in nested_aliases {
+                let location = class_alias_draft_location(file, &decl, &names);
+                let conflicting_source =
+                    if voided_class_aliases.contains(&key) || g_alias_taken(&key) {
+                        None
+                    } else {
+                        match class_alias_decls.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                let entry = ClassAliasEntry {
+                                    name: key,
+                                    file,
+                                    context: ctx,
+                                    decl,
+                                };
+                                v.insert(build_class_alias_entry(key, entry));
+                                record_path_index(
+                                    &mut self.path_index,
+                                    file,
+                                    PathIndexKey::ClassAlias(key),
+                                );
+                                continue;
+                            }
+                            std::collections::hash_map::Entry::Occupied(o) => {
+                                let existing = o.remove();
+                                voided_class_aliases.insert(key);
+                                class_alias_entry_location(&existing, &names)
+                            }
+                        }
+                    };
+                duplicate_declarations.push(DuplicateDeclaration {
+                    name: key,
+                    kind: DeclKind::ClassAlias,
+                    location,
+                    conflicting_source,
+                });
             }
 
             // Same overlay-seeded extend as `class_alias_decls` above.
@@ -2074,6 +2397,8 @@ impl EnvironmentDraft {
                 all_names,
                 aliases,
                 concern_block_targets: self.concern_block_targets,
+                duplicate_declarations,
+                constant_definitions,
             })
         })();
 
@@ -2208,7 +2533,6 @@ fn merge_nested_class(
     file: DeclOrigin,
     context: Context,
     decl: ClassDeclaration,
-    names: &NameTable,
 ) -> Result<(), BuildError> {
     use std::collections::hash_map::Entry;
     match map.entry(key) {
@@ -2244,7 +2568,7 @@ fn merge_nested_class(
                 entry.context_decls = decls.into_boxed_slice();
                 Ok(())
             }
-            ClassOrModule::Module(_) => Err(duplicate_decl_error(&key, names)),
+            ClassOrModule::Module(_) => Err(BuildError::DuplicatedDeclaration { name: key }),
         },
     }
 }
@@ -2255,7 +2579,6 @@ fn merge_nested_module(
     file: DeclOrigin,
     context: Context,
     decl: ModuleDeclaration,
-    names: &NameTable,
 ) -> Result<(), BuildError> {
     use std::collections::hash_map::Entry;
     match map.entry(key) {
@@ -2283,55 +2606,8 @@ fn merge_nested_module(
                 entry.context_decls = decls.into_boxed_slice();
                 Ok(())
             }
-            ClassOrModule::Class(_) => Err(duplicate_decl_error(&key, names)),
+            ClassOrModule::Class(_) => Err(BuildError::DuplicatedDeclaration { name: key }),
         },
-    }
-}
-
-fn insert_single_or_duplicate<D>(
-    map: &mut FxHashMap<TypeName, SingleEntry<D>>,
-    key: TypeName,
-    file: DeclOrigin,
-    context: Context,
-    decl: Arc<D>,
-    names: &NameTable,
-) -> Result<(), BuildError> {
-    use std::collections::hash_map::Entry;
-    match map.entry(key) {
-        Entry::Vacant(v) => {
-            v.insert(SingleEntry {
-                name: key,
-                file,
-                context,
-                decl,
-            });
-            Ok(())
-        }
-        Entry::Occupied(_) => Err(duplicate_decl_error(&key, names)),
-    }
-}
-
-fn insert_alias_or_duplicate(
-    map: &mut FxHashMap<TypeName, ClassOrModuleAliasEntry>,
-    key: TypeName,
-    file: DeclOrigin,
-    context: Context,
-    decl: ClassAliasDraft,
-    names: &NameTable,
-) -> Result<(), BuildError> {
-    use std::collections::hash_map::Entry;
-    match map.entry(key) {
-        Entry::Vacant(v) => {
-            let entry = ClassAliasEntry {
-                name: key,
-                file,
-                context,
-                decl,
-            };
-            v.insert(build_class_alias_entry(key, entry));
-            Ok(())
-        }
-        Entry::Occupied(_) => Err(duplicate_decl_error(&key, names)),
     }
 }
 
@@ -2445,10 +2721,6 @@ pub(crate) fn class_decl_has_super(d: &ClassDeclaration) -> bool {
         ClassDeclaration::Signature(s) => s.super_class.is_some(),
         ClassDeclaration::Ruby(r) => r.super_class.is_some(),
     }
-}
-
-fn duplicate_decl_error(key: &TypeName, _names: &NameTable) -> BuildError {
-    BuildError::DuplicatedDeclaration { name: *key }
 }
 
 fn merge_nested_interface(
@@ -2646,4 +2918,169 @@ fn type_params_match(first: &[TypeParam], other: &[TypeParam]) -> bool {
             && a.lower_bound == b.lower_bound
             && a.default_type == b.default_type
     })
+}
+
+/// `DeclKind` of a frozen class-or-module entry.
+fn class_or_module_kind(entry: &ClassOrModule) -> DeclKind {
+    match entry {
+        ClassOrModule::Class(_) => DeclKind::Class,
+        ClassOrModule::Module(_) => DeclKind::Module,
+    }
+}
+
+/// `SourceLocation` of a declaration from its [`DeclOrigin`] (or the
+/// decl's own `source_file`) and a name range. `None` when either side is
+/// missing — a G-snapshot entry or a location-less synthesized decl.
+fn entry_source_location(
+    file: DeclOrigin,
+    source_file: Option<Name>,
+    range: Option<LocationRange>,
+    names: &NameTable,
+) -> Option<SourceLocation> {
+    source_file
+        .or(file.file())
+        .zip(range)
+        .map(|(file, range)| SourceLocation {
+            file: PathBuf::from(names.resolve(file)),
+            range,
+        })
+}
+
+/// Ruby (prism) byte ranges carry no char offsets; the diagnostic
+/// emitter only reads the byte side, so char = byte here (same as the
+/// insert-time path's `conflicting_source`).
+fn prism_range(range: PrismByteRange) -> LocationRange {
+    LocationRange::new(range.0, range.0, range.1, range.1)
+}
+
+fn constant_draft_location(draft: &ConstantDraft, names: &NameTable) -> Option<SourceLocation> {
+    entry_source_location(
+        draft.entry.file,
+        None,
+        draft.entry.decl.location.map(|l| l.name_range),
+        names,
+    )
+}
+
+/// Report order for duplicate constants: the first candidate becomes the
+/// `conflicting_source`, every later one carries a diagnostic. RBS before
+/// Ruby (so the Ruby side is reported), then file path, then offset — a
+/// total order independent of load order.
+fn constant_report_order(
+    a: &ConstantDraft,
+    b: &ConstantDraft,
+    names: &NameTable,
+) -> std::cmp::Ordering {
+    let key = |c: &ConstantDraft| {
+        (
+            c.source,
+            c.entry.file.file().map(|f| names.resolve(f).to_string()),
+            c.entry.decl.location.map(|l| l.name_range.start_byte),
+        )
+    };
+    key(a).cmp(&key(b))
+}
+
+fn class_decl_location(
+    file: DeclOrigin,
+    decl: &ClassDeclaration,
+    names: &NameTable,
+) -> Option<SourceLocation> {
+    match decl {
+        ClassDeclaration::Signature(s) => {
+            entry_source_location(file, s.source_file, s.location.map(|l| l.name_range), names)
+        }
+        ClassDeclaration::Ruby(r) => {
+            entry_source_location(file, None, Some(prism_range(r.name_location)), names)
+        }
+    }
+}
+
+fn module_decl_location(
+    file: DeclOrigin,
+    decl: &ModuleDeclaration,
+    names: &NameTable,
+) -> Option<SourceLocation> {
+    match decl {
+        ModuleDeclaration::Signature(s) => {
+            entry_source_location(file, s.source_file, s.location.map(|l| l.name_range), names)
+        }
+        ModuleDeclaration::Ruby(r) => {
+            entry_source_location(file, None, Some(prism_range(r.name_location)), names)
+        }
+    }
+}
+
+/// Location of a frozen class-or-module entry: its most recent decl with
+/// a file, mirroring `ruby_decl`'s `class_or_module_source_location`.
+fn class_or_module_entry_location(
+    entry: &ClassOrModule,
+    names: &NameTable,
+) -> Option<SourceLocation> {
+    match entry {
+        ClassOrModule::Class(c) => c
+            .context_decls()
+            .iter()
+            .rev()
+            .find_map(|(file, _, decl)| class_decl_location(*file, decl, names)),
+        ClassOrModule::Module(m) => m
+            .context_decls()
+            .iter()
+            .rev()
+            .find_map(|(file, _, decl)| module_decl_location(*file, decl, names)),
+    }
+}
+
+fn class_alias_draft_location(
+    file: DeclOrigin,
+    decl: &ClassAliasDraft,
+    names: &NameTable,
+) -> Option<SourceLocation> {
+    match decl {
+        ClassAliasDraft::Class(c) => entry_source_location(
+            file,
+            c.source_file,
+            c.location.map(|l| l.new_name_range),
+            names,
+        ),
+        ClassAliasDraft::Module(m) => entry_source_location(
+            file,
+            m.source_file,
+            m.location.map(|l| l.new_name_range),
+            names,
+        ),
+        ClassAliasDraft::Ruby(r) => {
+            entry_source_location(file, None, Some(prism_range(r.name_location)), names)
+        }
+    }
+}
+
+fn class_alias_entry_location(
+    entry: &ClassOrModuleAliasEntry,
+    names: &NameTable,
+) -> Option<SourceLocation> {
+    match entry {
+        ClassOrModuleAliasEntry::Class(e) => match &e.decl {
+            ClassAliasDeclaration::Signature(c) => entry_source_location(
+                e.file,
+                c.source_file,
+                c.location.map(|l| l.new_name_range),
+                names,
+            ),
+            ClassAliasDeclaration::Ruby(r) => {
+                entry_source_location(e.file, None, Some(prism_range(r.name_location)), names)
+            }
+        },
+        ClassOrModuleAliasEntry::Module(e) => match &e.decl {
+            ModuleAliasDeclaration::Signature(m) => entry_source_location(
+                e.file,
+                m.source_file,
+                m.location.map(|l| l.new_name_range),
+                names,
+            ),
+            ModuleAliasDeclaration::Ruby(r) => {
+                entry_source_location(e.file, None, Some(prism_range(r.name_location)), names)
+            }
+        },
+    }
 }

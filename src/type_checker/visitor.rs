@@ -22,7 +22,9 @@ use crate::class_new_recognizer::is_class_dot_new;
 use crate::data_struct_recognizer::data_struct_construction_kind;
 use crate::definition::ConstantOrigin;
 use crate::definition_builder;
-use crate::diagnostic::{CandidateScope, ConstantKind, Diagnostic, DiagnosticKind};
+use crate::diagnostic::{
+    AssignmentTarget, CandidateScope, ConstantKind, Diagnostic, DiagnosticKind,
+};
 use crate::environment::DeclKindLocal;
 use crate::inline_parser::TrailingAnnotation;
 use crate::location::SourceLocation;
@@ -30,11 +32,14 @@ use crate::name::Name;
 use crate::type_name::{Kind, TypeName};
 use crate::type_param::TypeParamScope;
 use crate::types::{
-    FunctionType, Ty, Type, Visibility, partition_falsy, partition_truthy, union_of, union_of_many,
+    FunctionType, ProcType, Ty, Type, Visibility, partition_falsy, partition_truthy, union_of,
+    union_of_many,
 };
 
 use super::TypeChecker;
-use super::inference::{ConstantPathOutcome, resolve_cvar_at_self, resolve_ivar_at_self};
+use super::inference::{
+    ConstantPathOutcome, ConstantPathOutcomeKind, resolve_cvar_at_self, resolve_ivar_at_self,
+};
 use super::is_special_lvar_name;
 
 struct AssertionTypeLocator<'a> {
@@ -145,8 +150,8 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             && let Some(cr) = super_node.as_constant_read_node()
         {
             let super_name = String::from_utf8_lossy(cr.name().as_slice()).to_string();
-            let start = super_node.location().start_offset();
-            let end = super_node.location().end_offset();
+            let start = super_node.location().start() as usize;
+            let end = super_node.location().end() as usize;
             match self.try_resolve_constant_read(&super_name) {
                 Some(constant) => {
                     // extract v7: the superclass position records like
@@ -238,8 +243,8 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                 None if node.constant_path().as_constant_read_node().is_some() => {
                     let name = String::from_utf8_lossy(node.name().as_slice()).to_string();
                     let location = self.byte_range_to_location(
-                        node.constant_path().location().start_offset(),
-                        node.constant_path().location().end_offset(),
+                        node.constant_path().location().start() as usize,
+                        node.constant_path().location().end() as usize,
                     );
                     let candidate_scope = self.candidate_scope_in_enclosing_scope();
                     let searched_namespaces = self.searched_namespaces_in_enclosing_scope();
@@ -258,7 +263,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                 }
                 Some(DeclKindLocal::Module) => {
                     let qualified = self.env.names().display_type_name(tn);
-                    let location = self.offset_to_location(node.location().start_offset());
+                    let location = self.offset_to_location(node.location().start() as usize);
                     self.push_diagnostic(Diagnostic {
                         scope: None,
                         location,
@@ -347,8 +352,8 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                 None if node.constant_path().as_constant_read_node().is_some() => {
                     let name = String::from_utf8_lossy(node.name().as_slice()).to_string();
                     let location = self.byte_range_to_location(
-                        node.constant_path().location().start_offset(),
-                        node.constant_path().location().end_offset(),
+                        node.constant_path().location().start() as usize,
+                        node.constant_path().location().end() as usize,
                     );
                     let candidate_scope = self.candidate_scope_in_enclosing_scope();
                     let searched_namespaces = self.searched_namespaces_in_enclosing_scope();
@@ -367,7 +372,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                 }
                 Some(DeclKindLocal::Class) => {
                     let qualified = self.env.names().display_type_name(tn);
-                    let location = self.offset_to_location(node.location().start_offset());
+                    let location = self.offset_to_location(node.location().start() as usize);
                     self.push_diagnostic(Diagnostic {
                         scope: None,
                         location,
@@ -589,11 +594,9 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
         // (statement position, span mismatch). Extract reports exactly
         // what the check computed — it does not run its own inference
         // (ADR-lite: `consulted` is "what the check consulted").
-        let carried = self.extract_take_carried_type((
-            node.location().start_offset() as u32,
-            node.location().end_offset() as u32,
-        ));
-        self.record_extract_call_site(node, &resolved, carried);
+        let carried =
+            self.extract_take_carried_type((node.location().start(), node.location().end()));
+        self.record_extract_call_site(node, carried);
     }
 
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
@@ -676,8 +679,8 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
         let name_str = String::from_utf8_lossy(node.name().as_slice()).into_owned();
         self.check_deprecated_global_ref(
             &name_str,
-            node.location().start_offset(),
-            node.location().end_offset(),
+            node.location().start() as usize,
+            node.location().end() as usize,
         );
     }
 
@@ -700,7 +703,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             node.name().as_slice(),
             &node.value(),
             None,
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
     }
 
@@ -711,7 +714,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
             node.name().as_slice(),
             &node.value(),
             None,
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
     }
 
@@ -777,7 +780,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
         self.check_compound_cvar_write_rhs(
             node.name().as_slice(),
             &node.value(),
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
     }
 
@@ -787,7 +790,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
         self.check_compound_cvar_write_rhs(
             node.name().as_slice(),
             &node.value(),
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
     }
 
@@ -910,7 +913,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
 
         if let Some((block_is_none, req_positionals)) = info {
             if block_is_none {
-                let position = self.offset_to_location(node.location().start_offset());
+                let position = self.offset_to_location(node.location().start() as usize);
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location: position.clone(),
@@ -940,7 +943,7 @@ impl<'pr, 'env> Visit<'pr> for TypeChecker<'env> {
                     };
                     let actual = self.check_node(&arg, Some(expected));
                     if !self.subtyper().check(actual, expected) {
-                        let position = self.offset_to_location(arg.location().start_offset());
+                        let position = self.offset_to_location(arg.location().start() as usize);
                         self.push_diagnostic(Diagnostic {
                             scope: None,
                             location: position,
@@ -1040,6 +1043,7 @@ impl<'env> TypeChecker<'env> {
                         Type::Literal(crate::types::Literal::Bool(_)) => Ty::BOOL,
                         _ => ty,
                     }),
+                    target: AssignmentTarget::Variable,
                 },
             });
         }
@@ -1219,7 +1223,10 @@ impl<'env> TypeChecker<'env> {
         let name_str = String::from_utf8_lossy(node.name().as_slice());
         let name = self.checker_names().intern(&name_str);
         let ty = self.freeze_lvar_bound_type(ty, node.depth());
-        let byte_range = (node.location().start_offset(), node.location().end_offset());
+        let byte_range = (
+            node.location().start() as usize,
+            node.location().end() as usize,
+        );
         if self
             .bind_pinned_lvar_write(name, ty, node.depth(), byte_range)
             .is_some()
@@ -1354,6 +1361,8 @@ impl<'env> TypeChecker<'env> {
     /// non-Tuple / non-Array[T] RHS via the receiver's `to_ary` — the
     /// core steep-repo idiom `type, constr = synthesize(node)` where
     /// the RHS returns a class carrying `def to_ary: () -> [...]`.
+    // Implicit-conversion probe, not a dispatch: consulted only.
+    #[allow(clippy::disallowed_methods)]
     fn try_convert_to_ary_return_type(&self, receiver_ty: Ty) -> Option<Ty> {
         let to_ary = self.env.names().intern_symbol("to_ary");
         let resolved = super::method_resolver::lookup_method(self.env, receiver_ty, to_ary)?;
@@ -1711,6 +1720,77 @@ impl<'env> TypeChecker<'env> {
         }
     }
 
+    /// The `ClassMethods` module name the pipeline gives a
+    /// `class_methods do` block whose lexical class is `current`:
+    /// `ClassMethods` under the enclosing frame owner — the topic module
+    /// inside `concerning`, else the lexical class — composed with the
+    /// same `append_type_name` as `collect_class_methods_block`. Only a
+    /// name: whether the pipeline synthesized it is the environment's
+    /// answer.
+    fn class_methods_module_name(&self, current: TypeName) -> TypeName {
+        let base = match self.concerning_module {
+            Some((owner, module)) if owner == current => module,
+            _ => current,
+        };
+        let names = self.env.names();
+        names.append_type_name(base, names.intern_symbol("ClassMethods"))
+    }
+
+    /// `class_methods do` on an ActiveSupport::Concern module. Rails runs
+    /// the block as `ClassMethods.module_eval(&block)`, so the body is
+    /// walked once with the class stack replaced by the synthesized
+    /// `<C>::ClassMethods`: block statements see
+    /// `singleton(<C>::ClassMethods)`, a `def` in the body is checked in
+    /// that module's instance context, and `def self.x` on its
+    /// singleton — the rbs reading of a `module ClassMethods` written
+    /// out by hand. The cref stays lexical (`module_eval` with a block
+    /// keeps it), so constants resolve from the concern's nesting and a
+    /// constant only `ClassMethods` holds stays unknown, as in Ruby.
+    ///
+    /// Returns `false`, keeping the default walk, when the pipeline did
+    /// not synthesize the module from this block (not a Concern, no
+    /// members, infusion off): no module is pushed that the environment
+    /// does not have.
+    pub(super) fn walk_class_methods_block_body<'pr>(
+        &mut self,
+        call: &CallNode<'pr>,
+        block: &Node<'pr>,
+    ) -> bool {
+        if call.receiver().is_some()
+            || self.ctx.method_name().is_some()
+            || call.name().as_slice() != b"class_methods"
+        {
+            return false;
+        }
+        let Some(block_node) = block.as_block_node() else {
+            return false;
+        };
+        let Some(current) = self.ctx.current_class_typename().copied() else {
+            return false;
+        };
+        let module = self.class_methods_module_name(current);
+        let location = crate::inline_parser::prism_location_range(block_node.location());
+        let source_file = self.env.names().intern(&self.file.to_string_lossy());
+        if !self
+            .env
+            .ruby_module_has_member_within(module, Some(source_file), location)
+        {
+            return false;
+        }
+        let Some(body) = block_node.body() else {
+            return true;
+        };
+        let saved_class_stack = self.ctx.replace_class_stack_outside_cref(vec![module]);
+        let saved_singleton_class_depth = self.ctx.replace_singleton_class_depth(0);
+        // Same as `walk_class_construction_block_body`: no expected type
+        // for a `next` that exits this block.
+        self.with_next_hint(None, |checker| checker.check_node(&body, None));
+        self.ctx
+            .replace_singleton_class_depth(saved_singleton_class_depth);
+        self.ctx.restore_class_stack(saved_class_stack);
+        true
+    }
+
     /// Records the `<owner>::<Topic>` module of a receiver-less
     /// `concerning :Topic do` call for the duration of its block walk
     /// (the caller restores the returned previous value afterwards).
@@ -1747,6 +1827,43 @@ impl<'env> TypeChecker<'env> {
         let names = self.env.names();
         let module = names.append_type_name(base, names.intern_symbol(&topic));
         self.concerning_module = Some((current, module));
+        saved
+    }
+
+    /// `crema extract` only: records the module the pipeline would
+    /// synthesize for this block call as
+    /// [`Self::extract_block_module`] for the duration of its walk (the
+    /// caller restores the returned previous value). Called right after
+    /// [`Self::enter_concerning_block`], whose previous value is
+    /// `outer_concerning`: a `concerning` call it claimed names the new
+    /// topic module. A `class_methods` call names
+    /// [`Self::class_methods_module_name`]. Whether the pipeline really
+    /// synthesized it is left to the per-site check.
+    pub(super) fn enter_extract_block_module<'pr>(
+        &mut self,
+        call: &CallNode<'pr>,
+        outer_concerning: Option<(TypeName, TypeName)>,
+    ) -> Option<TypeName> {
+        let saved = self.extract_block_module;
+        if self.extract.is_none()
+            || call.receiver().is_some()
+            || self.ctx.method_name().is_some()
+            || call.block().and_then(|b| b.as_block_node()).is_none()
+        {
+            return saved;
+        }
+        let Some(current) = self.ctx.current_class_typename().copied() else {
+            return saved;
+        };
+        match call.name().as_slice() {
+            b"concerning" if self.concerning_module != outer_concerning => {
+                self.extract_block_module = self.concerning_module.map(|(_, module)| module);
+            }
+            b"class_methods" => {
+                self.extract_block_module = Some(self.class_methods_module_name(current));
+            }
+            _ => {}
+        }
         saved
     }
 
@@ -1873,7 +1990,8 @@ impl<'env> TypeChecker<'env> {
     /// reproducing the exact bug this lookup exists to fix (caught by
     /// crema-review adversarial pass on `assertion_type_lost_map_block_sig_defined_call`).
     pub(super) fn lookup_receiver_trailing_assertion<'pr>(&self, node: &Node<'pr>) -> Option<Ty> {
-        if let Some(ty) = self.lookup_trailing_assertion_ty_readonly(node.location().end_offset()) {
+        if let Some(ty) = self.lookup_trailing_assertion_ty_readonly(node.location().end() as usize)
+        {
             return Some(ty);
         }
         let body = node.as_parentheses_node()?.body()?;
@@ -1980,7 +2098,7 @@ impl<'env> TypeChecker<'env> {
     /// outer scope's now-stale binding (misreporting a valid assertion as
     /// false) — caught by crema-review adversarial pass.
     pub(super) fn apply_receiver_assertion_gate<'pr>(&mut self, node: &Node<'pr>) {
-        let end_offset = node.location().end_offset();
+        let end_offset = node.location().end() as usize;
         if self.trailing_node_assertion_adjacent(end_offset).is_some() {
             // `LocalVariableWriteNode` / `MultiWriteNode` / `ReturnNode`
             // each have their own dedicated pipeline that independently
@@ -2004,7 +2122,7 @@ impl<'env> TypeChecker<'env> {
             ) {
                 return;
             }
-            let start_offset = node.location().start_offset();
+            let start_offset = node.location().start() as usize;
             let natural = self.infer_type(node, None);
             if let Some(asserted) = self.lookup_trailing_assertion(start_offset, end_offset) {
                 let position = self.offset_to_location(start_offset);
@@ -2336,10 +2454,14 @@ impl<'env> TypeChecker<'env> {
             declared,
             declared,
             |name| DiagnosticKind::UnknownGlobalVariable { name },
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
         let name_loc = node.name_loc();
-        self.check_deprecated_global_ref(&name_str, name_loc.start_offset(), name_loc.end_offset());
+        self.check_deprecated_global_ref(
+            &name_str,
+            name_loc.start() as usize,
+            name_loc.end() as usize,
+        );
         rhs_ty
     }
 
@@ -2352,13 +2474,10 @@ impl<'env> TypeChecker<'env> {
     /// old default-walker RHS descent (`self.visit(node)`, no value)
     /// with `check_node` (mirrors the ivar/cvar/gvar plumbing above).
     ///
-    /// Unlike Steep's `casgn`, this does **not** yet subtype-check the
-    /// RHS against the declared type / emit `IncompatibleAssignment` on
-    /// a mismatch — the `visit_constant_or_write_node` /
-    /// `visit_constant_and_write_node` doc comment already calls out
-    /// that declared-type subtype gate as a separate todo
-    /// (statement-position side effect, out of scope for the
-    /// value-type plumbing this migration covers).
+    /// When the name resolves to a value-constant declaration (`N: T`),
+    /// the RHS is subtype-checked against `T` like Steep's `casgn`
+    /// (`check_constant_write_value`). Class / module targets
+    /// (`ConstantOrigin::Module`) only serve as the hint.
     ///
     /// `Const = Class.new(Parent?) { ... }` / `Struct.new` /
     /// `Data.define` stays untyped — that branch walks the block body
@@ -2370,8 +2489,10 @@ impl<'env> TypeChecker<'env> {
     pub(super) fn check_constant_write<'pr>(&mut self, node: &ConstantWriteNode<'pr>) -> Ty {
         self.ctx.invalidate_const_pure_calls();
         let name_str = String::from_utf8_lossy(node.name().as_slice()).to_string();
-        let position = self
-            .byte_range_to_location(node.name_loc().start_offset(), node.name_loc().end_offset());
+        let position = self.byte_range_to_location(
+            node.name_loc().start() as usize,
+            node.name_loc().end() as usize,
+        );
         // `class << self; S = 1` defines `S` on the singleton class
         // (Ruby cref), which no RBS declaration can spell — so it is
         // unknown by construction, with nothing searched and no extract
@@ -2398,11 +2519,7 @@ impl<'env> TypeChecker<'env> {
         }
         // Extract bookkeeping first, before the `Class.new do` fast
         // path below returns early, so that route records once too.
-        self.record_extract_constant_write(
-            node.location().start_offset(),
-            node.location().end_offset(),
-            Some(name_str.clone()),
-        );
+        self.record_extract_constant_write(node.location(), &node.value(), Some(name_str.clone()));
         // A constant write defines a new binding in the *current* cref
         // scope; the read-side resolver walks parent scopes and would
         // treat a same-named constant in an outer namespace as "already
@@ -2459,16 +2576,67 @@ impl<'env> TypeChecker<'env> {
             // `is_statement_assertion_eligible`, so no other site would.
             if let Some(cast) = &unwrapped.cast {
                 self.lookup_trailing_assertion(
-                    cast.location().start_offset(),
-                    cast.location().end_offset(),
+                    cast.location().start() as usize,
+                    cast.location().end() as usize,
                 );
             }
             self.walk_class_construction_block_body(&unwrapped.call, &name_str);
             return Ty::UNTYPED;
         }
 
-        let declared = resolved.map(|rc| rc.ty);
-        self.check_node(&node.value(), declared)
+        let name_loc = node.name_loc();
+        match resolved {
+            Some(rc) if matches!(rc.origin, ConstantOrigin::Constant) => self
+                .check_constant_write_value(
+                    &node.value(),
+                    rc.name,
+                    rc.ty,
+                    (name_loc.start() as usize, name_loc.end() as usize),
+                ),
+            resolved => self.check_node(&node.value(), resolved.map(|rc| rc.ty)),
+        }
+    }
+
+    /// RHS of a write to a declared value constant (`N: T`): synthesize
+    /// it under the hint `T` and report `IncompatibleAssignment` when it
+    /// is not a subtype of `T` — Steep `type_construction.rb` `:casgn`
+    /// (`synthesize(..., hint: constant_type)` then `check_relation`).
+    /// Returns the RHS type either way, like the ivar/gvar writes. The
+    /// range is the LHS (`N` / `A::N`) and is only turned into a
+    /// `SourceLocation` on the diagnostic path.
+    ///
+    /// An inline `N = v #: T` with no other declaration *is* the
+    /// declaration of `name`; it is not checked against itself (rbs's
+    /// inline parser does not compare annotation and value). The origin
+    /// lookup runs only on a mismatch, so a conforming write pays nothing.
+    fn check_constant_write_value(
+        &mut self,
+        value: &Node<'_>,
+        name: TypeName,
+        declared: Ty,
+        lhs_range: (usize, usize),
+    ) -> Ty {
+        let rhs_ty = self.check_node(value, Some(declared));
+        if !self.subtyper().check(rhs_ty, declared)
+            && !self.is_own_constant_declaration(name, lhs_range.0)
+        {
+            let location = self.byte_range_to_location(lhs_range.0, lhs_range.1);
+            self.push_diagnostic(Diagnostic {
+                scope: None,
+                location,
+                kind: DiagnosticKind::IncompatibleAssignment {
+                    lhs_type: self.display_type(declared),
+                    rhs_type: self.display_type(rhs_ty),
+                    target: AssignmentTarget::Constant,
+                },
+            });
+        }
+        rhs_ty
+    }
+
+    fn is_own_constant_declaration(&self, name: TypeName, lhs_start: usize) -> bool {
+        let file = self.env.names().intern(&self.file.to_string_lossy());
+        self.env.constant_declared_at(&name, file, lhs_start as u32)
     }
 
     /// `Const::Path = expr` in value position — the constant-path
@@ -2488,9 +2656,8 @@ impl<'env> TypeChecker<'env> {
     /// (`leaf_kind = Some(ConstantKind::Constant)`, matching a plain
     /// write's `ConstantKind::Constant`).
     ///
-    /// Like `check_constant_write`, this does **not** yet subtype-check
-    /// the RHS against the resolved declared type — the declared-type
-    /// subtype gate is the same separate todo noted there.
+    /// Like `check_constant_write`, a leaf that resolves to a value
+    /// constant has its RHS subtype-checked against the declared type.
     pub(super) fn check_constant_path_write<'pr>(
         &mut self,
         node: &ConstantPathWriteNode<'pr>,
@@ -2500,8 +2667,8 @@ impl<'env> TypeChecker<'env> {
         // Lexical spelling of the LHS; `None` on a dynamic parent, which
         // is exactly the `Malformed` case below.
         self.record_extract_constant_write(
-            node.location().start_offset(),
-            node.location().end_offset(),
+            node.location(),
+            &node.value(),
             static_constant_path_string(&target),
         );
         if matches!(outcome, ConstantPathOutcome::Malformed) {
@@ -2518,6 +2685,20 @@ impl<'env> TypeChecker<'env> {
             self.check_node(&node.value(), None)
         } else {
             self.emit_constant_path_outcome(&outcome, Some(ConstantKind::Constant));
+            if let ConstantPathOutcome::Walked {
+                kind: ConstantPathOutcomeKind::Resolved(declared, Some(leaf)),
+                ..
+            } = &outcome
+                && matches!(leaf.origin, ConstantOrigin::Constant)
+            {
+                let target_loc = target.location();
+                return self.check_constant_write_value(
+                    &node.value(),
+                    leaf.name,
+                    *declared,
+                    (target_loc.start() as usize, target_loc.end() as usize),
+                );
+            }
             let declared_ty = outcome.resolved_ty();
             let hint = (!declared_ty.is_untyped()).then_some(declared_ty);
             self.check_node(&node.value(), hint)
@@ -2533,11 +2714,15 @@ impl<'env> TypeChecker<'env> {
             node.name().as_slice(),
             &node.value(),
             hint,
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
         let name_str = String::from_utf8_lossy(node.name().as_slice()).into_owned();
         let name_loc = node.name_loc();
-        self.check_deprecated_global_ref(&name_str, name_loc.start_offset(), name_loc.end_offset());
+        self.check_deprecated_global_ref(
+            &name_str,
+            name_loc.start() as usize,
+            name_loc.end() as usize,
+        );
         ty
     }
 
@@ -2552,11 +2737,15 @@ impl<'env> TypeChecker<'env> {
             node.name().as_slice(),
             &node.value(),
             hint,
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
         let name_str = String::from_utf8_lossy(node.name().as_slice()).into_owned();
         let name_loc = node.name_loc();
-        self.check_deprecated_global_ref(&name_str, name_loc.start_offset(), name_loc.end_offset());
+        self.check_deprecated_global_ref(
+            &name_str,
+            name_loc.start() as usize,
+            name_loc.end() as usize,
+        );
         ty
     }
 
@@ -2643,8 +2832,8 @@ impl<'env> TypeChecker<'env> {
         }
         let no_splat = matches!(splat_shape, SplatShape::None);
         let assertion_ty = self.lookup_trailing_assertion(
-            node.location().start_offset(),
-            node.location().end_offset(),
+            node.location().start() as usize,
+            node.location().end() as usize,
         );
         let assertion_tuple: Option<Vec<Ty>> = assertion_ty.and_then(|ty| {
             let ty = definition_builder::expand_alias(self.env, ty);
@@ -2664,7 +2853,7 @@ impl<'env> TypeChecker<'env> {
             let nested_splat = elements.iter().any(|e| e.as_splat_node().is_some());
             if let Some(asserted) = assertion_ty {
                 let value_ty = self.check_node(&value_node, Some(asserted));
-                let position = self.offset_to_location(node.location().start_offset());
+                let position = self.offset_to_location(node.location().start() as usize);
                 self.emit_false_assertion_if_incompatible(value_ty, asserted, position);
                 if let Some(elem_types) = assertion_tuple.as_ref() {
                     let splat_for_distribute = splat_target_opt.unwrap_or(None);
@@ -2847,13 +3036,13 @@ impl<'env> TypeChecker<'env> {
                     (
                         w.name().as_slice().to_vec(),
                         w.value(),
-                        w.location().start_offset(),
+                        w.location().start() as usize,
                     )
                 } else if let Some(w) = node.as_instance_variable_and_write_node() {
                     (
                         w.name().as_slice().to_vec(),
                         w.value(),
-                        w.location().start_offset(),
+                        w.location().start() as usize,
                     )
                 } else {
                     return None;
@@ -2913,6 +3102,7 @@ impl<'env> TypeChecker<'env> {
                             kind: DiagnosticKind::IncompatibleAssignment {
                                 lhs_type: self.display_type(lhs),
                                 rhs_type: self.display_type(rhs_ty),
+                                target: AssignmentTarget::Variable,
                             },
                         });
                     }
@@ -2933,7 +3123,7 @@ impl<'env> TypeChecker<'env> {
         // normalize on a pure-Tuple union → expand + optional wrap).
         let checked_value_ty = self.check_node(&value_node, assertion_ty);
         if let Some(asserted) = assertion_ty {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.emit_false_assertion_if_incompatible(checked_value_ty, asserted, position);
         }
 
@@ -3024,7 +3214,7 @@ impl<'env> TypeChecker<'env> {
                 // the `nil` variant, matching Steep's `rhs_type` at
                 // `type_construction.rb:2932`. Location anchors on
                 // the RHS node (Steep passes `node: rhs`).
-                let position = self.offset_to_location(value_node.location().start_offset());
+                let position = self.offset_to_location(value_node.location().start() as usize);
                 self.push_diagnostic(Diagnostic {
                     scope: None,
                     location: position,
@@ -3138,8 +3328,8 @@ impl<'env> TypeChecker<'env> {
         let name_bytes = node.name().as_slice();
         if is_special_lvar_name(name_bytes) {
             self.lookup_trailing_assertion(
-                node.location().start_offset(),
-                node.location().end_offset(),
+                node.location().start() as usize,
+                node.location().end() as usize,
             );
             if name_bytes != b"__skip__" {
                 self.check_node(&node.value(), Some(Ty::UNTYPED));
@@ -3163,8 +3353,8 @@ impl<'env> TypeChecker<'env> {
         // to the last statement, `cond ? a : b` forwards it to both
         // branches.
         let assertion_ty = self.lookup_trailing_assertion(
-            node.location().start_offset(),
-            node.location().end_offset(),
+            node.location().start() as usize,
+            node.location().end() as usize,
         );
         let name_str = String::from_utf8_lossy(name_bytes);
         let name = self.checker_names().intern(&name_str);
@@ -3208,7 +3398,7 @@ impl<'env> TypeChecker<'env> {
         // (widening or narrowing) is accepted; only mutual incompatibility
         // surfaces as `FalseAssertion`.
         if let Some(asserted) = assertion_ty {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.emit_false_assertion_if_incompatible(value_type, asserted, position);
         }
 
@@ -3221,7 +3411,10 @@ impl<'env> TypeChecker<'env> {
         // `#: T` write inside a block reports IncompatibleAssignment
         // against the pin and never a second FalseAssertion for the
         // same mismatch (Steep, measured 2026-09-11).
-        let byte_range = (node.location().start_offset(), node.location().end_offset());
+        let byte_range = (
+            node.location().start() as usize,
+            node.location().end() as usize,
+        );
         if let Some(pinned) = self.bind_pinned_lvar_write(name, bound_ty, depth, byte_range) {
             return pinned;
         }
@@ -3290,8 +3483,10 @@ impl<'env> TypeChecker<'env> {
         let op_bytes = node.binary_operator().as_slice();
         let op_name = String::from_utf8_lossy(op_bytes).to_string();
         let op_loc = node.binary_operator_loc();
-        let name_location = self
-            .byte_range_to_location(op_loc.start_offset(), op_loc.start_offset() + op_name.len());
+        let name_location = self.byte_range_to_location(
+            op_loc.start() as usize,
+            op_loc.start() as usize + op_name.len(),
+        );
 
         let bound_ty = self.check_synthetic_method_call_with_single_arg_node(
             receiver_ty,
@@ -3301,7 +3496,10 @@ impl<'env> TypeChecker<'env> {
             name_location,
         );
         let bound_ty = self.freeze_lvar_bound_type(bound_ty, depth);
-        let byte_range = (node.location().start_offset(), node.location().end_offset());
+        let byte_range = (
+            node.location().start() as usize,
+            node.location().end() as usize,
+        );
         if let Some(pinned) = self.bind_pinned_lvar_write(name, bound_ty, depth, byte_range) {
             return pinned;
         }
@@ -3347,7 +3545,7 @@ impl<'env> TypeChecker<'env> {
             declared,
             declared,
             |name| DiagnosticKind::UnknownInstanceVariable { name },
-            node.location().start_offset(),
+            node.location().start() as usize,
         )
     }
 
@@ -3364,7 +3562,7 @@ impl<'env> TypeChecker<'env> {
         let declared = resolve_ivar_at_self(self, var_sym);
 
         let Some(declared_ty) = declared else {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: position,
@@ -3382,8 +3580,10 @@ impl<'env> TypeChecker<'env> {
         let op_bytes = node.binary_operator().as_slice();
         let op_name = String::from_utf8_lossy(op_bytes).to_string();
         let op_loc = node.binary_operator_loc();
-        let op_location = self
-            .byte_range_to_location(op_loc.start_offset(), op_loc.start_offset() + op_name.len());
+        let op_location = self.byte_range_to_location(
+            op_loc.start() as usize,
+            op_loc.start() as usize + op_name.len(),
+        );
         let result_ty =
             self.check_synthetic_method_call(declared_ty, &op_name, vec![rhs_type], op_location);
 
@@ -3393,13 +3593,14 @@ impl<'env> TypeChecker<'env> {
         // `Ty::UNTYPED`, which would trivially subtype the declared ivar
         // type and emit a spurious second diagnostic.
         if !result_ty.is_untyped() && !self.subtyper().check(result_ty, declared_ty) {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: position,
                 kind: DiagnosticKind::IncompatibleAssignment {
                     lhs_type: self.display_type(declared_ty),
                     rhs_type: self.display_type(result_ty),
+                    target: AssignmentTarget::Variable,
                 },
             });
         }
@@ -3452,7 +3653,7 @@ impl<'env> TypeChecker<'env> {
             declared,
             declared,
             |name| DiagnosticKind::UnknownClassVariable { name },
-            node.location().start_offset(),
+            node.location().start() as usize,
         );
         match declared {
             Some(lhs) if self.subtyper().check(rhs_ty, lhs) => rhs_ty,
@@ -3473,7 +3674,7 @@ impl<'env> TypeChecker<'env> {
         let declared = resolve_cvar_at_self(self, var_sym);
 
         let Some(declared_ty) = declared else {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: position,
@@ -3491,8 +3692,10 @@ impl<'env> TypeChecker<'env> {
         let op_bytes = node.binary_operator().as_slice();
         let op_name = String::from_utf8_lossy(op_bytes).to_string();
         let op_loc = node.binary_operator_loc();
-        let op_location = self
-            .byte_range_to_location(op_loc.start_offset(), op_loc.start_offset() + op_name.len());
+        let op_location = self.byte_range_to_location(
+            op_loc.start() as usize,
+            op_loc.start() as usize + op_name.len(),
+        );
         let result_ty =
             self.check_synthetic_method_call(declared_ty, &op_name, vec![rhs_type], op_location);
 
@@ -3502,13 +3705,14 @@ impl<'env> TypeChecker<'env> {
         // `Ty::UNTYPED`, which would trivially subtype the declared cvar
         // type and emit a spurious second diagnostic.
         if !result_ty.is_untyped() && !self.subtyper().check(result_ty, declared_ty) {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: position,
                 kind: DiagnosticKind::IncompatibleAssignment {
                     lhs_type: self.display_type(declared_ty),
                     rhs_type: self.display_type(result_ty),
+                    target: AssignmentTarget::Variable,
                 },
             });
             // Steep's `fallback_to_any` on this exact path (see doc
@@ -3533,10 +3737,14 @@ impl<'env> TypeChecker<'env> {
         let name_str = String::from_utf8_lossy(name_bytes).into_owned();
         let declared = self.env.lookup_global(&name_str);
         let name_loc = node.name_loc();
-        self.check_deprecated_global_ref(&name_str, name_loc.start_offset(), name_loc.end_offset());
+        self.check_deprecated_global_ref(
+            &name_str,
+            name_loc.start() as usize,
+            name_loc.end() as usize,
+        );
 
         let Some(declared_ty) = declared else {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: position,
@@ -3554,8 +3762,10 @@ impl<'env> TypeChecker<'env> {
         let op_bytes = node.binary_operator().as_slice();
         let op_name = String::from_utf8_lossy(op_bytes).to_string();
         let op_loc = node.binary_operator_loc();
-        let op_location = self
-            .byte_range_to_location(op_loc.start_offset(), op_loc.start_offset() + op_name.len());
+        let op_location = self.byte_range_to_location(
+            op_loc.start() as usize,
+            op_loc.start() as usize + op_name.len(),
+        );
         let result_ty =
             self.check_synthetic_method_call(declared_ty, &op_name, vec![rhs_type], op_location);
 
@@ -3565,13 +3775,14 @@ impl<'env> TypeChecker<'env> {
         // `Ty::UNTYPED`, which would trivially subtype the declared gvar
         // type and emit a spurious second diagnostic.
         if !result_ty.is_untyped() && !self.subtyper().check(result_ty, declared_ty) {
-            let position = self.offset_to_location(node.location().start_offset());
+            let position = self.offset_to_location(node.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: position,
                 kind: DiagnosticKind::IncompatibleAssignment {
                     lhs_type: self.display_type(declared_ty),
                     rhs_type: self.display_type(result_ty),
+                    target: AssignmentTarget::Variable,
                 },
             });
         }
@@ -3600,18 +3811,18 @@ impl<'env> TypeChecker<'env> {
             IndexCompoundWriteOp::Operator(
                 &op_name,
                 self.byte_range_to_location(
-                    op_loc.start_offset(),
-                    op_loc.start_offset() + op_name.len(),
+                    op_loc.start() as usize,
+                    op_loc.start() as usize + op_name.len(),
                 ),
             ),
             &node.value(),
             self.byte_range_to_location(
-                node.opening_loc().start_offset(),
-                node.closing_loc().end_offset(),
+                node.opening_loc().start() as usize,
+                node.closing_loc().end() as usize,
             ),
             self.byte_range_to_location(
-                op_loc.start_offset(),
-                op_loc.start_offset() + op_name.len(),
+                op_loc.start() as usize,
+                op_loc.start() as usize + op_name.len(),
             ),
         )
     }
@@ -3631,12 +3842,12 @@ impl<'env> TypeChecker<'env> {
             IndexCompoundWriteOp::Or,
             &node.value(),
             self.byte_range_to_location(
-                node.opening_loc().start_offset(),
-                node.closing_loc().end_offset(),
+                node.opening_loc().start() as usize,
+                node.closing_loc().end() as usize,
             ),
             self.byte_range_to_location(
-                node.operator_loc().start_offset(),
-                node.operator_loc().end_offset(),
+                node.operator_loc().start() as usize,
+                node.operator_loc().end() as usize,
             ),
         )
     }
@@ -3652,12 +3863,12 @@ impl<'env> TypeChecker<'env> {
             IndexCompoundWriteOp::And,
             &node.value(),
             self.byte_range_to_location(
-                node.opening_loc().start_offset(),
-                node.closing_loc().end_offset(),
+                node.opening_loc().start() as usize,
+                node.closing_loc().end() as usize,
             ),
             self.byte_range_to_location(
-                node.operator_loc().start_offset(),
-                node.operator_loc().end_offset(),
+                node.operator_loc().start() as usize,
+                node.operator_loc().end() as usize,
             ),
         )
     }
@@ -3674,8 +3885,10 @@ impl<'env> TypeChecker<'env> {
         let op_bytes = node.binary_operator().as_slice();
         let op_name = String::from_utf8_lossy(op_bytes).to_string();
         let op_loc = node.binary_operator_loc();
-        let op_location = self
-            .byte_range_to_location(op_loc.start_offset(), op_loc.start_offset() + op_name.len());
+        let op_location = self.byte_range_to_location(
+            op_loc.start() as usize,
+            op_loc.start() as usize + op_name.len(),
+        );
         let read_location = self.call_write_read_location(node.message_loc(), node.location());
         self.check_call_compound_write(
             node.receiver(),
@@ -3705,7 +3918,7 @@ impl<'env> TypeChecker<'env> {
             IndexCompoundWriteOp::Or,
             &node.value(),
             read_location,
-            self.byte_range_to_location(op_loc.start_offset(), op_loc.end_offset()),
+            self.byte_range_to_location(op_loc.start() as usize, op_loc.end() as usize),
         )
     }
 
@@ -3722,7 +3935,7 @@ impl<'env> TypeChecker<'env> {
             IndexCompoundWriteOp::And,
             &node.value(),
             read_location,
-            self.byte_range_to_location(op_loc.start_offset(), op_loc.end_offset()),
+            self.byte_range_to_location(op_loc.start() as usize, op_loc.end() as usize),
         )
     }
 
@@ -3737,8 +3950,8 @@ impl<'env> TypeChecker<'env> {
         node_loc: ruby_prism::Location<'_>,
     ) -> SourceLocation {
         match message_loc {
-            Some(l) => self.byte_range_to_location(l.start_offset(), l.end_offset()),
-            None => self.byte_range_to_location(node_loc.start_offset(), node_loc.end_offset()),
+            Some(l) => self.byte_range_to_location(l.start() as usize, l.end() as usize),
+            None => self.byte_range_to_location(node_loc.start() as usize, node_loc.end() as usize),
         }
     }
 
@@ -4040,6 +4253,7 @@ impl<'env> TypeChecker<'env> {
                         kind: DiagnosticKind::IncompatibleAssignment {
                             lhs_type: self.display_type(lhs),
                             rhs_type: self.display_type(rhs_ty),
+                            target: AssignmentTarget::Variable,
                         },
                     });
                 }
@@ -4104,11 +4318,12 @@ impl<'env> TypeChecker<'env> {
                     self.walk_reference_type_names(*v, record);
                 }
             }
-            Type::Proc {
-                type_,
-                self_type,
-                block,
-            } => {
+            Type::Proc(p) => {
+                let ProcType {
+                    type_,
+                    self_type,
+                    block,
+                } = &**p;
                 self.walk_reference_type_names_in_fn(type_, record);
                 if let Some(t) = *self_type {
                     self.walk_reference_type_names(t, record);

@@ -236,6 +236,16 @@ pub struct TypeChecker<'env> {
     /// back to the ordinary lookup. Set by `check_call_in_frame` around
     /// the block walk of a `concerning` call.
     concerning_module: Option<(TypeName, TypeName)>,
+    /// `crema extract` only: the module the infusion pipeline would
+    /// synthesize for the innermost `concerning :Topic do` /
+    /// `class_methods do` block the walk is inside (`<owner>::<Topic>`,
+    /// `<concern>::ClassMethods`). A candidate, not a verdict — an
+    /// `implements` record takes it as owner only when the environment
+    /// has the site registered on it
+    /// ([`TypeChecker::extract_synthesized_owner`]), so the class stack
+    /// the body is checked under never decides the owner. Set by
+    /// `check_call_in_frame` around the block walk.
+    extract_block_module: Option<TypeName>,
     /// Expected return type of the innermost block / lambda a `next`
     /// would exit (Steep `BreakContext#next_type`): the hint a `next`
     /// value is typed under. Set around a block body walk
@@ -320,6 +330,11 @@ pub struct TypeChecker<'env> {
     /// receiver) / diagnosed (NoMethod). Empty unless `extract` is
     /// `Some`; recording is bookkeeping only (no env queries).
     extract_call_states: RefCell<FxHashMap<(u32, u32), ExtractCallState>>,
+    /// Extract-mode dispatches the check walk performed that no entry
+    /// has finalized yet, keyed by site span (`extract_register_dispatch`
+    /// / `extract_finalize_dispatch`). Empty at the end of a file —
+    /// `check_source_extract` asserts it in debug builds.
+    extract_dispatches: RefCell<FxHashMap<(u32, u32), RegisteredDispatch>>,
     /// Extract-mode hand-off of check-computed expression types to the
     /// Visit-descent record point (`visit_call_node`), keyed by the
     /// consuming call node's byte span. The check deposits a value only
@@ -362,6 +377,11 @@ pub struct TypeChecker<'env> {
 struct CallFrame {
     span: (usize, usize),
     receiver_ty: Ty,
+    /// The call is written with an explicit receiver (`foo.bar`). The
+    /// inline collector never descends into such a call's arguments or
+    /// block, so an `attr_*` there registers nothing (see
+    /// [`TypeChecker::record_extract_attr_implements`]).
+    has_receiver: bool,
     /// Call arguments the frame's walk typed, in walk order. Keyed by
     /// the argument's span *and* the hint it was typed under: the
     /// collectors read a value back only when they would have inferred
@@ -387,6 +407,33 @@ pub(crate) enum ExtractCallState {
     NoMethodError,
 }
 
+/// Who is asking `resolve_call_target_at` to dispatch, for extract
+/// bookkeeping. Every caller states it. The check walk's dispatch of a
+/// site is registered once per span and finalized by the walk entry
+/// that owns the site; a read-only re-resolution — inference,
+/// narrowing material, a purity probe, the `&:sym` return-type
+/// inference — resolves the same site any number of times and never
+/// records. The explicit choice is the point: an implicit "not
+/// recorded" is how `&:sym` sites went missing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DispatchSite {
+    Record((u32, u32)),
+    Probe,
+}
+
+/// One dispatch the check walk performed, waiting for its walk entry
+/// to supply the site's expression type (`extract_register_dispatch`).
+#[derive(Debug)]
+struct RegisteredDispatch {
+    method_name: String,
+    /// Receiver type as the site saw it, before dispatch normalization
+    /// (`::Integer?`, not `::Integer | nil`).
+    receiver_type: String,
+    /// Whether the dispatch found a target; `symbols` is empty otherwise.
+    resolved: bool,
+    symbols: Vec<String>,
+}
+
 impl<'env> TypeChecker<'env> {
     fn new(
         env: ConsultationView<'env>,
@@ -405,6 +452,7 @@ impl<'env> TypeChecker<'env> {
             comments,
             suppress_method_body_last_assertion: false,
             concerning_module: None,
+            extract_block_module: None,
             next_hint: None,
 
             suppress_parens_routed_last_assertion: false,
@@ -418,6 +466,7 @@ impl<'env> TypeChecker<'env> {
             unify_depth_cap_hit: std::cell::Cell::new(false),
             extract: None,
             extract_call_states: RefCell::new(FxHashMap::default()),
+            extract_dispatches: RefCell::new(FxHashMap::default()),
             extract_carried_types: RefCell::new(FxHashMap::default()),
             extract_carry_armed: std::cell::Cell::new(false),
             call_frames: RefCell::new(Vec::new()),
@@ -594,46 +643,41 @@ impl<'env> TypeChecker<'env> {
         })
     }
 
-    /// Records every resolved call site for `crema extract`. Called
-    /// from the two walk entries for real `CallNode` sites (they know
-    /// the site's expression type — see the note in
-    /// `check_call_arguments`), plus the synthetic dispatch points for
-    /// compound writes.
+    /// Phase 1 of extract call recording: `resolve_call_target_at`
+    /// registers the dispatch the check walk just performed, keyed by
+    /// the site's span, before anyone knows the site's expression type.
+    /// The walk entry that owns the site finalizes it
+    /// ([`Self::extract_finalize_dispatch`]) with that type. Registering
+    /// at the dispatch entry is what makes a missing record structural
+    /// rather than per-path (specs/extract.md Goal 6): a dispatch that
+    /// reaches no finalize stays in the map and the end-of-file census
+    /// in `check_source_extract` reports it.
     ///
-    /// `expr_type` is the site's expression type (the call's return
-    /// type) when the check itself computed one, `None` otherwise.
-    /// Extract never runs its own inference for this field: a synthesis
-    /// the check does not perform would both widen `consulted` beyond
-    /// "what the check consulted" and, worse, run outside the site's
-    /// checked scope (block params unbound), producing wrong lookups.
-    fn record_extract_call(
+    /// The landing symbols are computed here so the registration owns
+    /// no `CallTarget` clone. Re-registering a span before its finalize
+    /// (a synthetic wrapper delegating to the plain synthetic dispatch
+    /// for the same span) replaces the earlier registration.
+    fn extract_register_dispatch(
         &self,
-        start_offset: usize,
-        end_offset: usize,
-        target: &CallTarget,
+        span: (u32, u32),
+        method_name: &str,
         receiver_type: Ty,
-        expr_type: Option<Ty>,
+        target: Option<&CallTarget>,
     ) {
-        let Some(collector) = &self.extract else {
+        if self.extract.is_none() {
             return;
-        };
+        }
         let mut symbols: Vec<String> = Vec::new();
         match target {
-            CallTarget::Method {
-                method_name,
-                method_def,
-                ..
-            } => {
+            None => {}
+            Some(CallTarget::Method { method_def, .. }) => {
                 symbols = self.extract_landing_symbols(method_def, method_name, receiver_type);
             }
             // Union receiver: the site dispatches into every component,
             // so each component's landing definition is "used" here.
             // Components sharing an implementation (a common ancestor's
             // method) dedupe to one symbol.
-            CallTarget::UnionMethod {
-                method_name,
-                components,
-            } => {
+            Some(CallTarget::UnionMethod { components, .. }) => {
                 for c in components {
                     for symbol in
                         self.extract_landing_symbols(&c.method_def, method_name, c.receiver_type)
@@ -645,16 +689,58 @@ impl<'env> TypeChecker<'env> {
                 }
             }
         }
-        let span = (start_offset as u32, end_offset as u32);
-        let state = match self.extract_take_call_state(span) {
-            Some(ExtractCallState::Error) => crate::extract::method_call_state::ERROR,
-            _ => crate::extract::method_call_state::TYPED,
+        self.extract_dispatches.borrow_mut().insert(
+            span,
+            RegisteredDispatch {
+                method_name: method_name.to_string(),
+                receiver_type: self.display_type(receiver_type),
+                resolved: target.is_some(),
+                symbols,
+            },
+        );
+    }
+
+    /// Phase 2: the walk entry that owns the site at `span` hands over
+    /// the expression type the check computed for it and the
+    /// registration becomes records. A resolved site records one
+    /// `typed` / `error` record per landing symbol. An unresolved site
+    /// records `untyped` / `no_method_error` only when
+    /// `check_call_arguments`' no-target branch flagged the span; with
+    /// no flag the site stayed silent (narrowed-to-bot local,
+    /// classifier-gated NoMethod) and leaves no record. A span with no
+    /// registration is a no-op: the entry ran for a site that never
+    /// reached the dispatch entry (a `&:sym` the resolver skipped).
+    ///
+    /// `expr_type` is the site's expression type (the call's return
+    /// type) when the check itself computed one, `None` otherwise.
+    /// Extract never runs its own inference for this field: a synthesis
+    /// the check does not perform would both widen `consulted` beyond
+    /// "what the check consulted" and, worse, run outside the site's
+    /// checked scope (block params unbound), producing wrong lookups.
+    pub(super) fn extract_finalize_dispatch(&self, span: (u32, u32), expr_type: Option<Ty>) {
+        let Some(collector) = &self.extract else {
+            return;
         };
-        let method_name = match target {
-            CallTarget::Method { method_name, .. }
-            | CallTarget::UnionMethod { method_name, .. } => method_name.clone(),
+        let Some(registered) = self.extract_dispatches.borrow_mut().remove(&span) else {
+            return;
         };
-        let receiver = self.display_type(receiver_type);
+        let flag = self.extract_take_call_state(span);
+        let (state, symbols) = if registered.resolved {
+            let state = match flag {
+                Some(ExtractCallState::Error) => crate::extract::method_call_state::ERROR,
+                _ => crate::extract::method_call_state::TYPED,
+            };
+            (state, registered.symbols.into_iter().map(Some).collect())
+        } else {
+            let state = match flag {
+                Some(ExtractCallState::Untyped) => crate::extract::method_call_state::UNTYPED,
+                Some(ExtractCallState::NoMethodError) => {
+                    crate::extract::method_call_state::NO_METHOD_ERROR
+                }
+                _ => return,
+            };
+            (state, vec![None])
+        };
         let return_type = expr_type.map(|t| self.display_type(t));
         for symbol in symbols {
             collector.push_method_call(crate::extract::MethodCallRecord {
@@ -662,15 +748,15 @@ impl<'env> TypeChecker<'env> {
                 kind: crate::extract::ReferenceKind::Call.as_str(),
                 start_byte: span.0,
                 end_byte: span.1,
-                method_name: method_name.clone(),
-                receiver_type: receiver.clone(),
+                method_name: registered.method_name.clone(),
+                receiver_type: registered.receiver_type.clone(),
                 return_type: return_type.clone(),
-                symbol: Some(symbol),
+                symbol,
             });
         }
     }
 
-    /// Super-side sibling of [`Self::record_extract_call`]: records a
+    /// Super-side sibling of [`Self::extract_finalize_dispatch`]: records a
     /// resolved `super` site. Called from both super resolution points
     /// — `check_super_node` (`super(args)`) and
     /// `emit_unexpected_super_if_unresolvable` (bare `super`) — on their
@@ -736,7 +822,9 @@ impl<'env> TypeChecker<'env> {
     /// resolution. Called from `visit_def_node` and reads the current
     /// class stack, so a `def` inside a Concern's `included do` /
     /// `prepended do` — walked once per include target by
-    /// `walk_concern_block_body` — records under each target.
+    /// `walk_concern_block_body` — records under each target. A site
+    /// the pipeline filed under a synthesized module records there
+    /// instead ([`Self::extract_synthesized_owner`]).
     pub(super) fn record_extract_implements<'pr>(&self, node: &ruby_prism::DefNode<'pr>) {
         let Some(collector) = &self.extract else {
             return;
@@ -751,8 +839,13 @@ impl<'env> TypeChecker<'env> {
                 return;
             }
         }
-        let owner = match self.ctx.current_class_typename() {
-            Some(tn) => self.env.names().display_type_name(*tn),
+        let start_byte = node.location().start();
+        let end_byte = node.location().end();
+        let owner = match self
+            .extract_synthesized_owner((start_byte, end_byte))
+            .or_else(|| self.ctx.current_class_typename().copied())
+        {
+            Some(tn) => self.env.names().display_type_name(tn),
             // Ruby semantics: a top-level `def` is a private instance
             // method on Object. (Inside any visited class body the
             // typename is always `Some` — `push_decl_class` skips the
@@ -771,9 +864,101 @@ impl<'env> TypeChecker<'env> {
             } else {
                 "instance_method"
             },
-            start_byte: node.location().start_offset() as u32,
-            end_byte: node.location().end_offset() as u32,
+            start_byte,
+            end_byte,
         });
+    }
+
+    /// The synthesized module a def / attr site at `span` is registered
+    /// on, for a site inside `concerning :Topic do` / a Concern's
+    /// `class_methods do`: Rails defines it there (`module_eval` on the
+    /// topic / `ClassMethods` module), and `definitions` /
+    /// `method_call` already name that module. `None` — keep the
+    /// lexical owner — when the walk is in no such block, or the
+    /// pipeline did not synthesize the candidate module (infusion off, a
+    /// module without `extend ActiveSupport::Concern`, a dynamic topic)
+    /// or filed the site elsewhere (`included do` sites go to each
+    /// include target). Asking the environment instead of the class
+    /// stack keeps the owner fixed whatever `self` the body is checked
+    /// under.
+    fn extract_synthesized_owner(&self, span: (u32, u32)) -> Option<TypeName> {
+        let module = self.extract_block_module?;
+        let file = self.env.names().intern(&self.file.to_string_lossy());
+        self.env
+            .ruby_module_declares_member_at(module, file, span)
+            .then_some(module)
+    }
+
+    /// Record the methods a receiverless `attr_reader` / `attr_writer` /
+    /// `attr_accessor` call defines as implementations, one per name
+    /// and accessor half, all anchored at the call (the span the inline
+    /// collector gives the attribute member, so `definitions` joins on
+    /// symbol + span). Called from `record_extract_call_site`, which
+    /// every walked call reaches once, and reads the class stack like
+    /// [`Self::record_extract_implements`] — a Concern's `included do`
+    /// body records once per include target.
+    ///
+    /// Mirrors the collector's registration rules (`collect_attr_call`)
+    /// so only sites it registers are recorded, in either mode: Symbol
+    /// literal names only, inside a class / module body (not the top
+    /// level, not a def body), and not under a call written with a
+    /// receiver (the collector stops at those, block included).
+    pub(super) fn record_extract_attr_implements<'pr>(&self, call: &ruby_prism::CallNode<'pr>) {
+        let Some(collector) = &self.extract else {
+            return;
+        };
+        if call.receiver().is_some() {
+            return;
+        }
+        let (reader, writer) = match call.name().as_slice() {
+            b"attr_reader" => (true, false),
+            b"attr_writer" => (false, true),
+            b"attr_accessor" => (true, true),
+            _ => return,
+        };
+        if self.ctx.method_name().is_some() {
+            return;
+        }
+        let Some(owner) = self.ctx.current_class_typename() else {
+            return;
+        };
+        if self.call_frames.borrow().iter().any(|f| f.has_receiver) {
+            return;
+        }
+        let Some(arguments) = call.arguments() else {
+            return;
+        };
+        let start_byte = call.location().start();
+        let end_byte = call.location().end();
+        let owner = self
+            .extract_synthesized_owner((start_byte, end_byte))
+            .unwrap_or(*owner);
+        let owner = self.env.names().display_type_name(owner);
+        let (separator, kind) = if self.ctx.in_singleton_class() {
+            (".", "singleton_method")
+        } else {
+            ("#", "instance_method")
+        };
+        for arg in arguments.arguments().iter() {
+            let Some(sym) = arg.as_symbol_node() else {
+                continue;
+            };
+            let name = String::from_utf8_lossy(sym.unescaped());
+            let push = |suffix: &str| {
+                collector.push_implements(crate::extract::ImplementsRecord {
+                    symbol: format!("{owner}{separator}{name}{suffix}"),
+                    kind,
+                    start_byte,
+                    end_byte,
+                });
+            };
+            if reader {
+                push("");
+            }
+            if writer {
+                push("=");
+            }
+        }
     }
 
     /// Record a constant assignment (`FOO = 1` / `A::B = 2`) as an
@@ -790,10 +975,10 @@ impl<'env> TypeChecker<'env> {
     /// never do, so one site is one record. Callers pass `None` for a
     /// dynamic-parent path (`obj.foo::BAR = 1`), which has no absolute
     /// rbs spelling and is skipped like `def obj.foo`.
-    pub(super) fn record_extract_constant_write(
+    pub(super) fn record_extract_constant_write<'pr>(
         &self,
-        start_offset: usize,
-        end_offset: usize,
+        location: ruby_prism::Location<'pr>,
+        value: &ruby_prism::Node<'pr>,
         path: Option<String>,
     ) {
         let Some(collector) = &self.extract else {
@@ -811,51 +996,88 @@ impl<'env> TypeChecker<'env> {
             }
         };
         collector.push_implements(crate::extract::ImplementsRecord {
-            symbol,
+            symbol: symbol.clone(),
             kind: "constant",
-            start_byte: start_offset as u32,
-            end_byte: end_offset as u32,
+            start_byte: location.start(),
+            end_byte: location.end(),
         });
+        self.record_extract_data_struct_members(&symbol, location, value);
     }
 
-    /// Record a call site whose target did not resolve, from the same
-    /// walk entries as [`Self::record_extract_call`]. The state comes
-    /// from the flag `check_call_arguments`' no-target branch left for
-    /// this span: `Untyped` (receiver untyped, resolution never
-    /// attempted) or `NoMethodError` (receiver resolved, the NoMethod
-    /// diagnostic actually fired). No flag means the site stayed
-    /// silent (narrowed-to-bot local, classifier-gated NoMethod) and is not
-    /// recorded — the v1 silent boundary is preserved.
-    fn record_extract_call_no_target<'pr>(
+    /// `Const = Struct.new(:x)` / `Const = Data.define(:x)` declares a
+    /// class whose members are methods: record each as an instance
+    /// method implementation of `owner` (the constant's symbol),
+    /// anchored at its Symbol argument like the collector's attribute
+    /// member. Block or not — the no-block form never reaches the
+    /// checker's `Class.new do` fast path, so the constant write is the
+    /// one point every form passes.
+    ///
+    /// Mirrors `process_constant_assignment`: a trailing `#: T` /
+    /// `# @rbs class-alias` / `# @rbs module-alias` makes the write a
+    /// constant or alias, not a class, so no members. The call shape,
+    /// member arguments and readonly flag come from the helpers the
+    /// collector itself uses.
+    fn record_extract_data_struct_members<'pr>(
         &self,
-        node: &ruby_prism::CallNode<'pr>,
-        receiver_type: Ty,
-        expr_type: Option<Ty>,
+        owner: &str,
+        location: ruby_prism::Location<'pr>,
+        value: &ruby_prism::Node<'pr>,
     ) {
+        use crate::inline_parser::TrailingAnnotation;
         let Some(collector) = &self.extract else {
             return;
         };
-        let span = (
-            node.location().start_offset() as u32,
-            node.location().end_offset() as u32,
-        );
-        let state = match self.extract_take_call_state(span) {
-            Some(ExtractCallState::Untyped) => crate::extract::method_call_state::UNTYPED,
-            Some(ExtractCallState::NoMethodError) => {
-                crate::extract::method_call_state::NO_METHOD_ERROR
-            }
-            _ => return,
+        let Some(unwrapped) =
+            crate::cast_unwrap::unwrap_cast(value, &crate::cast_unwrap::CastUnwrapConfig::PARSER)
+        else {
+            return;
         };
-        collector.push_method_call(crate::extract::MethodCallRecord {
-            state,
-            kind: crate::extract::ReferenceKind::Call.as_str(),
-            start_byte: span.0,
-            end_byte: span.1,
-            method_name: String::from_utf8_lossy(node.name().as_slice()).into_owned(),
-            receiver_type: self.display_type(receiver_type),
-            return_type: expr_type.map(|t| self.display_type(t)),
-            symbol: None,
-        });
+        let Some(kind) =
+            crate::data_struct_recognizer::data_struct_construction_kind(&unwrapped.call)
+        else {
+            return;
+        };
+        if self.comments.has_trailing_annotations() {
+            let end_line = self
+                .line_index
+                .line((location.end() as usize).saturating_sub(1));
+            if matches!(
+                self.comments.trailing_annotation(&self.source, end_line),
+                Some(
+                    TrailingAnnotation::NodeTypeAssertion { .. }
+                        | TrailingAnnotation::ClassAlias { .. }
+                        | TrailingAnnotation::ModuleAlias { .. }
+                )
+            ) {
+                return;
+            }
+        }
+        let options = crate::inline_parser::DataStructOptions::read(
+            &self.comments,
+            &self.line_index,
+            &unwrapped.call,
+            location,
+        );
+        let writer = options.defines_writers(kind);
+        for sym in crate::inline_parser::data_struct_member_symbols(&unwrapped.call) {
+            let name = String::from_utf8_lossy(sym.unescaped());
+            let start_byte = sym.location().start();
+            let end_byte = sym.location().end();
+            collector.push_implements(crate::extract::ImplementsRecord {
+                symbol: format!("{owner}#{name}"),
+                kind: "instance_method",
+                start_byte,
+                end_byte,
+            });
+            if writer {
+                collector.push_implements(crate::extract::ImplementsRecord {
+                    symbol: format!("{owner}#{name}="),
+                    kind: "instance_method",
+                    start_byte,
+                    end_byte,
+                });
+            }
+        }
     }
 
     /// Record a constant read site for extract mode. `leaf` is the
@@ -1422,6 +1644,20 @@ pub fn check_source_extract(
     let mut checker = TypeChecker::new(view, file, source.to_vec(), line_index, comments);
     checker.extract = Some(crate::extract::ExtractSitesCollector::new());
     checker.visit(&root);
+    // Census: every dispatch the check walk registered must have been
+    // finalized by a walk entry. A leftover is an entry that forgot its
+    // record — the leak Goal 6 forbids, caught here instead of by a
+    // consumer's count going quietly wrong.
+    debug_assert!(
+        checker.extract_dispatches.borrow().is_empty(),
+        "extract: dispatches registered but never finalized in {}: {:?}",
+        checker.file.display(),
+        checker
+            .extract_dispatches
+            .borrow()
+            .keys()
+            .collect::<Vec<_>>()
+    );
     checker
         .extract
         .expect("set above, never cleared")

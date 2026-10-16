@@ -5,7 +5,7 @@ use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::environment::DeclKindLocal;
 use crate::substitution::Substitution;
 use crate::type_name::TypeName;
-use crate::types::{MethodType, Ty, Type, intersection_of, union_of, union_of_many};
+use crate::types::{MethodType, ProcType, Ty, Type, intersection_of, union_of, union_of_many};
 
 use super::{MethodTarget, TypeChecker};
 
@@ -287,15 +287,15 @@ impl<'env> TypeChecker<'env> {
             self.ctx.set_local_variable(name, hash_type);
         }
 
-        if let Some(block_param) = params.block()
+        if let Some(block_param) = params.block().and_then(|b| b.as_block_parameter_node())
             && let Some(block) = method_type.block.as_ref()
             && let Some(name_id) = block_param.name()
         {
-            let proc_ty = self.env.types().intern(Type::Proc {
+            let proc_ty = self.env.types().intern(Type::Proc(Box::new(ProcType {
                 type_: block.type_.clone(),
                 self_type: block.self_type,
                 block: None,
-            });
+            })));
             let ty = if block.required {
                 proc_ty
             } else {
@@ -343,7 +343,7 @@ impl<'env> TypeChecker<'env> {
         {
             names.push(name);
         }
-        if let Some(block) = params.block()
+        if let Some(block) = params.block().and_then(|b| b.as_block_parameter_node())
             && let Some(name) = block.name()
         {
             names.push(name);
@@ -414,10 +414,11 @@ impl<'env> TypeChecker<'env> {
         // A trailing `#: T` on the `return` line overrides the natural
         // type (Steep `:assertion` parity), exactly as the assignment
         // path treats `x = expr #: T`.
-        let actual = if let Some(asserted) = self
-            .lookup_trailing_assertion(node.location().start_offset(), node.location().end_offset())
-        {
-            let position = self.offset_to_location(node.location().start_offset());
+        let actual = if let Some(asserted) = self.lookup_trailing_assertion(
+            node.location().start() as usize,
+            node.location().end() as usize,
+        ) {
+            let position = self.offset_to_location(node.location().start() as usize);
             self.emit_false_assertion_if_incompatible(natural, asserted, position);
             asserted
         } else {
@@ -445,7 +446,7 @@ impl<'env> TypeChecker<'env> {
             && (!bidirectional || subtyper.check(gate_expected, actual));
         if !gate_ok {
             let method_name = self.ctx.method_name().unwrap_or("(unknown)").to_string();
-            let location = self.offset_to_location(node.location().start_offset());
+            let location = self.offset_to_location(node.location().start() as usize);
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location,
@@ -496,7 +497,7 @@ impl<'env> TypeChecker<'env> {
             return;
         }
 
-        let method_location = self.offset_to_location(node.location().start_offset());
+        let method_location = self.offset_to_location(node.location().start() as usize);
 
         // The three axes (positional per-param, keyword, kwrestarg) are
         // detected independently — a positional-kind divergence must not
@@ -626,7 +627,7 @@ impl<'env> TypeChecker<'env> {
             None => {
                 if !self.unified_return_accepts(&merged, Ty::NIL, &instance_subst) {
                     let expected = merged.return_type();
-                    let location = self.offset_to_location(node.location().start_offset());
+                    let location = self.offset_to_location(node.location().start() as usize);
                     self.push_diagnostic(Diagnostic {
                         scope: None,
                         location,
@@ -682,7 +683,7 @@ impl<'env> TypeChecker<'env> {
         }
 
         let expected_return = merged.return_type();
-        let location = self.offset_to_location(node.location().start_offset());
+        let location = self.offset_to_location(node.location().start() as usize);
         self.push_diagnostic(Diagnostic {
             scope: None,
             location,
@@ -865,10 +866,10 @@ fn last_stmt_offsets(body: &Node<'_>) -> (usize, usize) {
         && let Some(last) = stmts.body().iter().last()
     {
         let loc = last.location();
-        return (loc.start_offset(), loc.end_offset());
+        return (loc.start() as usize, loc.end() as usize);
     }
     let loc = body.location();
-    (loc.start_offset(), loc.end_offset())
+    (loc.start() as usize, loc.end() as usize)
 }
 
 pub(super) fn return_type_hint(return_type: Ty) -> Option<Ty> {
@@ -1253,8 +1254,8 @@ impl RubyParams {
                     ruby_kind: "required positional".to_string(),
                     rbs_kind: "rest parameter".to_string(),
                     range: (
-                        param.location().start_offset(),
-                        param.location().end_offset(),
+                        param.location().start() as usize,
+                        param.location().end() as usize,
                     ),
                     class: ParamMismatchClass::Strict,
                 });
@@ -1269,8 +1270,8 @@ impl RubyParams {
                     ruby_kind: "required positional".to_string(),
                     rbs_kind: "optional positional".to_string(),
                     range: (
-                        param.location().start_offset(),
-                        param.location().end_offset(),
+                        param.location().start() as usize,
+                        param.location().end() as usize,
                     ),
                     class: ParamMismatchClass::Strict,
                 });
@@ -1285,8 +1286,8 @@ impl RubyParams {
                     ruby_kind: "required positional".to_string(),
                     rbs_kind: "no parameter".to_string(),
                     range: (
-                        param.location().start_offset(),
-                        param.location().end_offset(),
+                        param.location().start() as usize,
+                        param.location().end() as usize,
                     ),
                     class: ParamMismatchClass::Strict,
                 });
@@ -1339,8 +1340,8 @@ impl RubyParams {
                         ruby_kind: "rest parameter".to_string(),
                         rbs_kind,
                         range: (
-                            rest_node.location().start_offset(),
-                            rest_node.location().end_offset(),
+                            rest_node.location().start() as usize,
+                            rest_node.location().end() as usize,
                         ),
                         class: ParamMismatchClass::Loose,
                     });
@@ -1368,8 +1369,8 @@ impl RubyParams {
                         ruby_kind: "trailing positional".to_string(),
                         rbs_kind,
                         range: (
-                            param.location().start_offset(),
-                            param.location().end_offset(),
+                            param.location().start() as usize,
+                            param.location().end() as usize,
                         ),
                         class: ParamMismatchClass::Strict,
                     });
@@ -1402,8 +1403,8 @@ impl RubyParams {
                     ruby_kind: "optional positional".to_string(),
                     rbs_kind: rbs_kind.to_string(),
                     range: (
-                        param.location().start_offset(),
-                        param.location().end_offset(),
+                        param.location().start() as usize,
+                        param.location().end() as usize,
                     ),
                     class: ParamMismatchClass::Loose,
                 });

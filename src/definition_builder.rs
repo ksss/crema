@@ -1110,6 +1110,21 @@ impl DefinitionBuilder {
         deprecated_annotation(&entry.decl.annotations, self.env.names())
     }
 
+    /// Whether constant `name` is declared by the write whose LHS name
+    /// starts at `name_start_byte` in `file` — i.e. an inline
+    /// `N = v #: T` that is its own declaration. A write is not checked
+    /// against the declaration it makes (rbs's inline parser does not
+    /// compare the annotation with the value either).
+    pub fn constant_declared_at(&self, name: &TypeName, file: Name, name_start_byte: u32) -> bool {
+        self.env.constant_decls().get(name).is_some_and(|entry| {
+            entry.file == DeclOrigin::Path(file)
+                && entry
+                    .decl
+                    .location
+                    .is_some_and(|loc| loc.name_range.start_byte == name_start_byte)
+        })
+    }
+
     /// Look up a global's lowered `Ty` by name string (`"$stdout"` etc).
     /// On-the-fly lowering of the raw `Global` decl held on `Environment`
     /// (ADR-0019). Returns `None` when `name` is not declared as a global.
@@ -1227,6 +1242,75 @@ impl DefinitionBuilder {
                 e.location == location && e.source_file.is_none_or(|f| Some(f) == source_file)
             })
             .map(|e| e.targets.clone())
+    }
+
+    /// Whether a Ruby declaration of module `module` loaded from `file`
+    /// holds a `def` / `attr_*` member written at exactly `span`: the
+    /// environment's own answer to "this site was registered on that
+    /// module". The infusion pipeline files the def / attr sites of a
+    /// Concern's `class_methods do` and of `concerning :Topic do` under
+    /// the module it synthesizes, and only when it synthesizes one.
+    pub(crate) fn ruby_module_declares_member_at(
+        &self,
+        module: TypeName,
+        file: Name,
+        span: PrismByteRange,
+    ) -> bool {
+        let Some(ClassOrModule::Module(entry)) = self.env.class_decls().get(&module) else {
+            return false;
+        };
+        entry
+            .context_decls()
+            .iter()
+            .any(|(origin, _, decl)| match decl {
+                ModuleDeclaration::Ruby(decl) if origin.file() == Some(file) => {
+                    decl.members.iter().any(|member| {
+                        let location = match member {
+                            RubyMember::Def(m) => m.location,
+                            RubyMember::AttrReader(m) => m.attribute.location,
+                            RubyMember::AttrWriter(m) => m.attribute.location,
+                            RubyMember::AttrAccessor(m) => m.attribute.location,
+                            _ => return false,
+                        };
+                        location == span
+                    })
+                }
+                _ => false,
+            })
+    }
+
+    /// Whether a Ruby declaration of module `module` loaded from
+    /// `source_file` holds a member written inside `block`: the
+    /// environment's own answer to "the infusion pipeline synthesized
+    /// this module from this block". `collect_class_methods_block` files
+    /// a Concern's `class_methods do` members under `<C>::ClassMethods`
+    /// and synthesizes nothing for a block without members, a module
+    /// without `extend ActiveSupport::Concern`, or with infusion off. A
+    /// declaration loaded without a file (an in-memory source) matches
+    /// any `source_file`, as in `concern_block_targets`.
+    pub(crate) fn ruby_module_has_member_within(
+        &self,
+        module: TypeName,
+        source_file: Option<Name>,
+        block: PrismByteRange,
+    ) -> bool {
+        let Some(ClassOrModule::Module(entry)) = self.env.class_decls().get(&module) else {
+            return false;
+        };
+        entry
+            .context_decls()
+            .iter()
+            .any(|(origin, _, decl)| match decl {
+                ModuleDeclaration::Ruby(decl)
+                    if origin.file().is_none_or(|f| Some(f) == source_file) =>
+                {
+                    decl.members.iter().any(|member| {
+                        !matches!(member, RubyMember::Declaration(_))
+                            && (block.0..block.1).contains(&member.location_start())
+                    })
+                }
+                _ => false,
+            })
     }
 
     /// Shortcut for `self.env().names()`. Free functions reach the
@@ -2774,6 +2858,14 @@ fn flush_bucket_via_sorter(
                 );
             }
         } else {
+            // Two or more canonical originals is the
+            // `DuplicatedMethodDefinition` `collect_method_dups` already
+            // recorded. Neither declaration survives (specs/inline.md Goal
+            // 2: no merge, no first-wins) — the name is simply absent, so
+            // a call site sees `NoMethod` next to the dup diagnostic.
+            if defn.originals.len() > 1 {
+                return;
+            }
             let method = lower_bucket_defn_to_method(
                 defn,
                 owner,
@@ -5140,6 +5232,7 @@ pub fn normalize_receiver(env: ConsultationView, ty: Ty) -> Ty {
 pub enum ConsultedKey {
     ExpandTypeAlias(TypeName),
     ConstantDeprecated(TypeName),
+    ConstantDeclSite(TypeName),
     GlobalLookup(Symbol),
     GlobalDeprecated(Symbol),
     ClassOrModuleDeprecated(TypeName),
@@ -5197,6 +5290,13 @@ pub enum ConsultedKey {
         /// Resolved from the raw `Name` at the call site — see the
         /// [`ConsultedKey`] doc comment for why the id itself cannot be
         /// used as a key.
+        source_file: Option<String>,
+    },
+    /// `DefinitionBuilder::ruby_module_has_member_within`.
+    RubyModuleMemberWithin {
+        module: TypeName,
+        block: PrismByteRange,
+        /// Resolved like `ConcernBlockTargets::source_file`.
         source_file: Option<String>,
     },
     ConstantResolution {
@@ -5320,6 +5420,14 @@ impl<'a> ConsultationView<'a> {
     pub fn constant_deprecated_message(&self, name: &TypeName) -> Option<Option<String>> {
         let result = self.builder.constant_deprecated_message(name);
         self.record(|| ConsultedKey::ConstantDeprecated(*name), result.is_some());
+        result
+    }
+
+    pub fn constant_declared_at(&self, name: &TypeName, file: Name, name_start_byte: u32) -> bool {
+        let result = self
+            .builder
+            .constant_declared_at(name, file, name_start_byte);
+        self.record(|| ConsultedKey::ConstantDeclSite(*name), result);
         result
     }
 
@@ -5663,6 +5771,38 @@ impl<'a> ConsultationView<'a> {
 
     pub fn types(&self) -> &'a TypeTable {
         self.builder.types()
+    }
+
+    /// Not recorded: only `crema extract` asks, to name the owner of an
+    /// `implements` record, and no diagnostic depends on the answer.
+    pub(crate) fn ruby_module_declares_member_at(
+        &self,
+        module: TypeName,
+        file: Name,
+        span: PrismByteRange,
+    ) -> bool {
+        self.builder
+            .ruby_module_declares_member_at(module, file, span)
+    }
+
+    pub(crate) fn ruby_module_has_member_within(
+        &self,
+        module: TypeName,
+        source_file: Option<Name>,
+        block: PrismByteRange,
+    ) -> bool {
+        let result = self
+            .builder
+            .ruby_module_has_member_within(module, source_file, block);
+        self.record(
+            || ConsultedKey::RubyModuleMemberWithin {
+                module,
+                block,
+                source_file: source_file.map(|n| self.builder.names().resolve(n).to_string()),
+            },
+            result,
+        );
+        result
     }
 
     /// Recorded (unlike the interner passthroughs above): the linearized

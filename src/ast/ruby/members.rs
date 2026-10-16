@@ -517,6 +517,7 @@ impl DocStyle {
                 block.take(),
                 params
                     .block()
+                    .and_then(|b| b.as_block_parameter_node())
                     .map(|bp| bp.name().map(|n| prism_name_to_string(n.as_slice()))),
                 &mut unused,
             );

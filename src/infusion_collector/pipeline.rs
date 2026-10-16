@@ -863,7 +863,7 @@ struct SyntheticClassMethodsExtend {
 
 struct ClassMethodsCollector<'a> {
     names: &'a NameTable,
-    /// Pre-interned `file`, stamped on attr members. Never interned here:
+    /// Pre-interned `file`, stamped on def and attr members. Never interned here:
     /// on a parallel-ingest worker `names` is a table that must not
     /// mint positional `Name`s (see `NameTable::merge`).
     source_file: Option<Name>,
@@ -1118,7 +1118,7 @@ fn annotated_def_method_type(
 ) -> MethodTypeAnnotation {
     let (leading_block, trailing_block) = match src.comments {
         Some(comments) => {
-            let def_start_line = src.line_index.line(node.location().start_offset());
+            let def_start_line = src.line_index.line(node.location().start() as usize);
             (
                 collect_consecutive_leading(comments, def_start_line),
                 collect_trailing_block(src.source, comments, def_start_line),
@@ -1207,7 +1207,7 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
             name_location: prism_location_range(node.name_loc()),
             method_type,
             leading_comment: None,
-            source_file: None,
+            source_file: self.source_file,
         }));
     }
 
@@ -1246,7 +1246,7 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
         let trailing = self.comments.and_then(|comments| {
             let end_line = self
                 .line_index
-                .line(node.location().end_offset().saturating_sub(1));
+                .line((node.location().end() as usize).saturating_sub(1));
             comments.trailing_annotation(self.source, end_line)
         });
         let (type_text, annotation_range) = match trailing {
