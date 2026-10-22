@@ -20,12 +20,15 @@ use crate::config::InfusionOptions;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::environment::draft::EnvironmentDraft;
 use crate::environment::frozen::ConcernBlockTargets;
+use crate::environment::resolution::TypeNameResolver;
 
 use crate::environment::ruby_decl::build_annotation_syntax_error;
+use crate::infusion_collector::active_record_synthesis::collect_declared_class_module_names;
 use crate::infusion_collector::activerecord::{
     ActiveRecordAssociation, ActiveRecordEnumMapping, ActiveRecordScope,
 };
 use crate::infusion_collector::inflector::{self, Inflector};
+use crate::infusion_collector::sidekiq::resolve_mixin_argument;
 use crate::infusion_collector::{
     active_record_synthesis, activemodel, activerecord, activesupport,
 };
@@ -331,115 +334,143 @@ pub fn load_collected<'a>(
         .flatten()
         .flat_map(|source| source.paranoia_models.iter().copied())
         .collect::<Vec<_>>();
-    for source in collected.iter().flatten() {
-        for site in &source.concern_sites {
-            let Some(concern) = resolve_concern(&concerns, &site.module_names) else {
+    // Every site and concern dependency is resolved up front, against
+    // the draft as the Ruby decls above left it: the expansion below
+    // inserts into the draft, which the resolver borrows. Without a
+    // Ruby concern there is nothing to expand, and no resolver to build.
+    let (graph, site_concerns) = if concerns.is_empty() {
+        (
+            ConcernGraph {
+                concerns,
+                dependencies: FxHashMap::default(),
+            },
+            Vec::new(),
+        )
+    } else {
+        let names = draft.names();
+        let all_names = collect_declared_class_module_names(draft);
+        let aliases = super::sidekiq::alias_map(draft);
+        let resolver = TypeNameResolver::new(&all_names, &aliases, names);
+        let resolve = |raw: &str, lexical_context: &[TypeName]| {
+            resolve_mixin_argument(&resolver, &aliases, names, raw, lexical_context)
+        };
+        let graph = ConcernGraph::new(concerns, resolve);
+        let site_concerns: Vec<(&ConcernSite, &ConcernDef)> = collected
+            .iter()
+            .flatten()
+            .flat_map(|source| source.concern_sites.iter())
+            .filter_map(|site| {
+                let name = resolve(&site.raw_module_name, &site.lexical_context)?;
+                Some((site, graph.concerns.get(&name).copied()?))
+            })
+            .collect();
+        (graph, site_concerns)
+    };
+    for (site, concern) in site_concerns {
+        if site.target == concern.name {
+            continue;
+        }
+        if concern_names.contains(&site.target) {
+            continue;
+        }
+        let mut synthetic_bodies = Vec::new();
+        expand_concern_bodies(
+            concern,
+            &graph,
+            ConcernExpansionTarget {
+                target: site.target,
+                target_kind: site.target_kind,
+            },
+            site.kind.body_kind(),
+            &mut Vec::new(),
+            &mut emitted_bodies,
+            &mut synthetic_bodies,
+        );
+        for synthetic in synthetic_bodies {
+            let associations = synthetic
+                .body
+                .active_record_associations(draft.names(), options);
+            let scopes = synthetic.body.active_record_scopes(options);
+            let enum_mappings = synthetic
+                .body
+                .active_record_enum_mappings(options, inflector);
+            // Extend before `apply_body`'s empty-member bail: a
+            // concern body whose only call is `acts_as_paranoid`
+            // yields no members (and thus no decl) but still marks
+            // its include target as a paranoia model.
+            paranoia_models.extend(synthetic.body.paranoia_model(options));
+            // Also before the bail, for the same reason: the target
+            // list must not depend on whether any member came out.
+            if let Some(entry) =
+                concern_block_targets
+                    .get_mut(&synthetic.concern)
+                    .and_then(|entries| {
+                        entries
+                            .iter_mut()
+                            .find(|e| e.location == synthetic.body.name_location)
+                    })
+                && !entry.targets.contains(&site.target)
+            {
+                entry.targets.push(site.target);
+            }
+
+            let Some(decl) = Collector::apply_body(
+                synthetic.body,
+                Vec::new(),
+                options,
+                inflector,
+                draft.names(),
+            ) else {
                 continue;
             };
-            if site.target == concern.name {
-                continue;
+            active_record_associations.extend(associations);
+            active_record_scopes.extend(scopes);
+            active_record_enum_mappings.extend(enum_mappings);
+            let concern_source = collected_at(synthetic.source_index);
+            if let Some(f) = concern_source.file {
+                expansion_contributions
+                    .insert((site.target, draft.names().intern(&f.to_string_lossy())));
             }
-            if concern_names.contains(&site.target) {
-                continue;
-            }
-            let mut synthetic_bodies = Vec::new();
-            expand_concern_bodies(
-                concern,
-                &concerns,
-                ConcernExpansionTarget {
-                    target: site.target,
-                    target_kind: site.target_kind,
-                },
-                site.kind.body_kind(),
-                &mut Vec::new(),
-                &mut emitted_bodies,
-                &mut synthetic_bodies,
+            let lexical_context = graph
+                .concerns
+                .get(&synthetic.concern)
+                .map_or(&[][..], |concern| concern.lexical_context.as_slice());
+            draft.insert_ruby_decl_in_context(
+                &decl,
+                lexical_context,
+                concern_source.source,
+                concern_source.file,
+                &mut diagnostics,
             );
-            for synthetic in synthetic_bodies {
-                let associations = synthetic
-                    .body
-                    .active_record_associations(draft.names(), options);
-                let scopes = synthetic.body.active_record_scopes(options);
-                let enum_mappings = synthetic
-                    .body
-                    .active_record_enum_mappings(options, inflector);
-                // Extend before `apply_body`'s empty-member bail: a
-                // concern body whose only call is `acts_as_paranoid`
-                // yields no members (and thus no decl) but still marks
-                // its include target as a paranoia model.
-                paranoia_models.extend(synthetic.body.paranoia_model(options));
-                // Also before the bail, for the same reason: the target
-                // list must not depend on whether any member came out.
-                if let Some(entry) =
-                    concern_block_targets
-                        .get_mut(&synthetic.concern)
-                        .and_then(|entries| {
-                            entries
-                                .iter_mut()
-                                .find(|e| e.location == synthetic.body.name_location)
-                        })
-                    && !entry.targets.contains(&site.target)
-                {
-                    entry.targets.push(site.target);
-                }
-
-                let Some(decl) = Collector::apply_body(
-                    synthetic.body,
-                    Vec::new(),
-                    options,
-                    inflector,
-                    draft.names(),
-                ) else {
-                    continue;
-                };
-                active_record_associations.extend(associations);
-                active_record_scopes.extend(scopes);
-                active_record_enum_mappings.extend(enum_mappings);
-                let concern_source = collected_at(synthetic.source_index);
-                if let Some(f) = concern_source.file {
-                    expansion_contributions
-                        .insert((site.target, draft.names().intern(&f.to_string_lossy())));
-                }
-                let lexical_context = concerns
-                    .get(&synthetic.concern)
-                    .map_or(&[][..], |concern| concern.lexical_context.as_slice());
-                draft.insert_ruby_decl_in_context(
-                    &decl,
-                    lexical_context,
-                    concern_source.source,
-                    concern_source.file,
-                    &mut diagnostics,
-                );
+        }
+        let mut class_method_extends = Vec::new();
+        expand_concern_class_methods(
+            concern,
+            &graph,
+            ConcernExpansionTarget {
+                target: site.target,
+                target_kind: site.target_kind,
+            },
+            site.kind.class_methods_mixin_kind(),
+            &mut Vec::new(),
+            &mut emitted_class_methods,
+            &mut class_method_extends,
+        );
+        for synthetic in class_method_extends {
+            let Some(decl) = synthetic.to_declaration(draft.names()) else {
+                continue;
+            };
+            let concern_source = collected_at(synthetic.source_index);
+            if let Some(f) = concern_source.file {
+                expansion_contributions
+                    .insert((site.target, draft.names().intern(&f.to_string_lossy())));
             }
-            let mut class_method_extends = Vec::new();
-            expand_concern_class_methods(
-                concern,
-                &concerns,
-                ConcernExpansionTarget {
-                    target: site.target,
-                    target_kind: site.target_kind,
-                },
-                site.kind.class_methods_mixin_kind(),
-                &mut Vec::new(),
-                &mut emitted_class_methods,
-                &mut class_method_extends,
+            draft.insert_ruby_decl(
+                &decl,
+                concern_source.source,
+                concern_source.file,
+                &mut diagnostics,
             );
-            for synthetic in class_method_extends {
-                let Some(decl) = synthetic.to_declaration(draft.names()) else {
-                    continue;
-                };
-                let concern_source = collected_at(synthetic.source_index);
-                if let Some(f) = concern_source.file {
-                    expansion_contributions
-                        .insert((site.target, draft.names().intern(&f.to_string_lossy())));
-                }
-                draft.insert_ruby_decl(
-                    &decl,
-                    concern_source.source,
-                    concern_source.file,
-                    &mut diagnostics,
-                );
-            }
         }
     }
 
@@ -511,10 +542,42 @@ pub fn load_collected<'a>(
             })
             .map(|site| super::sidekiq::SidekiqSite {
                 target: site.target,
-                module_names: site.module_names.clone(),
+                raw_module_name: &site.raw_module_name,
+                lexical_context: &site.lexical_context,
             })
             .collect();
         super::sidekiq::synthesize(draft, &sites);
+    }
+
+    // `X::ClassMethods` along the include chain of every Ruby
+    // `include` / `prepend` site (see `class_methods`). After sidekiq
+    // and the strict Concern expansion above, whose `extend`s it
+    // recognizes as already present; before zeitwerk, which only adds
+    // namespaces.
+    if options.class_methods {
+        let sites: Vec<super::class_methods::ClassMethodsSite> = collected
+            .iter()
+            .enumerate()
+            .filter_map(|(source_index, source)| source.as_ref().map(|s| (source_index, s)))
+            .flat_map(|(source_index, source)| {
+                source.concern_sites.iter().map(move |site| {
+                    super::class_methods::ClassMethodsSite {
+                        source_index,
+                        target: site.target,
+                        target_kind: site.target_kind,
+                        kind: site.kind,
+                        raw_module_name: site.raw_module_name.clone(),
+                        lexical_context: site.lexical_context.clone(),
+                        location: site.location,
+                    }
+                })
+            })
+            .collect();
+        for (source_index, decl) in super::class_methods::synthesize(draft, &sites, &concern_names)
+        {
+            let source = collected_at(source_index);
+            draft.insert_ruby_decl(&decl, source.source, source.file, &mut diagnostics);
+        }
     }
 
     // Zeitwerk-style implicit namespace synthesis (see
@@ -542,6 +605,7 @@ fn activesupport_options() -> InfusionOptions {
         activerecord: false,
         paranoia: false,
         sidekiq: false,
+        class_methods: false,
     }
 }
 
@@ -683,7 +747,7 @@ impl InfusionBody {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum InfusionOwnerKind {
+pub(crate) enum InfusionOwnerKind {
     Class,
     Module,
 }
@@ -793,21 +857,38 @@ struct ConcernDef {
     lexical_context: Vec<TypeName>,
 }
 
+/// A concern module's own `include X` / `prepend X`: `X` as written and
+/// the cref it was written under (outer-first, without the root),
+/// resolved by Ruby's constant lookup when the concern graph is built.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ConcernDependency {
-    module_name_candidates: Vec<TypeName>,
+    raw_module_name: String,
+    lexical_context: Vec<TypeName>,
 }
 
+/// One receiver-less `include X` / `prepend X` with a single constant
+/// argument in a class or module body. Recorded for every file the
+/// collector walks, whatever providers are on: the strict Concern
+/// expansion, the sidekiq pass and the `class_methods` pass all read
+/// the same list.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct ConcernSite {
-    target: TypeName,
-    target_kind: InfusionOwnerKind,
-    kind: ConcernSiteKind,
-    module_names: Vec<TypeName>,
+pub(crate) struct ConcernSite {
+    pub(crate) target: TypeName,
+    pub(crate) target_kind: InfusionOwnerKind,
+    pub(crate) kind: ConcernSiteKind,
+    /// The argument as written (`ActiveModel::Model`, `::Foo`), with the
+    /// cref it was written under (outer-first, without the root). Every
+    /// consumer resolves it with `sidekiq::resolve_mixin_argument`, the
+    /// way Ruby's constant lookup does.
+    pub(crate) raw_module_name: String,
+    pub(crate) lexical_context: Vec<TypeName>,
+    /// The `include` / `prepend` call itself — the anchor for a mixin a
+    /// provider synthesizes onto `target` because of this site.
+    pub(crate) location: PrismByteRange,
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
-enum ConcernSiteKind {
+pub(crate) enum ConcernSiteKind {
     Include,
     Prepend,
 }
@@ -826,7 +907,7 @@ enum AttributeCallSiteKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum SyntheticClassMethodsMixinKind {
+pub(crate) enum SyntheticClassMethodsMixinKind {
     Extend,
     SingletonPrepend,
 }
@@ -887,18 +968,53 @@ struct ConcernExpansionTarget {
     target_kind: InfusionOwnerKind,
 }
 
-fn resolve_concern<'a>(
-    concerns: &FxHashMap<TypeName, &'a ConcernDef>,
-    candidates: &[TypeName],
-) -> Option<&'a ConcernDef> {
-    candidates
-        .iter()
-        .find_map(|name| concerns.get(name).copied())
+/// The Ruby concerns by name, with each one's own `include` /
+/// `prepend` arguments already resolved to the concerns they name
+/// (dependency order; an argument that names no concern is dropped).
+struct ConcernGraph<'a> {
+    concerns: FxHashMap<TypeName, &'a ConcernDef>,
+    dependencies: FxHashMap<TypeName, Vec<&'a ConcernDef>>,
+}
+
+impl<'a> ConcernGraph<'a> {
+    /// `resolve` maps a mixin argument and its cref to the module it
+    /// names (Ruby's constant lookup); only a concern in `concerns`
+    /// counts as a dependency.
+    fn new(
+        concerns: FxHashMap<TypeName, &'a ConcernDef>,
+        resolve: impl Fn(&str, &[TypeName]) -> Option<TypeName>,
+    ) -> Self {
+        let dependencies = concerns
+            .values()
+            .map(|concern| {
+                let resolved = concern
+                    .dependencies
+                    .iter()
+                    .filter_map(|dependency| {
+                        let name =
+                            resolve(&dependency.raw_module_name, &dependency.lexical_context)?;
+                        concerns.get(&name).copied()
+                    })
+                    .collect();
+                (concern.name, resolved)
+            })
+            .collect();
+        ConcernGraph {
+            concerns,
+            dependencies,
+        }
+    }
+
+    fn dependencies_of(&self, concern: &ConcernDef) -> &[&'a ConcernDef] {
+        self.dependencies
+            .get(&concern.name)
+            .map_or(&[], Vec::as_slice)
+    }
 }
 
 fn expand_concern_bodies(
     concern: &ConcernDef,
-    concerns: &FxHashMap<TypeName, &ConcernDef>,
+    graph: &ConcernGraph<'_>,
     expansion_target: ConcernExpansionTarget,
     body_kind: ConcernBodyKind,
     visiting: &mut Vec<TypeName>,
@@ -913,13 +1029,10 @@ fn expand_concern_bodies(
     }
 
     visiting.push(concern.name);
-    for dependency in &concern.dependencies {
-        let Some(dependency) = resolve_concern(concerns, &dependency.module_name_candidates) else {
-            continue;
-        };
+    for dependency in graph.dependencies_of(concern) {
         expand_concern_bodies(
             dependency,
-            concerns,
+            graph,
             expansion_target,
             body_kind,
             visiting,
@@ -944,7 +1057,7 @@ fn expand_concern_bodies(
 
 fn expand_concern_class_methods(
     concern: &ConcernDef,
-    concerns: &FxHashMap<TypeName, &ConcernDef>,
+    graph: &ConcernGraph<'_>,
     expansion_target: ConcernExpansionTarget,
     mixin_kind: SyntheticClassMethodsMixinKind,
     visiting: &mut Vec<TypeName>,
@@ -959,13 +1072,10 @@ fn expand_concern_class_methods(
     }
 
     visiting.push(concern.name);
-    for dependency in &concern.dependencies {
-        let Some(dependency) = resolve_concern(concerns, &dependency.module_name_candidates) else {
-            continue;
-        };
+    for dependency in graph.dependencies_of(concern) {
         expand_concern_class_methods(
             dependency,
-            concerns,
+            graph,
             expansion_target,
             mixin_kind,
             visiting,
@@ -1008,7 +1118,7 @@ impl ConcernSiteKind {
         }
     }
 
-    fn class_methods_mixin_kind(self) -> SyntheticClassMethodsMixinKind {
+    pub(crate) fn class_methods_mixin_kind(self) -> SyntheticClassMethodsMixinKind {
         match self {
             ConcernSiteKind::Include => SyntheticClassMethodsMixinKind::Extend,
             ConcernSiteKind::Prepend => SyntheticClassMethodsMixinKind::SingletonPrepend,
@@ -1384,29 +1494,6 @@ impl<'a> Collector<'a> {
         Some(self.names.parse_type_name(abs_path))
     }
 
-    fn type_name_candidates_in_current_namespace(&self, raw: &str) -> Vec<TypeName> {
-        let name = self.names.parse_type_name(raw);
-        if self.names.type_name_is_absolute(name) {
-            return vec![name];
-        }
-        let mut candidates = Vec::new();
-        if let Some(owner) = self.current_class_typename() {
-            candidates.push(self.names.concat_type_name(owner, name));
-            if let Some(parent) = self.names.type_name_parent(owner) {
-                let parent_candidate = self.names.concat_type_name(parent, name);
-                if parent_candidate != candidates[0] {
-                    candidates.push(parent_candidate);
-                }
-            }
-        } else {
-            candidates.push(
-                self.names
-                    .concat_type_name(self.names.absolute_root(), name),
-            );
-        }
-        candidates
-    }
-
     fn find_existing_class_methods_module(
         &self,
         owner: TypeName,
@@ -1758,16 +1845,19 @@ impl<'a> Collector<'a> {
         let Some(raw_module_name) = constant_node_to_string(&arg) else {
             return;
         };
-        let module_names = self.type_name_candidates_in_current_namespace(&raw_module_name);
+        let lexical_context = self.class_stack_context();
         self.concern_sites.push(ConcernSite {
             target: frame.body.owner,
             target_kind: frame.body.owner_kind,
             kind,
-            module_names: module_names.clone(),
+            raw_module_name: raw_module_name.clone(),
+            lexical_context: lexical_context.clone(),
+            location: prism_location_range(node.location()),
         });
         if let Some(frame) = self.current_frame_mut() {
             let dependency = ConcernDependency {
-                module_name_candidates: module_names,
+                raw_module_name,
+                lexical_context,
             };
             match kind {
                 ConcernSiteKind::Include => frame.dependencies.push(dependency),
@@ -1998,11 +2088,14 @@ impl<'a> Collector<'a> {
         } else {
             ConcernSiteKind::Include
         };
+        let raw_module_name = self.names.display_type_name(module_name);
         self.concern_sites.push(ConcernSite {
             target: owner,
             target_kind: owner_kind,
             kind,
-            module_names: vec![module_name],
+            raw_module_name: raw_module_name.clone(),
+            lexical_context: Vec::new(),
+            location: topic_location,
         });
         // `ConcernSite`/`ConcernDependency` below only drive the
         // included-do/prepended-do body-expansion bookkeeping
@@ -2024,7 +2117,8 @@ impl<'a> Collector<'a> {
         };
         if let Some(parent) = self.current_frame_mut() {
             let dependency = ConcernDependency {
-                module_name_candidates: vec![module_name],
+                raw_module_name,
+                lexical_context: Vec::new(),
             };
             match kind {
                 ConcernSiteKind::Include => parent.dependencies.push(dependency),
@@ -2686,6 +2780,25 @@ mod tests {
         }
     }
 
+    fn test_dependency(names: &NameTable, name: TypeName) -> ConcernDependency {
+        ConcernDependency {
+            raw_module_name: names.display_type_name(name),
+            lexical_context: Vec::new(),
+        }
+    }
+
+    /// The graph `load_collected` builds, over absolute dependency names
+    /// (which resolve to themselves).
+    fn test_graph<'a>(names: &NameTable, concerns: &[&'a ConcernDef]) -> ConcernGraph<'a> {
+        ConcernGraph::new(
+            concerns
+                .iter()
+                .map(|concern| (concern.name, *concern))
+                .collect(),
+            |raw, _| Some(names.parse_type_name(raw)),
+        )
+    }
+
     fn test_class_methods(names: &NameTable, owner: TypeName, method: &str) -> ClassMethodsBody {
         ClassMethodsBody {
             module_name: names.append_type_name(owner, names.intern_symbol("ClassMethods")),
@@ -2729,9 +2842,7 @@ mod tests {
         let auditable = ConcernDef {
             name: auditable_name,
             source_index: 1,
-            dependencies: vec![ConcernDependency {
-                module_name_candidates: vec![timestamped_name],
-            }],
+            dependencies: vec![test_dependency(&names, timestamped_name)],
             class_methods_module: None,
             included_body: Some(test_body(
                 auditable_name,
@@ -2742,14 +2853,12 @@ mod tests {
             class_methods: None,
             lexical_context: Vec::new(),
         };
-        let mut concerns = FxHashMap::default();
-        concerns.insert(timestamped_name, &timestamped);
-        concerns.insert(auditable_name, &auditable);
+        let graph = test_graph(&names, &[&timestamped, &auditable]);
 
         let mut out = Vec::new();
         expand_concern_bodies(
             &auditable,
-            &concerns,
+            &graph,
             ConcernExpansionTarget {
                 target: user_name,
                 target_kind: InfusionOwnerKind::Class,
@@ -2778,9 +2887,7 @@ mod tests {
         let a = ConcernDef {
             name: a_name,
             source_index: 0,
-            dependencies: vec![ConcernDependency {
-                module_name_candidates: vec![b_name],
-            }],
+            dependencies: vec![test_dependency(&names, b_name)],
             class_methods_module: None,
             included_body: Some(test_body(
                 a_name,
@@ -2794,9 +2901,7 @@ mod tests {
         let b = ConcernDef {
             name: b_name,
             source_index: 1,
-            dependencies: vec![ConcernDependency {
-                module_name_candidates: vec![a_name],
-            }],
+            dependencies: vec![test_dependency(&names, a_name)],
             class_methods_module: None,
             included_body: Some(test_body(
                 b_name,
@@ -2807,14 +2912,12 @@ mod tests {
             class_methods: None,
             lexical_context: Vec::new(),
         };
-        let mut concerns = FxHashMap::default();
-        concerns.insert(a_name, &a);
-        concerns.insert(b_name, &b);
+        let graph = test_graph(&names, &[&a, &b]);
 
         let mut out = Vec::new();
         expand_concern_bodies(
             &a,
-            &concerns,
+            &graph,
             ConcernExpansionTarget {
                 target: user_name,
                 target_kind: InfusionOwnerKind::Class,
@@ -2858,10 +2961,8 @@ end
 
         assert_eq!(collector.concerns.len(), 1);
         let dependencies = &collector.concerns[0].dependencies;
-        let first = dependencies[0].module_name_candidates[0];
-        let second = dependencies[1].module_name_candidates[0];
-        assert_eq!(names.display_type_name(first), "::PrependedDep");
-        assert_eq!(names.display_type_name(second), "::IncludedDep");
+        assert_eq!(dependencies[0].raw_module_name, "::PrependedDep");
+        assert_eq!(dependencies[1].raw_module_name, "::IncludedDep");
     }
 
     #[test]
@@ -2887,9 +2988,7 @@ end
         let auditable = ConcernDef {
             name: auditable_name,
             source_index: 1,
-            dependencies: vec![ConcernDependency {
-                module_name_candidates: vec![timestamped_name],
-            }],
+            dependencies: vec![test_dependency(&names, timestamped_name)],
             class_methods_module: None,
             included_body: None,
             prepended_body: Some(test_body(
@@ -2900,14 +2999,12 @@ end
             class_methods: None,
             lexical_context: Vec::new(),
         };
-        let mut concerns = FxHashMap::default();
-        concerns.insert(timestamped_name, &timestamped);
-        concerns.insert(auditable_name, &auditable);
+        let graph = test_graph(&names, &[&timestamped, &auditable]);
 
         let mut out = Vec::new();
         expand_concern_bodies(
             &auditable,
-            &concerns,
+            &graph,
             ConcernExpansionTarget {
                 target: user_name,
                 target_kind: InfusionOwnerKind::Class,
@@ -2952,9 +3049,7 @@ end
         let auditable = ConcernDef {
             name: auditable_name,
             source_index: 1,
-            dependencies: vec![ConcernDependency {
-                module_name_candidates: vec![timestamped_name],
-            }],
+            dependencies: vec![test_dependency(&names, timestamped_name)],
             class_methods_module: Some(ClassMethodsModuleRef {
                 module_name: names
                     .append_type_name(auditable_name, names.intern_symbol("ClassMethods")),
@@ -2965,14 +3060,12 @@ end
             class_methods: Some(test_class_methods(&names, auditable_name, "audited")),
             lexical_context: Vec::new(),
         };
-        let mut concerns = FxHashMap::default();
-        concerns.insert(timestamped_name, &timestamped);
-        concerns.insert(auditable_name, &auditable);
+        let graph = test_graph(&names, &[&timestamped, &auditable]);
 
         let mut out = Vec::new();
         expand_concern_class_methods(
             &auditable,
-            &concerns,
+            &graph,
             ConcernExpansionTarget {
                 target: user_name,
                 target_kind: InfusionOwnerKind::Class,
@@ -3024,13 +3117,12 @@ end
             class_methods: Some(test_class_methods(&names, auditable_name, "audited")),
             lexical_context: Vec::new(),
         };
-        let mut concerns = FxHashMap::default();
-        concerns.insert(auditable_name, &auditable);
+        let graph = test_graph(&names, &[&auditable]);
 
         let mut out = Vec::new();
         expand_concern_class_methods(
             &auditable,
-            &concerns,
+            &graph,
             ConcernExpansionTarget {
                 target: user_name,
                 target_kind: InfusionOwnerKind::Class,
@@ -3059,9 +3151,7 @@ end
         let a = ConcernDef {
             name: a_name,
             source_index: 0,
-            dependencies: vec![ConcernDependency {
-                module_name_candidates: vec![b_name],
-            }],
+            dependencies: vec![test_dependency(&names, b_name)],
             class_methods_module: Some(ClassMethodsModuleRef {
                 module_name: names.append_type_name(a_name, names.intern_symbol("ClassMethods")),
                 location: (0, 0),
@@ -3074,9 +3164,7 @@ end
         let b = ConcernDef {
             name: b_name,
             source_index: 1,
-            dependencies: vec![ConcernDependency {
-                module_name_candidates: vec![a_name],
-            }],
+            dependencies: vec![test_dependency(&names, a_name)],
             class_methods_module: Some(ClassMethodsModuleRef {
                 module_name: names.append_type_name(b_name, names.intern_symbol("ClassMethods")),
                 location: (0, 0),
@@ -3086,14 +3174,12 @@ end
             class_methods: Some(test_class_methods(&names, b_name, "b_method")),
             lexical_context: Vec::new(),
         };
-        let mut concerns = FxHashMap::default();
-        concerns.insert(a_name, &a);
-        concerns.insert(b_name, &b);
+        let graph = test_graph(&names, &[&a, &b]);
 
         let mut out = Vec::new();
         expand_concern_class_methods(
             &a,
-            &concerns,
+            &graph,
             ConcernExpansionTarget {
                 target: user_name,
                 target_kind: InfusionOwnerKind::Class,
@@ -3153,6 +3239,7 @@ end
             activerecord: true,
             paranoia: false,
             sidekiq: false,
+            class_methods: false,
         }
     }
 

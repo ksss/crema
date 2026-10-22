@@ -706,6 +706,7 @@ pub struct MBakedArityViolation {
     pub class: String,
     pub expected: String,
     pub got: u64,
+    pub args: Vec<String>,
     pub location: Option<MBakedLoc>,
 }
 
@@ -749,6 +750,48 @@ pub struct MBakedDiagnostics {
     /// failure, ...) baked in verbatim so a warm hit can replay them
     /// (v7, `gem_dirs_cache_removal_warning_replay`).
     pub warnings: Vec<String>,
+    /// G references cold's G-only resolver left relative, for the
+    /// build-time retry against the A ∪ G names (v10,
+    /// `g_snapshot_gem_decl_relative_names_not_reresolved_at_warm`).
+    pub relative_refs: MRelativeRefs,
+}
+
+/// Mirror of `environment::g_relative::GRelativeRefs`.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct MRelativeRefs {
+    /// Per gem file: its `use` clauses. A clause's names are spelled out
+    /// rather than referenced by id — they appear in no declaration, so
+    /// the type-name table does not carry them.
+    pub use_groups: Vec<Vec<MUseClause>>,
+    pub entries: Vec<MRelativeEntry>,
+}
+
+/// kind: 0 = `use A::B [as C]` (`name` = `A::B`, `new_name` = `C`),
+/// 1 = `use A::*` (`name` = `A`).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MUseClause {
+    pub kind: u8,
+    pub name: String,
+    pub new_name: Option<String>,
+}
+
+/// kind: 0=Class(or module) 1=Interface 2=TypeAlias 3=Constant 4=Global
+/// 5=ClassAlias(or module alias). `id` is the entry key (TypeName id;
+/// Symbol id for globals).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MRelativeEntry {
+    pub kind: u8,
+    pub id: u64,
+    pub decls: Vec<MRelativeDecl>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MRelativeDecl {
+    pub index: u32,
+    pub use_group: Option<u32>,
+    pub context: Vec<Tn>,
+    pub outer_refs: Vec<Tn>,
+    pub inner_refs: Vec<Tn>,
 }
 
 /// Mirror-side twin of `definition_builder::SuperEdges`. Both arms

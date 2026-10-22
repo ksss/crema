@@ -57,12 +57,44 @@ use crate::context::{ScopeKind, ScopeSnapshot};
 use crate::pure_call_env::{PureKey, PureNode};
 
 /// One arm's after-state for [`TypeChecker::join_arms_with_divergence`]:
-/// the scope snapshot taken at the join point and the body's last
-/// expression type. The latter lets the join detect divergence
-/// (`last_ty == Ty::BOTTOM`) and drop the arm from the per-name union.
+/// the scope snapshot taken at the join point, the body's last
+/// expression type, and whether the arm's narrowing is unreachable. An
+/// arm that diverges (`last_ty == Ty::BOTTOM`) or is dead drops out of
+/// the per-name union and the value union.
 pub(in crate::type_checker) struct BranchOutcome {
     pub after: ScopeSnapshot,
     pub last_ty: Ty,
+    pub dead: bool,
+}
+
+/// The narrowing for a `case` `else` arm: unreachable when the residue
+/// is already empty, so the arm reads the scrutinee as `untyped` and
+/// drops out of the join; otherwise none (the residue is in the arm's
+/// base env already).
+fn residue_dead_env(scrutinee: Option<&(Scrutinee, Ty)>, residue: Option<Ty>) -> CondEnv {
+    match scrutinee {
+        Some((s, _)) if residue == Some(Ty::BOTTOM) => CondEnv::single(*s, Ty::BOTTOM),
+        _ => CondEnv::empty(),
+    }
+}
+
+impl BranchOutcome {
+    /// Whether the arm never reaches the join point.
+    fn skips_join(&self) -> bool {
+        self.dead || self.last_ty == Ty::BOTTOM
+    }
+
+    /// The arm the source leaves unwritten (`if` without `else`, a
+    /// loop's exit). Steep joins its env even when its narrowing is
+    /// unreachable, so a guard such as `return if n.is_a?(Integer)`
+    /// leaves `n` as `untyped` after it rather than cutting the rest
+    /// of the method off.
+    pub(in crate::type_checker) fn implicit(self) -> Self {
+        BranchOutcome {
+            dead: false,
+            ..self
+        }
+    }
 }
 
 /// Which side's shape is preserved by the shared unify traversal in
@@ -1799,6 +1831,19 @@ impl<'env> TypeChecker<'env> {
         // `unless` is `if` with branches swapped — feed falsy to the body
         // and truthy to the else clause.
         let (truthy, falsy) = self.analyze_condition(&predicate);
+        // Steep's `:if` locations for `unless`: a dead body at `then` or
+        // the `unless` keyword, a dead else clause at `else`.
+        if falsy.is_unreachable() && stmts.is_some() {
+            let loc = unless
+                .then_keyword_loc()
+                .unwrap_or_else(|| unless.unless_keyword_loc());
+            self.push_unreachable_branch(&loc);
+        }
+        if truthy.is_unreachable()
+            && let Some(else_clause) = &else_clause
+        {
+            self.push_unreachable_branch(&else_clause.else_keyword_loc());
+        }
 
         let base = self.ctx.snapshot_scopes();
         let arm_body = self.with_branch_outcome(&base, &falsy, |checker| {
@@ -1818,6 +1863,7 @@ impl<'env> TypeChecker<'env> {
             // narrowing so a divergent `unless` body (`unless x; raise;
             // end`) can adopt `x: String` into the post-unless env.
             self.with_branch_outcome(&base, &truthy, |_| Ty::NIL)
+                .implicit()
         };
         self.join_arms_with_divergence(base, arm_body, arm_else)
     }
@@ -1899,6 +1945,12 @@ impl<'env> TypeChecker<'env> {
                     CondEnv::single(*s, truthy_ty)
                 }
                 (_, _, Some((truthy, _))) => truthy.clone(),
+                // An empty residue was reached while every earlier cond
+                // was derivable, so no value is left for this `when`
+                // whatever its cond is.
+                (Some((s, _)), None, _) if iter_falsy_ty == Some(Ty::BOTTOM) => {
+                    CondEnv::single(*s, Ty::BOTTOM)
+                }
                 _ => CondEnv::empty(),
             };
 
@@ -1909,6 +1961,14 @@ impl<'env> TypeChecker<'env> {
                     Ty::NIL
                 }
             });
+            // Steep (`type_construction.rb` `:case`): a `when` none of
+            // whose tests is reachable, with a value that is not bot.
+            if outcome.dead && outcome.last_ty != Ty::BOTTOM {
+                self.push_unreachable_value_branch(
+                    &when_node.when_keyword_loc(),
+                    crate::diagnostic::UnreachableClause::When,
+                );
+            }
             arms.push(outcome);
 
             if let (Some((s, _)), Some(target), true) =
@@ -1976,17 +2036,21 @@ impl<'env> TypeChecker<'env> {
         // `T | nil` post-case (the "unrun assignment reads as nil" path
         // in `Context::join_branches`).
         if let Some(else_clause) = else_clause_opt {
-            let outcome = self.with_branch_outcome(&iter_base, &CondEnv::empty(), |c| {
+            // The residue stays `bot` in `iter_base` (the exhaustiveness
+            // claim reads it); the else body reads it as `untyped`.
+            let else_env = residue_dead_env(scrutinee.as_ref(), iter_falsy_ty);
+            let outcome = self.with_branch_outcome(&iter_base, &else_env, |c| {
                 c.check_node(&else_clause.as_node(), hint)
             });
             if case_exhausted && outcome.last_ty != Ty::BOTTOM {
-                use crate::diagnostic::{Diagnostic, DiagnosticKind};
                 let position =
                     self.offset_to_location(else_clause.as_node().location().start() as usize);
-                self.push_diagnostic(Diagnostic {
+                self.push_diagnostic(crate::diagnostic::Diagnostic {
                     scope: None,
                     location: position,
-                    kind: DiagnosticKind::UnreachableValueBranch,
+                    kind: crate::diagnostic::DiagnosticKind::UnreachableValueBranch {
+                        clause: crate::diagnostic::UnreachableClause::Else,
+                    },
                 });
             }
             if !case_exhausted {
@@ -1999,6 +2063,7 @@ impl<'env> TypeChecker<'env> {
             arms.push(BranchOutcome {
                 after: iter_base.clone(),
                 last_ty: Ty::NIL,
+                dead: false,
             });
         }
 
@@ -2214,7 +2279,8 @@ impl<'env> TypeChecker<'env> {
             }
         }
         if let Some(else_clause) = case.else_clause() {
-            let outcome = self.with_branch_outcome(&iter_base, &CondEnv::empty(), |c| {
+            let else_env = residue_dead_env(scrutinee.as_ref(), iter_falsy_ty);
+            let outcome = self.with_branch_outcome(&iter_base, &else_env, |c| {
                 c.check_node(&else_clause.as_node(), hint)
             });
             arms.push(outcome);
@@ -2275,7 +2341,9 @@ impl<'env> TypeChecker<'env> {
             // a concrete `Ty::NIL`; we never want (true, true) here.
             let body = self
                 .with_branch_outcome(&base, &truthy, |c| c.check_statements_with_hint(&s, None));
-            let exit = self.with_branch_outcome(&base, &falsy, |_| Ty::NIL);
+            let exit = self
+                .with_branch_outcome(&base, &falsy, |_| Ty::NIL)
+                .implicit();
             self.join_arms_with_divergence(base, body, exit);
         } else {
             // No body: pick the falsy-narrow env directly. Joining with
@@ -2321,7 +2389,9 @@ impl<'env> TypeChecker<'env> {
             // out of the post-loop env.
             let body =
                 self.with_branch_outcome(&base, &falsy, |c| c.check_statements_with_hint(&s, None));
-            let exit = self.with_branch_outcome(&base, &truthy, |_| Ty::NIL);
+            let exit = self
+                .with_branch_outcome(&base, &truthy, |_| Ty::NIL)
+                .implicit();
             self.join_arms_with_divergence(base, body, exit);
         } else {
             let (exit_after, _) = self.with_cond_branch(&base, &truthy, |_| {});
@@ -2503,6 +2573,7 @@ impl<'env> TypeChecker<'env> {
         let subsequent = if_node.subsequent();
         self.check_node(&predicate, None);
         let (truthy, falsy) = self.analyze_condition(&predicate);
+        self.report_unreachable_if_branches(&if_node, &truthy, &falsy);
 
         let base = self.ctx.snapshot_scopes();
         let arm_a = self.with_branch_outcome(&base, &truthy, |checker| {
@@ -2521,15 +2592,86 @@ impl<'env> TypeChecker<'env> {
             // truthy arm (`if x.nil?; return; end`) can adopt this
             // env's `x: String` into the post-if scope chain.
             self.with_branch_outcome(&base, &falsy, |_| Ty::NIL)
+                .implicit()
         };
         self.join_arms_with_divergence(base, arm_a, arm_b)
+    }
+
+    /// `Ruby::UnreachableBranch` for each written clause of an `if` /
+    /// `elsif` / ternary whose narrowing is unreachable. Locations follow
+    /// Steep (`type_construction.rb` `:if`): a dead then-clause is
+    /// reported at `then` (or the `if` / `elsif` keyword when there is
+    /// no `then`), a dead else-clause at its `else` / `elsif` keyword,
+    /// and a ternary clause at the clause expression itself.
+    fn report_unreachable_if_branches(
+        &self,
+        if_node: &ruby_prism::IfNode<'_>,
+        truthy: &CondEnv,
+        falsy: &CondEnv,
+    ) {
+        let has_keyword = if_node.if_keyword_loc().is_some();
+        if truthy.is_unreachable()
+            && let Some(stmts) = if_node.statements()
+        {
+            let loc = if has_keyword {
+                if_node
+                    .then_keyword_loc()
+                    .or_else(|| if_node.if_keyword_loc())
+                    .expect("has_keyword")
+            } else {
+                stmts.location()
+            };
+            self.push_unreachable_branch(&loc);
+        }
+        if falsy.is_unreachable()
+            && let Some(sub) = if_node.subsequent()
+        {
+            let loc = if let Some(else_node) = sub.as_else_node() {
+                if has_keyword {
+                    Some(else_node.else_keyword_loc())
+                } else {
+                    else_node.statements().map(|s| s.location())
+                }
+            } else {
+                sub.as_if_node().and_then(|elsif| elsif.if_keyword_loc())
+            };
+            if let Some(loc) = loc {
+                self.push_unreachable_branch(&loc);
+            }
+        }
+    }
+
+    fn push_unreachable_value_branch(
+        &self,
+        loc: &ruby_prism::Location<'_>,
+        clause: crate::diagnostic::UnreachableClause,
+    ) {
+        use crate::diagnostic::{Diagnostic, DiagnosticKind};
+        let location = self.byte_range_to_location(loc.start() as usize, loc.end() as usize);
+        self.push_diagnostic(Diagnostic {
+            scope: None,
+            location,
+            kind: DiagnosticKind::UnreachableValueBranch { clause },
+        });
+    }
+
+    fn push_unreachable_branch(&self, loc: &ruby_prism::Location<'_>) {
+        use crate::diagnostic::{Diagnostic, DiagnosticKind};
+        let location = self.byte_range_to_location(loc.start() as usize, loc.end() as usize);
+        self.push_diagnostic(Diagnostic {
+            scope: None,
+            location,
+            kind: DiagnosticKind::UnreachableBranch,
+        });
     }
 
     /// Two-arm join with divergence-aware fallthrough. Mirrors Steep's
     /// terminal model (`type_construction.rb:1943`): when an arm's
     /// body type is `Ty::BOTTOM`, that arm cannot reach the join point
     /// (it `return`s, `raise`s, `break`s, or `next`s), so the other
-    /// arm's env is adopted wholesale into the post-if scope chain.
+    /// arm's env is adopted wholesale into the post-if scope chain. A
+    /// dead arm (its narrowing is unreachable) is dropped the same way
+    /// whatever its last value is, as Steep drops `truthy.unreachable`.
     /// When both arms diverge the if/unless itself has type `BOTTOM`
     /// and the base env is restored — outer statements walking past
     /// this expression observe `BOTTOM` as their last_ty and propagate
@@ -2545,7 +2687,7 @@ impl<'env> TypeChecker<'env> {
         arm_a: BranchOutcome,
         arm_b: BranchOutcome,
     ) -> Ty {
-        match (arm_a.last_ty == Ty::BOTTOM, arm_b.last_ty == Ty::BOTTOM) {
+        match (arm_a.skips_join(), arm_b.skips_join()) {
             (true, true) => {
                 self.ctx.restore_scopes(base);
                 Ty::BOTTOM
@@ -2587,10 +2729,7 @@ impl<'env> TypeChecker<'env> {
         base: ScopeSnapshot,
         arms: Vec<BranchOutcome>,
     ) -> Ty {
-        let live: Vec<BranchOutcome> = arms
-            .into_iter()
-            .filter(|a| a.last_ty != Ty::BOTTOM)
-            .collect();
+        let live: Vec<BranchOutcome> = arms.into_iter().filter(|a| !a.skips_join()).collect();
         if live.is_empty() {
             self.ctx.restore_scopes(base);
             return Ty::BOTTOM;
@@ -2713,8 +2852,14 @@ impl<'env> TypeChecker<'env> {
             // circuits `||` — `b` only evaluates when `a` is falsy.
             let (lt, lf) = self.analyze_condition(&or.left());
             let (rt, rf) = self.with_cond_narrowing(&lf, |c| c.analyze_condition(&or.right()));
-            let truthy = lt.join_branch(lf.clone().merge_sequential(rt), self.env);
-            let falsy = lf.merge_sequential(rf);
+            // Steep's `:or` decides reachability from the left operand
+            // alone (the right's `bool` value absorbs its narrowing).
+            let both_left_dead = lt.is_unreachable() && lf.is_unreachable();
+            let falsy_dead = lf.is_unreachable();
+            let truthy = lt
+                .join_branch(lf.clone().merge_sequential(rt), self.env)
+                .with_unreachable(both_left_dead);
+            let falsy = lf.merge_sequential(rf).with_unreachable(falsy_dead);
             return (truthy, falsy);
         }
         if let Some(and) = node.as_and_node() {
@@ -2725,8 +2870,17 @@ impl<'env> TypeChecker<'env> {
             // truthy, so `b`'s analysis sees `lt` already in scope.
             let (lt, lf) = self.analyze_condition(&and.left());
             let (rt, rf) = self.with_cond_narrowing(&lt, |c| c.analyze_condition(&and.right()));
-            let truthy = lt.clone().merge_sequential(rt);
-            let falsy = lf.join_branch(lt.merge_sequential(rf), self.env);
+            // Steep's `:and`: reachability comes from the left operand
+            // alone, as in `||` above.
+            let both_left_dead = lt.is_unreachable() && lf.is_unreachable();
+            let truthy_dead = lt.is_unreachable();
+            let truthy = lt
+                .clone()
+                .merge_sequential(rt)
+                .with_unreachable(truthy_dead);
+            let falsy = lf
+                .join_branch(lt.merge_sequential(rf), self.env)
+                .with_unreachable(both_left_dead);
             return (truthy, falsy);
         }
         if let Some(call) = node.as_call_node() {
@@ -4081,8 +4235,9 @@ impl<'env> TypeChecker<'env> {
             checker.condition_bool_literal(&right).unwrap_or(ty)
         });
         let right_value_ty = arm_falsy.last_ty;
-        let left_diverged = arm_truthy.last_ty == Ty::BOTTOM;
-        let right_diverged = arm_falsy.last_ty == Ty::BOTTOM;
+        let left_diverged = arm_truthy.skips_join();
+        // A dead right arm (the left is never falsy) contributes no value.
+        let right_diverged = arm_falsy.skips_join();
         let env_join_ty = self.join_arms_with_divergence(base, arm_truthy, arm_falsy);
         if left_diverged && right_diverged {
             return env_join_ty; // BOTTOM
@@ -4204,8 +4359,9 @@ impl<'env> TypeChecker<'env> {
         });
         let arm_falsy = self.with_branch_outcome(&base, &falsy, |_| left_ty);
         let right_value_ty = arm_truthy.last_ty;
-        let left_diverged = arm_falsy.last_ty == Ty::BOTTOM;
-        let right_diverged = arm_truthy.last_ty == Ty::BOTTOM;
+        let left_diverged = arm_falsy.skips_join();
+        // A dead right arm (the left is never truthy) contributes no value.
+        let right_diverged = arm_truthy.skips_join();
         let env_join_ty = self.join_arms_with_divergence(base, arm_truthy, arm_falsy);
         if left_diverged && right_diverged {
             return env_join_ty; // BOTTOM
@@ -4923,7 +5079,13 @@ impl<'env> TypeChecker<'env> {
                                 self.env,
                             )
                         });
+                        // Mirror of `check_case_node`: a dead `when`
+                        // (narrowed to bot, or reached after an empty
+                        // residue) drops out of the value union.
+                        let dead = truthy_ty == Some(Ty::BOTTOM)
+                            || (scrutinee.is_some() && iter_falsy_ty == Some(Ty::BOTTOM));
                         let arm_ty = match when_node.statements() {
+                            _ if dead => Ty::BOTTOM,
                             Some(s) => match (scrutinee.as_ref(), truthy_ty) {
                                 (Some((scrutinee, _)), Some(ty)) => self
                                     .infer_type_with_scrutinee_overlay(
@@ -5019,6 +5181,7 @@ impl<'env> TypeChecker<'env> {
                         )
                     });
                     let arm_ty = match in_node.statements() {
+                        _ if truthy_ty == Some(Ty::BOTTOM) => Ty::BOTTOM,
                         Some(stmts) => match (scrutinee.as_ref(), truthy_ty) {
                             (Some((s, _)), Some(ty)) => self.infer_type_with_scrutinee_overlay(
                                 &stmts.as_node(),
@@ -5046,6 +5209,7 @@ impl<'env> TypeChecker<'env> {
                 }
                 if let Some(e) = case.else_clause() {
                     let else_ty = match e.statements() {
+                        _ if scrutinee.is_some() && iter_falsy_ty == Some(Ty::BOTTOM) => Ty::BOTTOM,
                         Some(stmts) => match (scrutinee.as_ref(), residue_alive, iter_falsy_ty) {
                             (Some((s, _)), true, Some(ty)) => self
                                 .infer_type_with_scrutinee_overlay(&stmts.as_node(), hint, s, ty),
@@ -5784,6 +5948,9 @@ impl<'env> TypeChecker<'env> {
         // depends on the include site, which is not statically known. Emitting
         // here would be a false positive matching Steep's silent behavior.
         if self.is_inside_module_definition() {
+            return;
+        }
+        if !self.self_ancestor_chain_complete(self_ty) {
             return;
         }
         let position = self.offset_to_location(node.location().start() as usize);
@@ -8100,8 +8267,12 @@ impl<'env> TypeChecker<'env> {
             .with_self_bound(self.current_self_type())
     }
 
-    /// Side-effecting walk of a lambda literal's body, then the read-only
-    /// literal type from `infer_type`.
+    /// Side-effecting walk of a lambda literal's body, then the literal
+    /// type built from the walk's body value (`lambda_type_with_body`).
+    /// The walk tracked the body's own locals, so a body-local read at the
+    /// tail types the lambda's return; the read-only `lambda_literal_type`
+    /// path, which runs under a params-only overlay after this scope is
+    /// gone, would read it as `untyped`.
     ///
     /// Params bind in a pushed `ScopeKind::Block` scope — the same shape
     /// `setup_block_scope` uses for blocks, so body-local writes stay
@@ -8145,15 +8316,20 @@ impl<'env> TypeChecker<'env> {
             // The hint's return type reaches the body's tail and any
             // `next` that exits this lambda (Steep `type_lambda`'s
             // `return_hint`); an unhinted lambda clears an outer one.
-            self.with_next_hint(body_hint, |checker| {
+            let body_value = self.with_next_hint(body_hint, |checker| {
                 if let Some(params_node) = lambda.parameters() {
                     checker.visit(&params_node);
                 }
-                if let Some(body) = lambda.body() {
-                    checker.check_node(&body, body_hint);
-                }
+                lambda
+                    .body()
+                    .map(|body| checker.check_node(&body, body_hint))
             });
             self.ctx.pop_scope();
+            // Same fallback as a def body (`check_def_node_in_current_context`):
+            // an `untyped` or sticky-`bot` walk value yields to the
+            // read-only type of the body.
+            let body_value = body_value.filter(|ty| !ty.is_untyped() && *ty != Ty::BOTTOM);
+            return self.lambda_type_with_body(node, hint, body_value);
         }
         self.infer_type(node, hint)
     }
@@ -8181,7 +8357,22 @@ impl<'env> TypeChecker<'env> {
         vec![Ty::UNTYPED; count]
     }
 
+    /// Read-only literal type of a lambda (the `infer_type` arm): the
+    /// body is typed under a params-only overlay, so a body-local read at
+    /// the tail is `untyped` here. `check_lambda_node` passes the walk's
+    /// body value instead.
     fn lambda_literal_type<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>) -> Ty {
+        self.lambda_type_with_body(node, hint, None)
+    }
+
+    /// `lambda_literal_type` with the body's return type taken from
+    /// `body_value` when given (the walk's value), else inferred read-only.
+    fn lambda_type_with_body<'pr>(
+        &self,
+        node: &Node<'pr>,
+        hint: Option<Ty>,
+        body_value: Option<Ty>,
+    ) -> Ty {
         if let Some(hint) = self.lambda_hint_proc(hint)
             && let Some(lambda) = node.as_lambda_node()
         {
@@ -8200,11 +8391,12 @@ impl<'env> TypeChecker<'env> {
             // lambda's type — what an argument check compares — is the
             // body's type under the hint.
             let body_hint = self.lambda_body_hint(&function);
-            let actual_return = match lambda.body() {
-                Some(body) => self.with_readonly_self(self_type, |checker| {
+            let actual_return = match (body_value, lambda.body()) {
+                (Some(value), Some(_)) => value,
+                (_, Some(body)) => self.with_readonly_self(self_type, |checker| {
                     checker.with_overlay(overlay, |checker| checker.infer_type(&body, body_hint))
                 }),
-                None => Ty::NIL,
+                (_, None) => Ty::NIL,
             };
             // The hinted lambda's type takes the hint's params / self / block
             // (Steep `params_hint || params.params_type`, `self_hint`), so the
@@ -8226,7 +8418,7 @@ impl<'env> TypeChecker<'env> {
         }
 
         if let Some(lambda) = node.as_lambda_node() {
-            let function = self.unhinted_lambda_function(lambda);
+            let function = self.unhinted_lambda_function(lambda, body_value);
             return self.env.types().intern(Type::Proc(Box::new(ProcType {
                 type_: FunctionType::Typed(function),
                 self_type: None,
@@ -8323,7 +8515,13 @@ impl<'env> TypeChecker<'env> {
         }
     }
 
-    fn unhinted_lambda_function<'pr>(&self, lambda: ruby_prism::LambdaNode<'pr>) -> Function {
+    /// The unhinted lambda's function: every declared param `untyped`, the
+    /// return `body_value` when given (the walk's), else inferred read-only.
+    fn unhinted_lambda_function<'pr>(
+        &self,
+        lambda: ruby_prism::LambdaNode<'pr>,
+        body_value: Option<Ty>,
+    ) -> Function {
         let mut function = Function::empty(Ty::UNTYPED);
         let mut param_tys = Vec::new();
         if let Some(params) = self.lambda_parameters(lambda.parameters()) {
@@ -8353,9 +8551,12 @@ impl<'env> TypeChecker<'env> {
             param_tys.extend(function.required_positionals.iter().copied());
         }
         let overlay = self.lambda_param_overlay(lambda.parameters(), &param_tys, None);
-        function.return_type = match lambda.body() {
-            Some(body) => self.with_overlay(overlay, |checker| checker.infer_type(&body, None)),
-            None => Ty::NIL,
+        function.return_type = match (body_value, lambda.body()) {
+            (Some(value), Some(_)) => value,
+            (_, Some(body)) => {
+                self.with_overlay(overlay, |checker| checker.infer_type(&body, None))
+            }
+            (_, None) => Ty::NIL,
         };
         function
     }
@@ -9694,9 +9895,14 @@ pub(super) fn resolve_cvar_at_self(checker: &TypeChecker<'_>, var_sym: Symbol) -
 /// collector reads the `#: T` off the attr call, which ends where the
 /// wrapper does.
 fn is_inline_declaration_call_stmt<'pr>(stmt: &Node<'pr>) -> bool {
-    let Some(call) = stmt.as_call_node() else {
-        return false;
-    };
+    stmt.as_call_node()
+        .is_some_and(|call| is_inline_declaration_call(&call))
+}
+
+/// The CallNode form of [`is_inline_declaration_call_stmt`]: the same
+/// receiverless-name test, shared with the call-site `#[T]` lookup so the
+/// two trailing-annotation kinds agree on what a declaration call is.
+pub(super) fn is_inline_declaration_call<'pr>(call: &CallNode<'pr>) -> bool {
     if call.receiver().is_some() {
         return false;
     }

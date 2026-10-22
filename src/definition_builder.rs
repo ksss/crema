@@ -41,6 +41,7 @@ use crate::environment::frozen::{
     ClassAliasDeclaration, ClassDeclaration, ClassOrModule, ClassOrModuleAliasEntry,
     InterfaceEntry, ModuleAliasDeclaration, ModuleDeclaration,
 };
+use crate::environment::g_relative::GRelativeRefs;
 use crate::environment::ruby_decl;
 use crate::environment::{DeclKindLocal, DeclOrigin, Environment, InfusionUnit, ScanScope};
 use crate::location::{DuplicateSource, LocationRange, SourceLocation};
@@ -1485,13 +1486,36 @@ impl DefinitionBuilder {
         self.direct_superclass_name(class_name)
     }
 
-    /// Whether the superclass chain rooted at `class_name` reaches
-    /// `::BasicObject` (or a `::Module` terminal for modules). Mirrors
-    /// legacy `has_complete_ancestor_chain`. Used by the type checker to
-    /// gate `NoMethod` diagnostics — incomplete chains imply the user
-    /// did not load every signature, so the absence of a method is not
-    /// reliable evidence of a real error.
+    /// Whether every member of `class_name`'s instance method table is
+    /// known: the superclass chain reaches `::BasicObject` (or the
+    /// `::Module` terminal for modules) **and** no super / mixin
+    /// reference along the linearized chain was dropped as unresolved
+    /// ([`InstanceAncestors::incomplete`]). Used by the type checker to
+    /// gate `NoMethod` / `UnexpectedSuper` — an incomplete table means
+    /// the user did not load every signature, so the absence of a
+    /// method is not reliable evidence of a real error.
     pub fn has_complete_ancestor_chain(&self, class_name: &TypeName) -> bool {
+        self.superclass_chain_reaches_root(class_name)
+            && !self
+                .ancestor_builder
+                .instance_ancestors(class_name)
+                .incomplete
+    }
+
+    /// Singleton-side [`Self::has_complete_ancestor_chain`]: the same
+    /// superclass walk, but the dropped-reference check reads the
+    /// singleton chain, so an unresolved `include` leaves
+    /// `singleton(C)` complete while an unresolved `extend` or super
+    /// does not.
+    pub fn has_complete_singleton_ancestor_chain(&self, class_name: &TypeName) -> bool {
+        self.superclass_chain_reaches_root(class_name)
+            && !self
+                .ancestor_builder
+                .singleton_ancestors(class_name)
+                .incomplete
+    }
+
+    fn superclass_chain_reaches_root(&self, class_name: &TypeName) -> bool {
         use rustc_hash::FxHashSet;
         let basic_object = &self.names().builtins().basic_object;
         let module_class = &self.names().builtins().module;
@@ -4111,6 +4135,11 @@ pub(crate) struct RoastedGScan {
     /// `encode_g_snapshot` can bake them into the same snapshot blob.
     /// Filled at the encode call site, left empty by `roast_g_scan`.
     pub(crate) warnings: Vec<String>,
+    /// G references the cold G-only resolver left relative, retried
+    /// against the A ∪ G names at build time (see
+    /// [`crate::environment::g_relative`]). Filled at the encode call
+    /// site, left empty by `roast_g_scan`.
+    pub(crate) relative_refs: GRelativeRefs,
 }
 
 /// Cold-time super-edge scan output, bundled so the two arms never
@@ -4161,6 +4190,10 @@ pub(crate) struct BakedArityViolation {
     pub(crate) class: String,
     pub(crate) expected: String,
     pub(crate) got: usize,
+    /// Display form of the type arguments actually supplied (`got` of
+    /// them), so the diagnostic's `help` can show them completed rather
+    /// than replaced.
+    pub(crate) args: Vec<String>,
     pub(crate) location: Option<SourceLocation>,
 }
 
@@ -4209,6 +4242,7 @@ pub(crate) fn roast_g_scan(env: &Environment) -> RoastedGScan {
         arity: Vec::new(),
         super_edges: SuperEdges::default(),
         warnings: Vec::new(),
+        relative_refs: GRelativeRefs::default(),
     }
 }
 
@@ -5248,6 +5282,7 @@ pub enum ConsultedKey {
     InterfaceMethodNames(TypeName),
     SuperclassTypeName(TypeName),
     HasCompleteAncestorChain(TypeName),
+    HasCompleteSingletonAncestorChain(TypeName),
     InstanceAncestors(TypeName),
     SingletonAncestors(TypeName),
     OneInstanceAncestors(TypeName),
@@ -5537,6 +5572,20 @@ impl<'a> ConsultationView<'a> {
         let result = self.builder.has_complete_ancestor_chain(class_name);
         self.record(
             || ConsultedKey::HasCompleteAncestorChain(*class_name),
+            result,
+        );
+        result
+    }
+
+    /// Own key, not `HasCompleteAncestorChain`: the two sides can
+    /// differ for one class (`extend` unresolved, `include` fine), and
+    /// the recorder keeps one bool per key.
+    pub fn has_complete_singleton_ancestor_chain(&self, class_name: &TypeName) -> bool {
+        let result = self
+            .builder
+            .has_complete_singleton_ancestor_chain(class_name);
+        self.record(
+            || ConsultedKey::HasCompleteSingletonAncestorChain(*class_name),
             result,
         );
         result

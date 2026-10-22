@@ -3,7 +3,7 @@ mod cond_env;
 mod constraints;
 mod inference;
 pub mod interface;
-mod method_resolver;
+pub(crate) mod method_resolver;
 mod methods;
 mod visitor;
 
@@ -1171,6 +1171,9 @@ impl<'env> TypeChecker<'env> {
         let mut lvar_tokens = Vec::new();
         let mut pure_tokens = Vec::new();
         for (scrutinee, ty) in env.iter_lvars_then_pures() {
+            let Some(ty) = env.planted(ty) else {
+                continue;
+            };
             match scrutinee {
                 Scrutinee::Lvar(name) => {
                     lvar_tokens.push(self.ctx.enter_narrow(*name, ty));
@@ -1213,6 +1216,9 @@ impl<'env> TypeChecker<'env> {
     ) -> (ScopeSnapshot, R) {
         use cond_env::Scrutinee;
         for (scrutinee, ty) in narrowing.iter_lvars_then_pures() {
+            let Some(ty) = narrowing.planted(ty) else {
+                continue;
+            };
             match scrutinee {
                 Scrutinee::Lvar(name) => self.ctx.set_local_variable(*name, ty),
                 Scrutinee::Pure(key) => self.ctx.pure_call_env_mut().set(*key, ty),
@@ -1224,11 +1230,13 @@ impl<'env> TypeChecker<'env> {
         (after, r)
     }
 
-    /// `with_cond_branch` that bundles the arm's after-snapshot and the
-    /// body's last_ty into a [`BranchOutcome`] so the caller can hand it
-    /// straight to `join_arms_with_divergence` without re-pairing the
-    /// pieces. Used by if/unless/while/until — anywhere the divergence
-    /// check matters.
+    /// `with_cond_branch` that bundles the arm's after-snapshot, the
+    /// body's last_ty and whether `narrowing` is unreachable into a
+    /// [`BranchOutcome`] so the caller can hand it straight to
+    /// `join_arms_with_divergence` without re-pairing the pieces. Used by
+    /// if/unless/while/until — anywhere the divergence check matters.
+    /// An arm the source does not write (`if` without `else`) is never
+    /// dead: callers mark it with [`inference::BranchOutcome::implicit`].
     pub(in crate::type_checker) fn with_branch_outcome(
         &mut self,
         base: &ScopeSnapshot,
@@ -1236,7 +1244,11 @@ impl<'env> TypeChecker<'env> {
         f: impl FnOnce(&mut Self) -> Ty,
     ) -> inference::BranchOutcome {
         let (after, last_ty) = self.with_cond_branch(base, narrowing, f);
-        inference::BranchOutcome { after, last_ty }
+        inference::BranchOutcome {
+            after,
+            last_ty,
+            dead: narrowing.is_unreachable(),
+        }
     }
 
     pub fn diagnostics(self) -> Vec<Diagnostic> {

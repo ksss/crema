@@ -28,7 +28,7 @@ use crate::ast::declarations::{
     InterfaceDeclaration as Interface, ModuleAliasDeclaration as ModuleAlias,
     ModuleDeclaration as Module, TypeAliasDeclaration as TypeAlias,
 };
-use crate::ast::directives::Directive;
+use crate::ast::directives::{Directive, UseClause};
 use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::annotations::InlineAliasKind;
 use crate::ast::ruby::declarations::{
@@ -44,6 +44,7 @@ use crate::environment::frozen::{
     ModuleAliasDeclaration, ModuleAliasEntry as FrozenModuleAliasEntry, ModuleDeclaration,
     ModuleEntry, NormalizeModuleNameResult,
 };
+use crate::environment::g_relative::{self, GReresolved};
 use crate::environment::resolution::{self, FlattenedDecls, TypeNameResolver};
 use crate::environment::use_map::UseMap;
 use crate::location::{LocationRange, RubyLocation, SourceLocation};
@@ -58,6 +59,9 @@ use std::path::PathBuf;
 /// so that nested decls can reuse the parent's allocation rather than
 /// rebuilding it per child.
 pub type Context = Arc<[TypeName]>;
+
+/// Per-file `use` clauses — see [`EnvironmentDraft::file_use_clauses`].
+pub type FileUseClauses = FxHashMap<Name, Vec<UseClause>>;
 
 /// Draft-side discriminator over the two declaration sources for an
 /// open class. `Signature` is an RBS-loaded `ast::declarations::Class`;
@@ -1165,6 +1169,27 @@ impl EnvironmentDraft {
         !self.default_resolve_type_names || self.file_resolve_type_names.values().any(|v| !*v)
     }
 
+    /// Every loaded file's `use` clauses, keyed by file. The frozen
+    /// environment drops directives, so a G-snapshot cold build takes
+    /// them from the draft before `build` and bakes them alongside the
+    /// gem references left relative (`crate::environment::g_relative`).
+    pub fn file_use_clauses(&self) -> FileUseClauses {
+        self.file_directives
+            .iter()
+            .filter_map(|(file, directives)| {
+                let clauses: Vec<UseClause> = directives
+                    .iter()
+                    .filter_map(|d| match d {
+                        Directive::Use(u) => Some(u.clauses.iter().cloned()),
+                        Directive::ResolveTypeNames(_) => None,
+                    })
+                    .flatten()
+                    .collect();
+                (!clauses.is_empty()).then_some((*file, clauses))
+            })
+            .collect()
+    }
+
     /// Re-draft a frozen G-layer environment so app-layer declarations
     /// (sig/ + inline + infusion) can be inserted on top and built into
     /// one combined environment (ADR-0028 slice 1c).
@@ -1601,11 +1626,16 @@ impl EnvironmentDraft {
             // with directives, or the file-less default path some tests
             // use) still pay the full O(all_names) cost on every build,
             // overlay or not — a known remaining debt, not addressed here.
+            // A gem file's `use Foo::*` (baked for the relative-reference
+            // retry below) enumerates the same merged table.
             let needs_use_table = !self.file_directives.is_empty()
                 || self
                     .default_directives
                     .iter()
-                    .any(|d| matches!(d, Directive::Use(_)));
+                    .any(|d| matches!(d, Directive::Use(_)))
+                || g_backend
+                    .as_ref()
+                    .is_some_and(|g| g.baked().relative_refs.has_wildcard_use());
             let use_table = if needs_use_table {
                 let mut t = crate::environment::use_map::Table::new();
                 t.known_types = all_names.clone();
@@ -1674,6 +1704,15 @@ impl EnvironmentDraft {
                 } else {
                     resolver.with_bypass()
                 }
+            };
+
+            // Gem entries whose references the cold G-only resolver left
+            // relative and the merged names now bind — rbs resolves every
+            // decl with this one resolver, so they shadow their lazy G
+            // entries below (`crate::environment::g_relative`).
+            let mut g_reresolved = match &g_backend {
+                Some(g) => g_relative::reresolve(g, &resolver, &use_table, &names),
+                None => GReresolved::default(),
             };
 
             // ---- Pass 2: build frozen entries with resolved AST ----
@@ -1987,7 +2026,11 @@ impl EnvironmentDraft {
                         continue;
                     }
                     let a_entry = class_decls.remove(&name).expect("key collected above");
-                    let g_entry = g.class_entry(&name).expect("class_contains checked above");
+                    let reresolved = g_reresolved.classes.remove(&name);
+                    let g_entry = match &reresolved {
+                        Some(e) => e,
+                        None => g.class_entry(&name).expect("class_contains checked above"),
+                    };
                     let a_location = class_or_module_entry_location(&a_entry, &names);
                     match merge_g_class_or_module(&name, g_entry, a_entry) {
                         Ok(merged) => {
@@ -2006,6 +2049,31 @@ impl EnvironmentDraft {
                             g_overlap.class -= 1;
                         }
                         Err(other) => return Err(other),
+                    }
+                }
+                // The remaining re-resolved gem classes have no A
+                // counterpart to merge with: each shadows its lazy G
+                // entry. An overlay-carried key keeps its merge, unless
+                // it is a re-resolved gem entry from a prior build —
+                // then this build's resolution replaces it.
+                for (name, entry) in std::mem::take(&mut g_reresolved.classes) {
+                    match class_decls.get(&name) {
+                        None => {
+                            class_decls.insert(name, entry);
+                            g_overlap.class += 1;
+                        }
+                        Some(existing) if is_g_only_entry(existing) => {
+                            class_decls.insert(name, entry);
+                        }
+                        Some(_) => {}
+                    }
+                }
+                for (name, entry) in std::mem::take(&mut g_reresolved.interfaces) {
+                    if interface_decls
+                        .get(&name)
+                        .is_none_or(|e| matches!(e.file, DeclOrigin::GSnapshot))
+                    {
+                        interface_decls.insert(name, entry);
                     }
                 }
                 // Interfaces are single-decl; a flatten-generated A
@@ -2123,6 +2191,12 @@ impl EnvironmentDraft {
             let mut constant_candidates: FxHashMap<TypeName, Vec<ConstantDraft>> =
                 self.constant_decls;
             for (key, entry) in constant_decls.drain() {
+                // A re-resolved gem constant a prior build left in the
+                // overlay is no candidate: the gem declaration stays
+                // outer, and its re-resolution is redone below.
+                if matches!(entry.file, DeclOrigin::GSnapshot) {
+                    continue;
+                }
                 let source = if overlay_constant_definitions.contains(&key) {
                     ConstantSource::RubyDefinition
                 } else {
@@ -2356,6 +2430,35 @@ impl EnvironmentDraft {
                     },
                 )
             }));
+
+            // Re-resolved gem single-decl entries shadow their lazy G
+            // entries. The A layer cannot hold these names (a collision
+            // with the gem declaration is dropped as a duplicate), so the
+            // only occupant can be this entry's prior-build copy carried
+            // in the overlay, which is replaced.
+            if let Some(g) = &g_backend {
+                let GReresolved {
+                    classes: _,
+                    interfaces: _,
+                    type_aliases,
+                    constants,
+                    globals,
+                    aliases,
+                } = std::mem::take(&mut g_reresolved);
+                type_alias_decls.extend(type_aliases);
+                constant_decls.extend(constants);
+                global_decls.extend(globals);
+                class_alias_decls.extend(aliases);
+                g_overlap.type_alias = type_alias_decls
+                    .keys()
+                    .filter(|k| g.type_alias_contains(k))
+                    .count();
+                g_overlap.constant = constant_decls
+                    .keys()
+                    .filter(|k| g.constant_contains(k))
+                    .count();
+                g_overlap.global = global_decls.keys().filter(|k| g.global_contains(k)).count();
+            }
 
             // Merge the eagerly decoded gem aliases into the frozen map:
             // `class_alias_decls` (and the normalize table below) stay
@@ -2633,6 +2736,22 @@ fn has_g_origin_decl(entry: &ClassOrModule) -> bool {
             .context_decls()
             .iter()
             .any(|(file, _, _)| matches!(file, DeclOrigin::GSnapshot)),
+    }
+}
+
+/// Whether every decl of `entry` came from the G snapshot — a gem entry
+/// re-resolved against the A layer (`crate::environment::g_relative`),
+/// as opposed to a merge with A decls.
+fn is_g_only_entry(entry: &ClassOrModule) -> bool {
+    match entry {
+        ClassOrModule::Class(c) => c
+            .context_decls()
+            .iter()
+            .all(|(file, _, _)| matches!(file, DeclOrigin::GSnapshot)),
+        ClassOrModule::Module(m) => m
+            .context_decls()
+            .iter()
+            .all(|(file, _, _)| matches!(file, DeclOrigin::GSnapshot)),
     }
 }
 

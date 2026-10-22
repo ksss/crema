@@ -4,7 +4,7 @@
 
 ## Scratch queries (`-e`)
 
-`crema extract -e '<ruby code>'` answers "what type does this expression have?" for code that is not in a file yet. It builds the same environment as a bare `crema extract` (so project types are in scope), and checks only the snippet — `files` holds exactly one entry, keyed `"-e"`. Nothing under `.crema/` is read, written, or created, so the command works in a directory with no `crema.toml` at all.
+`crema extract -e '<ruby code>'` answers "what type does this expression have?" for code that is not in a file yet. It builds the same environment as a bare `crema extract` (so project types are in scope), and checks only the snippet — `files` holds exactly one entry, keyed `"-e"`. Nothing derived from the snippet is persisted. Without a `crema.toml` the command still works and creates no `.crema/` directory; inside a project it shares the project's `.crema/` caches with `crema check` (reading them, and refreshing the gem-environment snapshot when it is stale), which changes only the speed, never the document.
 
 ```
 crema extract -e '[1, 2].map { _1.to_s }' | jq -r '.files["-e"].method_call[].return_type'
@@ -26,7 +26,7 @@ Type errors in the snippet are not reported here — extract discards diagnostic
 
 - `version` — Integer. Schema version of the document; this page describes version 7.
 - `root` — String. Base directory the `files` keys are relative to.
-- `files` — Object. One entry per file in the check scope, keyed by relative path. Files that fail to parse still get an entry (with whatever facts were recoverable), so the key set is the full scope.
+- `files` — Object. One entry per file, keyed by relative path. A bare `crema extract` covers the full check scope: files that fail to parse still get an entry (with whatever facts were recoverable), so the key set is the whole scope. `crema extract <path>...` holds only the positional targets (a directory is intersected with the scope), with the same validation as `crema check <path>...`; the environment is still the whole scope, so each target's entry equals its entry in the bare document.
 
 Every symbol string in the document is absolute RBS syntax: `::User` (type), `::User#save` (instance method), `::User.new` (singleton method), `::Billing::Invoice` (namespaced type). Global variables (`$foo`) have no absolute RBS spelling and are absent.
 

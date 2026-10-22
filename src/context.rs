@@ -21,7 +21,6 @@ pub enum ScopeKind {
 struct Scope {
     kind: ScopeKind,
     bindings: FxHashMap<Name, Ty>,
-    bot_rhs_bindings: FxHashSet<Name>,
     self_type_override: Option<Ty>,
     /// Outer lvars pinned on entry to this `Block` scope: the type each
     /// visible lvar had when the closure was entered. Steep's
@@ -131,7 +130,6 @@ impl Context {
             scopes: vec![Scope {
                 kind: ScopeKind::Top,
                 bindings: FxHashMap::default(),
-                bot_rhs_bindings: FxHashSet::default(),
                 self_type_override: None,
                 pinned: FxHashMap::default(),
             }],
@@ -399,7 +397,6 @@ impl Context {
         self.scopes.push(Scope {
             kind,
             bindings: FxHashMap::default(),
-            bot_rhs_bindings: FxHashSet::default(),
             self_type_override: None,
             pinned: FxHashMap::default(),
         });
@@ -432,7 +429,6 @@ impl Context {
         self.scopes.push(Scope {
             kind: ScopeKind::Block,
             bindings: FxHashMap::default(),
-            bot_rhs_bindings: FxHashSet::default(),
             self_type_override: None,
             pinned: pins,
         });
@@ -532,7 +528,6 @@ impl Context {
         self.pure_call_env.invalidate_by_lvar(name);
         if let Some(scope) = self.scopes.last_mut() {
             scope.bindings.insert(name, ty);
-            scope.bot_rhs_bindings.remove(&name);
         }
     }
 
@@ -556,7 +551,6 @@ impl Context {
         for i in (0..len).rev() {
             if remaining == 0 {
                 self.scopes[i].bindings.insert(name, ty);
-                self.scopes[i].bot_rhs_bindings.remove(&name);
                 return;
             }
             // An enclosing conditional's narrow (`with_cond_branch`)
@@ -567,7 +561,6 @@ impl Context {
             // (`lookup_local_variable` walks innermost-first) and see
             // the pre-write narrow instead of this write's value.
             self.scopes[i].bindings.remove(&name);
-            self.scopes[i].bot_rhs_bindings.remove(&name);
             if self.scopes[i].kind == ScopeKind::Block {
                 remaining -= 1;
             }
@@ -578,24 +571,6 @@ impl Context {
              every scope walked past had its stale `name` entry cleared with no target left to \
              write into"
         );
-    }
-
-    pub fn set_local_variable_at_depth_from_bot_rhs(&mut self, name: Name, ty: Ty, depth: u32) {
-        self.set_local_variable_at_depth(name, ty, depth);
-        if ty != Ty::BOTTOM {
-            return;
-        }
-        let len = self.scopes.len();
-        let mut remaining = depth;
-        for i in (0..len).rev() {
-            if remaining == 0 {
-                self.scopes[i].bot_rhs_bindings.insert(name);
-                return;
-            }
-            if self.scopes[i].kind == ScopeKind::Block {
-                remaining -= 1;
-            }
-        }
     }
 
     /// Look up a variable by walking the scope chain from inner to outer.
@@ -612,18 +587,6 @@ impl Context {
             }
         }
         None
-    }
-
-    pub fn is_bot_rhs_local_variable(&self, name: Name) -> bool {
-        for scope in self.scopes.iter().rev() {
-            if scope.bindings.contains_key(&name) {
-                return scope.bot_rhs_bindings.contains(&name);
-            }
-            if scope.kind == ScopeKind::Method {
-                return false;
-            }
-        }
-        false
     }
 
     /// Sequential-environment substrate, low half of the narrow pair.
@@ -647,17 +610,11 @@ impl Context {
             .scopes
             .last()
             .and_then(|s| s.bindings.get(&name).copied());
-        let prev_bot_rhs_in_innermost = self
-            .scopes
-            .last()
-            .map(|s| s.bot_rhs_bindings.contains(&name))
-            .unwrap_or(false);
         self.set_local_variable(name, ty);
         NarrowToken {
             name,
             narrowed_ty: ty,
             prev_in_innermost,
-            prev_bot_rhs_in_innermost,
         }
     }
 
@@ -673,7 +630,6 @@ impl Context {
             name,
             narrowed_ty,
             prev_in_innermost,
-            prev_bot_rhs_in_innermost,
         } = token;
         if let Some(scope) = self.scopes.last_mut() {
             if scope.bindings.get(&name).copied() != Some(narrowed_ty) {
@@ -682,15 +638,9 @@ impl Context {
             match prev_in_innermost {
                 Some(prev) => {
                     scope.bindings.insert(name, prev);
-                    if prev_bot_rhs_in_innermost {
-                        scope.bot_rhs_bindings.insert(name);
-                    } else {
-                        scope.bot_rhs_bindings.remove(&name);
-                    }
                 }
                 None => {
                     scope.bindings.remove(&name);
-                    scope.bot_rhs_bindings.remove(&name);
                 }
             }
         }
@@ -717,7 +667,6 @@ pub struct ScopeSnapshot {
     /// (debug-asserted) — arms are expected to leave the scope stack
     /// balanced.
     per_scope: Vec<FxHashMap<Name, Ty>>,
-    per_scope_bot_rhs: Vec<FxHashSet<Name>>,
     /// Pure-call cache at snapshot time. The cache lives on the
     /// `Context` itself (not in `scopes`) so it carries across scope
     /// push/pop, but per-arm snapshots still need to capture it so
@@ -733,11 +682,6 @@ impl Context {
     pub fn snapshot_scopes(&self) -> ScopeSnapshot {
         ScopeSnapshot {
             per_scope: self.scopes.iter().map(|s| s.bindings.clone()).collect(),
-            per_scope_bot_rhs: self
-                .scopes
-                .iter()
-                .map(|s| s.bot_rhs_bindings.clone())
-                .collect(),
             pure_call_env: self.pure_call_env.clone(),
         }
     }
@@ -755,14 +699,8 @@ impl Context {
             snapshot.per_scope.len(),
             "restore_scopes called with mismatched scope depth"
         );
-        for ((scope, bindings), bot_rhs_bindings) in self
-            .scopes
-            .iter_mut()
-            .zip(snapshot.per_scope)
-            .zip(snapshot.per_scope_bot_rhs)
-        {
+        for (scope, bindings) in self.scopes.iter_mut().zip(snapshot.per_scope) {
             scope.bindings = bindings;
-            scope.bot_rhs_bindings = bot_rhs_bindings;
         }
         self.pure_call_env = snapshot.pure_call_env;
     }
@@ -813,20 +751,12 @@ impl Context {
             all_names.extend(b.keys().copied());
 
             let mut joined: FxHashMap<Name, Ty> = FxHashMap::default();
-            let mut joined_bot_rhs: FxHashSet<Name> = FxHashSet::default();
             for name in all_names {
                 let ty_a = a.get(&name).copied();
                 let ty_b = b.get(&name).copied();
                 match (ty_a, ty_b) {
                     (Some(ta), Some(tb)) => {
-                        let ty = crate::types::union_of(ta, tb, env.types());
-                        joined.insert(name, ty);
-                        if ty == Ty::BOTTOM
-                            && arm_a.per_scope_bot_rhs[i].contains(&name)
-                            && arm_b.per_scope_bot_rhs[i].contains(&name)
-                        {
-                            joined_bot_rhs.insert(name);
-                        }
+                        joined.insert(name, crate::types::union_of(ta, tb, env.types()));
                     }
                     (Some(t), None) | (None, Some(t)) => {
                         let shadows_outer =
@@ -846,7 +776,6 @@ impl Context {
                 }
             }
             scope.bindings = joined;
-            scope.bot_rhs_bindings = joined_bot_rhs;
         }
 
         // Pure-call cache joins on the same "both-arms keep, one-arm
@@ -871,7 +800,6 @@ pub struct NarrowToken {
     name: Name,
     narrowed_ty: Ty,
     prev_in_innermost: Option<Ty>,
-    prev_bot_rhs_in_innermost: bool,
 }
 
 /// Opaque undo handle produced by [`Context::enter_pure_narrow`]. The

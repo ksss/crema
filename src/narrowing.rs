@@ -30,6 +30,14 @@ pub fn partition_union(ty: Ty, env: ConsultationView) -> (Option<Ty>, Option<Ty>
     crate::types::partition_union_with(ty, env.types(), &|t| expand_alias(env, t))
 }
 
+/// A type variable narrows like `top`: to the target on the matching
+/// side, unchanged on the other (Steep `type_case_select0`'s `Var` arm).
+/// The subtype check would answer for it as a wildcard instead, so a
+/// `[S] (S)` parameter tested with `is_a?(C)` would lose its else side.
+fn is_type_variable(ty: Ty, env: ConsultationView) -> bool {
+    matches!(env.types().resolve(ty), Type::TypeVariable { .. })
+}
+
 /// Return the intersection of `ty` with `target`.
 ///
 /// Empty intersection → `Ty::BOTTOM`. `Untyped` on the input narrows to
@@ -57,6 +65,9 @@ pub fn narrow(ty: Ty, target: Ty, env: ConsultationView) -> Ty {
     }
 
     let types = env.types();
+    if is_type_variable(ty, env) {
+        return target;
+    }
     if let (Type::Bool, Type::Literal(Literal::Bool(_))) =
         (types.resolve(ty), types.resolve(target))
     {
@@ -123,6 +134,9 @@ pub fn subtract(ty: Ty, target: Ty, env: ConsultationView) -> Ty {
     }
 
     let types = env.types();
+    if is_type_variable(ty, env) {
+        return ty;
+    }
     if let (Type::Bool, Type::Literal(Literal::Bool(value))) =
         (types.resolve(ty), types.resolve(target))
     {

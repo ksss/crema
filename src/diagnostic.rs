@@ -71,6 +71,14 @@ pub struct Diagnostic {
     pub scope: Option<String>,
 }
 
+/// Which `case` clause an [`DiagnosticKind::UnreachableValueBranch`]
+/// points at. Only the message wording depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UnreachableClause {
+    Else,
+    When,
+}
+
 // serde is derived so structured diagnostics can be persisted (the
 // per-file ingest cache planned by ADR-0036 Decision 4 stores them).
 // bincode gives no schema evolution — whatever persists this enum must
@@ -409,6 +417,28 @@ pub enum DiagnosticKind {
         /// `RecursiveAncestorError#location` (= `entry.primary_decl.location`).
         primary_source: Option<SourceLocation>,
     },
+    /// Mirrors Steep's `Diagnostic::Signature::ModuleSelfTypeError`
+    /// (`lib/steep/diagnostic/signature.rb`; rbs has no such class — the
+    /// check lives in `Steep::Signature::Validator#mixin_constraints`).
+    /// Emitted by the build-layer validator when a class / module
+    /// `include`s or `extend`s a module whose self type constraint
+    /// (`module M : _K`, default `Object`) the includer does not satisfy.
+    /// One diagnostic per violating mixin, anchored at the mixin member.
+    ModuleSelfType {
+        /// The includer, fully qualified (Steep `name`).
+        type_name: String,
+        /// The mixin as written, with its args (Steep `ancestor`):
+        /// `::M`, `::Enumerable[::Integer]`.
+        ancestor: String,
+        /// The constraint after substituting the mixin's params with its
+        /// args — the relation's super type: `::_K`, `::_Each[::Integer]`.
+        self_type: String,
+        /// The relation's sub type: the includer's instance type,
+        /// `singleton(::G)` for `extend`, or the intersection with the
+        /// includer's own self types for a module includer
+        /// (`(::Object & ::Q)`).
+        actual: String,
+    },
     InstanceVariableDuplication {
         type_name: String,
         variable_name: String,
@@ -434,6 +464,15 @@ pub enum DiagnosticKind {
         expected: String,
         /// Actual number of type arguments supplied.
         got: usize,
+        /// Imperative fix hint in the origin file's syntax, e.g. ``add a
+        /// type argument after this reference, e.g. `#[untyped]` `` for
+        /// an inline `.rb` and `` `[untyped]` `` for `.rbs`. JSON-only:
+        /// the message does not repeat it. Present only when too few
+        /// arguments were supplied and the reference has a source
+        /// location. Named after rustc's `help:`; `untyped` is an
+        /// example that makes the reference well-formed, not an
+        /// inferred type.
+        help: Option<String>,
     },
     /// A type name referenced from the build layer (alias rhs today;
     /// later super class / mixin / module-self / type references) is
@@ -566,12 +605,21 @@ pub enum DiagnosticKind {
         residue_type: String,
     },
 
-    /// `case x; when A; when B; else; ... end` covered every value of
-    /// `x` already, so the `else` branch is statically unreachable
-    /// (ADR-0022 § exhaustiveness). Mirrors Steep's
+    /// A `case` branch that can never run yet yields a value: the
+    /// `else` after `when` clauses that covered every value of the
+    /// scrutinee (ADR-0022 § exhaustiveness), or a `when` whose tests
+    /// all narrow the scrutinee to nothing. Mirrors Steep's
     /// `Ruby::UnreachableValueBranch`; `Hint` by default to match
-    /// Steep's `default` preset.
-    UnreachableValueBranch,
+    /// Steep's `default` preset. `clause` only picks the message.
+    UnreachableValueBranch {
+        clause: UnreachableClause,
+    },
+
+    /// An `if` / `unless` / `elsif` / ternary branch whose condition
+    /// narrows a local or pure call to nothing, so the branch never
+    /// runs. Mirrors Steep's `Ruby::UnreachableBranch`
+    /// (`type_construction.rb` `:if`); `Hint` by default.
+    UnreachableBranch,
 
     /// RHS of an ivar / cvar / gvar / constant assignment is incompatible
     /// with the declared type (e.g. `@x: Integer` with `@x = "string"`).
@@ -967,7 +1015,8 @@ impl Diagnostic {
                 .first()
                 .map(String::as_str)
                 .unwrap_or("<recursive-type-alias>"),
-            DiagnosticKind::RecursiveAncestor { type_name, .. } => type_name,
+            DiagnosticKind::RecursiveAncestor { type_name, .. }
+            | DiagnosticKind::ModuleSelfType { type_name, .. } => type_name,
             DiagnosticKind::InstanceVariableDuplication { variable_name, .. }
             | DiagnosticKind::ClassInstanceVariableDuplication { variable_name, .. } => {
                 variable_name
@@ -998,7 +1047,13 @@ impl Diagnostic {
             DiagnosticKind::UnsatisfiableConstraint { type_param, .. } => type_param,
             DiagnosticKind::UnknownConstant { name, .. } => name,
             DiagnosticKind::NonExhaustiveCase { .. } => "<case>",
-            DiagnosticKind::UnreachableValueBranch => "<else>",
+            DiagnosticKind::UnreachableValueBranch {
+                clause: UnreachableClause::Else,
+            } => "<else>",
+            DiagnosticKind::UnreachableValueBranch {
+                clause: UnreachableClause::When,
+            } => "<when>",
+            DiagnosticKind::UnreachableBranch => "<branch>",
             DiagnosticKind::IncompatibleAssignment { .. } => "<assignment>",
             DiagnosticKind::MultipleAssignmentConversion { .. } => "<multi-assign>",
             DiagnosticKind::UnknownInstanceVariable { name } => name,
@@ -1241,12 +1296,16 @@ impl Diagnostic {
                 class,
                 expected,
                 got,
+                help,
             } => {
                 obj.insert("kind".into(), json!(kind));
                 obj.insert("target".into(), json!(target));
                 obj.insert("class".into(), json!(class));
                 obj.insert("expected".into(), json!(expected));
                 obj.insert("got".into(), json!(got));
+                if let Some(help) = help {
+                    obj.insert("help".into(), json!(help));
+                }
             }
             DiagnosticKind::InlineClassAliasMissingTypeName { kind } => {
                 let kind_str = match kind {
@@ -1344,6 +1403,17 @@ impl Diagnostic {
                     );
                 }
             }
+            DiagnosticKind::ModuleSelfType {
+                type_name,
+                ancestor,
+                self_type,
+                actual,
+            } => {
+                obj.insert("type_name".into(), json!(type_name));
+                obj.insert("ancestor".into(), json!(ancestor));
+                obj.insert("self_type".into(), json!(self_type));
+                obj.insert("actual".into(), json!(actual));
+            }
             DiagnosticKind::InstanceVariableDuplication {
                 type_name,
                 variable_name,
@@ -1415,7 +1485,7 @@ impl Diagnostic {
                 obj.insert("scrutinee_type".into(), json!(scrutinee_type));
                 obj.insert("residue_type".into(), json!(residue_type));
             }
-            DiagnosticKind::UnreachableValueBranch => {}
+            DiagnosticKind::UnreachableValueBranch { .. } | DiagnosticKind::UnreachableBranch => {}
             DiagnosticKind::IncompatibleAssignment {
                 lhs_type, rhs_type, ..
             } => {
@@ -1647,6 +1717,9 @@ impl DiagnosticKind {
         DiagnosticKind::RecursiveAncestor { .. } => "RBS::RecursiveAncestorError",
             "A class or module ancestor graph contains a cycle.",
             "RBS_RecursiveAncestorError",
+        DiagnosticKind::ModuleSelfType { .. } => "RBS::ModuleSelfTypeError",
+            "A class or module includes / extends a module whose self type constraint it does not satisfy.",
+            "RBS_ModuleSelfTypeError",
         DiagnosticKind::InstanceVariableDuplication { .. } => "RBS::InstanceVariableDuplicationError",
             "A type declares the same instance variable name more than once.",
             "RBS_InstanceVariableDuplicationError",
@@ -1677,9 +1750,12 @@ impl DiagnosticKind {
         DiagnosticKind::NonExhaustiveCase { .. } => "Crema::NonExhaustiveCase",
             "A case expression without else leaves part of the scrutinee type uncovered by its when clauses.",
             "Crema_NonExhaustiveCase",
-        DiagnosticKind::UnreachableValueBranch => "Ruby::UnreachableValueBranch",
-            "A case expression's else branch cannot run because previous when clauses cover every scrutinee value.",
+        DiagnosticKind::UnreachableValueBranch { .. } => "Ruby::UnreachableValueBranch",
+            "A case branch that yields a value cannot run: the else after when clauses that cover every scrutinee value, or a when that matches no value left.",
             "Ruby_UnreachableValueBranch",
+        DiagnosticKind::UnreachableBranch => "Ruby::UnreachableBranch",
+            "An if, unless, elsif or ternary branch cannot run because its condition narrows a variable to no possible value.",
+            "Ruby_UnreachableBranch",
         DiagnosticKind::IncompatibleAssignment { .. } => "Ruby::IncompatibleAssignment",
             "A variable assignment writes a value whose inferred type is incompatible with the declared variable type.",
             "Ruby_IncompatibleAssignment",
@@ -1772,6 +1848,7 @@ impl DiagnosticKind {
             | "Ruby::FallbackAny"
             | "Ruby::UnsatisfiableConstraint"
             | "Ruby::UnreachableValueBranch"
+            | "Ruby::UnreachableBranch"
             | "Ruby::IncompatibleAssignment"
             | "Ruby::UnexpectedTypeArgument"
             | "Ruby::InsufficientTypeArguments"
@@ -2244,6 +2321,7 @@ impl fmt::Display for DiagnosticKind {
                 class,
                 expected,
                 got,
+                ..
             } => write!(
                 f,
                 "{} {} for {} expects {} type argument(s), got {}",
@@ -2275,6 +2353,16 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::RecursiveAncestor { chain, .. } => {
                 write!(f, "Detected recursive ancestors: {}", chain.join(" < "),)
             }
+            DiagnosticKind::ModuleSelfType {
+                type_name,
+                self_type,
+                actual,
+                ..
+            } => write!(
+                f,
+                "Module self type constraint in type `{}` doesn't satisfy: `{} <: {}`",
+                type_name, actual, self_type,
+            ),
             DiagnosticKind::InstanceVariableDuplication {
                 type_name,
                 variable_name,
@@ -2339,10 +2427,26 @@ impl fmt::Display for DiagnosticKind {
                     residue_type,
                 )
             }
-            DiagnosticKind::UnreachableValueBranch => {
+            DiagnosticKind::UnreachableValueBranch {
+                clause: UnreachableClause::Else,
+            } => {
                 write!(
                     f,
                     "The `else` branch is unreachable: every value of the scrutinee is covered by the preceding `when` clauses",
+                )
+            }
+            DiagnosticKind::UnreachableValueBranch {
+                clause: UnreachableClause::When,
+            } => {
+                write!(
+                    f,
+                    "The `when` branch is unreachable: its conditions match no value left in the scrutinee",
+                )
+            }
+            DiagnosticKind::UnreachableBranch => {
+                write!(
+                    f,
+                    "The branch is unreachable: its condition narrows a variable to no possible value",
                 )
             }
             DiagnosticKind::IncompatibleAssignment {

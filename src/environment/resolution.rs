@@ -1112,6 +1112,84 @@ pub(crate) fn resolve_module_recursive(
     })
 }
 
+/// Non-flattening sibling of [`resolve_class_recursive`] for a decl
+/// whose nested declarations already live as their own env entries (a
+/// G-snapshot entry re-resolved against the A layer): nested
+/// `Declaration` members pass through unchanged, every other reference
+/// resolves exactly as the recursive walk resolves it.
+pub(crate) fn resolve_class_shallow(
+    decl: &Arc<Class>,
+    context: &[TypeName],
+    resolver: &TypeNameResolver,
+    names: &NameTable,
+) -> Arc<Class> {
+    let inner_context = extend_context(context, decl.name);
+    Arc::new(Class {
+        name: decl.name,
+        type_params: decl
+            .type_params
+            .iter()
+            .map(|tp| resolve_decl_type_param(tp, &inner_context, resolver, names))
+            .collect(),
+        // Outer context, as in `resolve_class_recursive`.
+        super_class: decl
+            .super_class
+            .as_ref()
+            .map(|m| resolve_super(m, context, resolver, names)),
+        members: decl
+            .members
+            .iter()
+            .map(|m| match m {
+                ClassMember::Member(m) => {
+                    ClassMember::Member(resolve_member(m, &inner_context, resolver, names))
+                }
+                ClassMember::Declaration(d) => ClassMember::Declaration(d.clone()),
+            })
+            .collect(),
+        annotations: decl.annotations.clone(),
+        location: decl.location,
+        source_file: decl.source_file,
+        comment: decl.comment.clone(),
+    })
+}
+
+/// Module counterpart of [`resolve_class_shallow`].
+pub(crate) fn resolve_module_shallow(
+    decl: &Arc<Module>,
+    context: &[TypeName],
+    resolver: &TypeNameResolver,
+    names: &NameTable,
+) -> Arc<Module> {
+    let inner_context = extend_context(context, decl.name);
+    Arc::new(Module {
+        name: decl.name,
+        type_params: decl
+            .type_params
+            .iter()
+            .map(|tp| resolve_decl_type_param(tp, &inner_context, resolver, names))
+            .collect(),
+        self_types: decl
+            .self_types
+            .iter()
+            .map(|m| resolve_self_type(m, &inner_context, resolver, names))
+            .collect(),
+        members: decl
+            .members
+            .iter()
+            .map(|m| match m {
+                ModuleMember::Member(m) => {
+                    ModuleMember::Member(resolve_member(m, &inner_context, resolver, names))
+                }
+                ModuleMember::Declaration(d) => ModuleMember::Declaration(d.clone()),
+            })
+            .collect(),
+        annotations: decl.annotations.clone(),
+        location: decl.location,
+        source_file: decl.source_file,
+        comment: decl.comment.clone(),
+    })
+}
+
 pub(crate) fn resolve_interface_recursive(
     decl: &Arc<Interface>,
     context: &[TypeName],

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::ast::ruby::PrismByteRange;
 use crate::definition::ancestor_builder::{Ancestor, AncestorBuilder};
 use crate::definition::{MixinRef, VariableDuplicationKind};
+use crate::definition_builder::ConsultationView;
 use crate::definition_builder::{
     BakedAncestorCycle, BakedArityViolation, DefinitionBuilder, PerNameCache, TypeParamsCache,
     collect_direct_alias_deps,
@@ -34,8 +35,11 @@ use crate::environment::{DeclOrigin, ScanScope};
 use crate::location::{RubyLocation, SourceLocation};
 use crate::name::NameTable;
 use crate::snapshot::backend::GSnapshotBackend;
+use crate::substitution::Substitution;
+use crate::subtyping::SubtypeChecker;
 use crate::type_name::TypeName;
-use crate::type_param::TypeParam;
+use crate::type_param::{TypeParam, TypeVarKey};
+use crate::types::{Ty, Type, TypeTable, intersection_of};
 
 /// In-memory source lookup used when translating `RubyLocation` byte offsets to
 /// line numbers. Keys are the canonical `PathBuf` for each source file.
@@ -227,41 +231,44 @@ fn validate_alias_targets(
     out
 }
 
-/// Emit `UnknownTypeName` for every declaration in `user_files` whose
-/// name has an undeclared enclosing namespace — `class Grape::API::Instance`
-/// with no `Grape::API` anywhere in the environment. Mirrors rbs's
-/// `DefinitionBuilder#ensure_namespace!` (`lib/rbs/definition_builder.rb`
-/// L25): the namespace is walked from the deepest prefix outward and the
-/// first undeclared one is reported, so each declaration yields at most one
-/// diagnostic. Presence follows rbs's `Environment#type_name?` (class,
-/// module, class/module alias, interface, type alias); a constant-only name
-/// does not count as a namespace. Steep surfaces the same error as
-/// `UnknownTypeName` (`Cannot find type \`::Grape::API\``).
+/// A declaration the user wrote, as the environment-level validators see
+/// it: the `path_index` key and the user file that declared it. Built once
+/// by [`user_decls`] and handed to every validator that walks the user's
+/// own declarations ([`validate_decl_namespaces`],
+/// [`validate_module_self_types`]), so the ownership scan over
+/// `context_decls` runs once per name rather than once per validator.
+#[derive(Debug, Clone, Copy)]
+pub struct UserDecl {
+    pub file: crate::name::Name,
+    pub key: PathIndexKey,
+}
+
+/// The declarations written in `user_files` (the project's sig files and
+/// inline `.rb` files, as interned path names), each name once. Library
+/// sigs (core / stdlib / gems / collection) are validated upstream and
+/// are deliberately not re-checked on every run. The caller supplies the
+/// file list because the environment does not record which files are the
+/// user's: with a G snapshot attached library decls sit in their own
+/// layer, but under `--no-g-snapshot` they share one map with the user's,
+/// and keying the walk on files keeps both runs' output identical by
+/// construction.
 ///
-/// Only declarations parsed from `user_files` (the project's sig files and
-/// inline `.rb` files, as interned path names) are walked. Library sigs (core / stdlib / gems /
-/// collection) are validated upstream and are deliberately not re-checked
-/// on every run. The caller supplies the file list because the
-/// environment does not record which files are the user's: with a G
-/// snapshot attached library decls sit in their own layer, but under
-/// `--no-g-snapshot` they share one map with the user's, and keying the
-/// walk on files keeps both runs' output identical by construction.
-/// Namespace presence itself is judged over the whole environment, so a
-/// namespace a library declares (`class Array::Mine`) is accepted.
-///
-/// A name reached through `path_index` is walked only when the file
-/// itself declared it: owner-tagged synthesized decls (infusion) are
-/// indexed under their owner `.rb` file but were not written by the user.
-/// Each name is reported once even when declared in several user files;
-/// the location is the primary declaration's, as in rbs.
-pub fn validate_decl_namespaces(
+/// A name reached through `path_index` counts only when the file itself
+/// declared it: owner-tagged synthesized decls (infusion) are indexed
+/// under their owner `.rb` file but were not written by the user. A name
+/// declared in several user files is listed once, under whichever file
+/// reaches it first (`path_index_for` hands back a hash set, so that
+/// order varies — harmless: the validators report the primary decl's
+/// location and main sorts env diagnostics). Class / module aliases and
+/// globals are left out: no validator walks them (rbs
+/// `ensure_namespace!` does not run on class aliases — their rhs is
+/// `validate_alias_targets`' concern — or globals, and self type
+/// constraints belong to classes and modules).
+pub fn user_decls(
     env: &DefinitionBuilder,
     user_files: impl IntoIterator<Item = crate::name::Name>,
-) -> Vec<Diagnostic> {
+) -> Vec<UserDecl> {
     let environment = env.env();
-    let names = env.names();
-    let ctx = AncestryEnv::from_builder(env);
-
     let mut seen: FxHashSet<PathIndexKey> = FxHashSet::default();
     let mut out = Vec::new();
     for file in user_files {
@@ -269,9 +276,6 @@ pub fn validate_decl_namespaces(
             continue;
         };
         let origin = DeclOrigin::Path(file);
-        // `keys` is a hash set, so the walk order varies — harmless: the
-        // reported location is the primary decl's whichever user file
-        // reaches a name first, and main sorts env diagnostics.
         for key in keys {
             // Skip a name already walked from an earlier file before the
             // `declared_here` scan: an outer `module Gitlab` reopened in
@@ -280,69 +284,279 @@ pub fn validate_decl_namespaces(
             if seen.contains(&key) {
                 continue;
             }
-            let (name, location) = match key {
+            let declared_here = match key {
                 PathIndexKey::ClassOrModule(name) => {
-                    let declared_here = match environment.class_decls().get(&name) {
-                        Some(ClassOrModule::Class(entry)) => {
-                            entry.context_decls().iter().any(|(o, _, _)| *o == origin)
-                        }
-                        Some(ClassOrModule::Module(entry)) => {
-                            entry.context_decls().iter().any(|(o, _, _)| *o == origin)
-                        }
-                        None => false,
-                    };
-                    if !declared_here {
-                        continue;
-                    }
-                    (name, primary_decl_location(&ctx, &name))
+                    class_or_module_declared_in(environment, &name, &origin)
                 }
                 PathIndexKey::Interface(name) => {
-                    match environment.interface_decls().get(&name) {
-                        Some(entry) if entry.file() == Some(file) => {}
-                        _ => continue,
-                    }
-                    (name, primary_decl_location(&ctx, &name))
+                    matches!(environment.interface_decls().get(&name), Some(entry) if entry.file() == Some(file))
                 }
                 PathIndexKey::TypeAlias(name) => {
-                    let Some(entry) = environment.type_alias_decls().get(&name) else {
-                        continue;
-                    };
-                    if entry.file != origin {
-                        continue;
-                    }
-                    let range = entry.decl.location.as_ref().map(|l| l.range);
-                    (name, file_range_location(names, file, range))
+                    matches!(environment.type_alias_decls().get(&name), Some(entry) if entry.file == origin)
                 }
                 PathIndexKey::Constant(name) => {
-                    let Some(entry) = environment.constant_decls().get(&name) else {
-                        continue;
-                    };
-                    if entry.file != origin {
-                        continue;
-                    }
-                    let range = entry.decl.location.as_ref().map(|l| l.range);
-                    (name, file_range_location(names, file, range))
+                    matches!(environment.constant_decls().get(&name), Some(entry) if entry.file == origin)
                 }
-                // rbs `ensure_namespace!` does not run on class aliases
-                // (their rhs is `validate_alias_targets`' concern) or globals.
-                PathIndexKey::ClassAlias(_) | PathIndexKey::Global(_) => continue,
+                PathIndexKey::ClassAlias(_) | PathIndexKey::Global(_) => false,
             };
-            if !seen.insert(key) {
+            if !declared_here {
                 continue;
             }
-            let Some(missing) = first_missing_namespace(environment, names, name) else {
+            seen.insert(key);
+            out.push(UserDecl { file, key });
+        }
+    }
+    out
+}
+
+/// Emit `UnknownTypeName` for every declaration in `decls` whose
+/// name has an undeclared enclosing namespace — `class Grape::API::Instance`
+/// with no `Grape::API` anywhere in the environment. Mirrors rbs's
+/// `DefinitionBuilder#ensure_namespace!` (`lib/rbs/definition_builder.rb`
+/// L25): the namespace is walked from the deepest prefix outward and the
+/// first one `Environment#type_name?` rejects is named in the
+/// diagnostic. Presence follows rbs's `Environment#type_name?` (class,
+/// module, class/module alias, interface, type alias); a constant-only name
+/// does not count as a namespace. Steep surfaces the same error as
+/// `UnknownTypeName` (`Cannot find type \`::Grape::API\``).
+///
+/// `decls` is the user's own declarations ([`user_decls`]); namespace
+/// presence itself is judged over the whole environment, so a namespace a
+/// library declares (`class Array::Mine`) is accepted. Each name is
+/// reported once; the location is the primary declaration's, as in rbs.
+pub fn validate_decl_namespaces(env: &DefinitionBuilder, decls: &[UserDecl]) -> Vec<Diagnostic> {
+    let environment = env.env();
+    let names = env.names();
+    let ctx = AncestryEnv::from_builder(env);
+
+    let mut out = Vec::new();
+    for decl in decls {
+        let file = decl.file;
+        let (name, location) = match decl.key {
+            PathIndexKey::ClassOrModule(name) | PathIndexKey::Interface(name) => {
+                (name, primary_decl_location(&ctx, &name))
+            }
+            PathIndexKey::TypeAlias(name) => {
+                let Some(entry) = environment.type_alias_decls().get(&name) else {
+                    continue;
+                };
+                let range = entry.decl.location.as_ref().map(|l| l.range);
+                (name, file_range_location(names, file, range))
+            }
+            PathIndexKey::Constant(name) => {
+                let Some(entry) = environment.constant_decls().get(&name) else {
+                    continue;
+                };
+                let range = entry.decl.location.as_ref().map(|l| l.range);
+                (name, file_range_location(names, file, range))
+            }
+            PathIndexKey::ClassAlias(_) | PathIndexKey::Global(_) => continue,
+        };
+        let Some(missing) = first_missing_namespace(environment, names, name) else {
+            continue;
+        };
+        out.push(Diagnostic {
+            scope: None,
+            kind: DiagnosticKind::UnknownTypeName {
+                name: names.display_type_name(missing),
+            },
+            location: resolve_or_default(location.as_ref()),
+        });
+    }
+    out
+}
+
+/// Whether `name` has a class / module declaration written in `origin`
+/// (a `context_decls` entry with that origin). Owner-tagged synthesized
+/// decls (infusion) are indexed under their owner `.rb` file but carry a
+/// different origin, so they do not count.
+fn class_or_module_declared_in(
+    environment: &Environment,
+    name: &TypeName,
+    origin: &DeclOrigin,
+) -> bool {
+    match environment.class_decls().get(name) {
+        Some(ClassOrModule::Class(entry)) => {
+            entry.context_decls().iter().any(|(o, _, _)| o == origin)
+        }
+        Some(ClassOrModule::Module(entry)) => {
+            entry.context_decls().iter().any(|(o, _, _)| o == origin)
+        }
+        None => false,
+    }
+}
+
+/// Port of Steep `Signature::Validator#mixin_constraints` and its two
+/// call sites (`validate_one_class` instance side over
+/// `included_modules`, singleton side over `extended_modules`): every
+/// `include M` / `extend M` of a declared class or module must satisfy
+/// `M`'s self type constraints (`module M : _K`; `Object` when none is
+/// written, see `module_self_types_or_default`). Each failing mixin is
+/// one `RBS::ModuleSelfTypeError`, anchored at the mixin member.
+///
+/// The relation is `sub <: sup` with
+/// - `sub`: the includer's instance type (`::D`), its singleton type for
+///   `extend` (`singleton(::G)`), intersected with the includer's own
+///   immediate self types when it has any (`module Q; include M` gives
+///   `(::Object & ::Q)`; `module P : _K` gives `(::_K & ::P)`). Classes
+///   have no self types, so no intersection — Steep's
+///   `immediate_self_types` is `nil` there.
+/// - `sup`: each of `M`'s self types with `M`'s params substituted by the
+///   mixin's args (`include Gen[Integer]` against `module Gen[T] : _E[T]`
+///   gives `::_E[::Integer]`).
+///
+/// Only the user's own classes and modules are walked (`decls`, see
+/// [`user_decls`]): a library sig is not re-validated on every run. A
+/// library class the user reopens is walked with its library mixins too;
+/// a correct sig stays silent. Most user classes mix nothing in, so `sub`
+/// is only built once a side has a mixin to check.
+///
+/// The check reuses the shared [`SubtypeChecker`] memo, so a relation
+/// derived here is not recomputed when the check phase meets it again,
+/// and a cyclic ancestor graph (`RecursiveAncestorError`'s case) closes
+/// through the checker's in-flight assumptions instead of recursing.
+pub fn validate_module_self_types(env: &DefinitionBuilder, decls: &[UserDecl]) -> Vec<Diagnostic> {
+    let names = env.names();
+    let types = env.types();
+    let ctx = AncestryEnv::from_builder(env);
+    let ancestors = env.ancestor_builder();
+    let checker = SubtypeChecker::new(ConsultationView::new(env, None));
+
+    let mut out = Vec::new();
+    for decl in decls {
+        let PathIndexKey::ClassOrModule(name) = decl.key else {
+            continue;
+        };
+
+        let one = ancestors.one_instance_ancestors_arc(&name);
+        if !one.included_modules.is_empty() {
+            let instance_sub = intersect_with_self_types(
+                types.class_instance(name),
+                &one.self_types,
+                names,
+                types,
+            );
+            check_mixin_constraints(
+                &one.included_modules,
+                instance_sub,
+                &name,
+                &ctx,
+                &checker,
+                types,
+                &mut out,
+            );
+        }
+
+        let one_singleton = ancestors.one_singleton_ancestors_arc(&name);
+        if !one_singleton.extended_modules.is_empty() {
+            let singleton_sub = intersect_with_self_types(
+                types.class_singleton(name),
+                &one_singleton.self_types,
+                names,
+                types,
+            );
+            check_mixin_constraints(
+                &one_singleton.extended_modules,
+                singleton_sub,
+                &name,
+                &ctx,
+                &checker,
+                types,
+                &mut out,
+            );
+        }
+    }
+    out
+}
+
+/// Steep `mixin_constraints`' `self_type`: `Intersection.build(types:
+/// sts.push(self_type))` when `immediate_self_types` is non-empty, the
+/// bare `self_type` otherwise. [`intersection_of`] normalizes (dedups,
+/// drops `Top`) the way `Intersection.build` does.
+fn intersect_with_self_types(
+    self_type: Ty,
+    immediate_self_types: &[MixinRef],
+    names: &NameTable,
+    types: &TypeTable,
+) -> Ty {
+    immediate_self_types
+        .iter()
+        .map(|st| mixin_ref_type(st, names, types))
+        .fold(self_type, |acc, st| intersection_of(st, acc, types))
+}
+
+/// The type a [`MixinRef`] names: an interface type for `_Iface[...]`,
+/// a class instance type otherwise (Steep `ancestor_to_type`).
+fn mixin_ref_type(mixin: &MixinRef, names: &NameTable, types: &TypeTable) -> Ty {
+    if names.is_interface(mixin.name) {
+        types.intern(Type::Interface {
+            name: mixin.name,
+            args: mixin.args.clone(),
+        })
+    } else {
+        types.intern(Type::ClassInstance {
+            name: mixin.name,
+            args: mixin.args.clone(),
+        })
+    }
+}
+
+/// The per-mixin loop of Steep `mixin_constraints` plus the `checker.check`
+/// / `@errors <<` at its call sites. `sub` is the includer side already
+/// intersected with its immediate self types.
+fn check_mixin_constraints(
+    mixins: &[MixinRef],
+    sub: Ty,
+    type_name: &TypeName,
+    ctx: &AncestryEnv,
+    checker: &SubtypeChecker<'_>,
+    types: &TypeTable,
+    out: &mut Vec<Diagnostic>,
+) {
+    let names = ctx.names();
+    let ancestors = ctx.ancestors;
+    // `sup`s already known to hold for this `sub`: `include A; include B`
+    // with both constrained to `::Object` asks the checker once. A failing
+    // `sup` is not recorded — each failing mixin line gets its own
+    // diagnostic.
+    let mut satisfied: Vec<Ty> = Vec::new();
+    for mixin in mixins {
+        let mixin_one = ancestors.one_instance_ancestors_arc(&mixin.name);
+        let mapping: FxHashMap<TypeVarKey, Ty> = mixin_one
+            .params
+            .iter()
+            .zip(mixin.args.iter())
+            .map(|(p, &arg)| (p.name.clone(), arg))
+            .collect();
+        let subst = Substitution::from_mapping(mapping);
+        for self_type in &mixin_one.self_types {
+            let sup = subst.apply(mixin_ref_type(self_type, names, types), types);
+            if satisfied.contains(&sup) {
                 continue;
-            };
+            }
+            if checker.check(sub, sup) {
+                satisfied.push(sup);
+                continue;
+            }
+            // `MixinRef.location` is `None` only for synthesized refs; fall
+            // back to the includer's primary decl rather than drop the
+            // diagnostic.
+            let location = mixin
+                .location
+                .clone()
+                .or_else(|| primary_decl_location(ctx, type_name));
             out.push(Diagnostic {
                 scope: None,
-                kind: DiagnosticKind::UnknownTypeName {
-                    name: names.display_type_name(missing),
+                kind: DiagnosticKind::ModuleSelfType {
+                    type_name: names.display_type_name(*type_name),
+                    ancestor: mixin_ref_type(mixin, names, types).display(types, names),
+                    self_type: sup.display(types, names),
+                    actual: sub.display(types, names),
                 },
                 location: resolve_or_default(location.as_ref()),
             });
         }
     }
-    out
 }
 
 /// rbs `ensure_namespace!`'s walk: the enclosing namespaces of `name` from
@@ -1661,13 +1875,17 @@ fn class_host_arity(ctx: &AncestryEnv, class_n: &TypeName) -> Vec<BakedArityViol
     let one_instance = ctx.ancestors.one_instance_ancestors_arc(class_n);
     let one_singleton = ctx.ancestors.one_singleton_ancestors_arc(class_n);
 
-    if let Some(mixin) = one_instance
+    if let Some(mut mixin) = one_instance
         .super_class
         .as_ref()
         .and_then(Ancestor::to_instance_mixin_ref)
-        && let Some(v) = check_one(ctx, class_n, &mixin, "superclass")
     {
-        out.push(v);
+        // `Ancestor` carries no location; the 1-step data keeps the
+        // `< Super` anchor beside it.
+        mixin.location = one_instance.super_class_location.clone();
+        if let Some(v) = check_one(ctx, class_n, &mixin, "superclass") {
+            out.push(v);
+        }
     }
     for m in one_instance
         .included_modules
@@ -1715,9 +1933,57 @@ fn arity_diagnostic(v: &BakedArityViolation) -> Diagnostic {
             class: v.class.clone(),
             expected: v.expected.clone(),
             got: v.got,
+            help: arity_help(v),
         },
         location: resolve_or_default(v.location.as_ref()),
     }
+}
+
+/// Imperative help for the under-supplied side (`got < min_arity`):
+/// says how many type arguments to add and where, with `untyped` only
+/// as an example (`e.g.`), in the syntax of the file the reference
+/// lives in — the trailing `#[...]` comment for an inline `.rb` (rbs
+/// `docs/inline.md`), plain `[...]` otherwise. With no argument yet the
+/// position is "after this reference" (the diagnostic's range); with
+/// some already written the example completes them (`#[::String,
+/// untyped]`) since appending another `#[...]` would not parse as one
+/// application. Over-supplied references get nothing — there is
+/// nothing to add. Only computed once a violation exists, so the clean
+/// path pays nothing. `None` without a location (in-memory envs,
+/// implicit refs).
+///
+/// `min_arity` is read back from `expected` ("N" or "N..M"), the one
+/// place `check_one` already records it.
+fn arity_help(v: &BakedArityViolation) -> Option<String> {
+    let location = v.location.as_ref()?;
+    let min_arity: usize = v.expected.split("..").next().and_then(|n| n.parse().ok())?;
+    if v.got >= min_arity {
+        return None;
+    }
+    let missing = min_arity - v.got;
+    let inline = location.file.extension().is_some_and(|ext| ext == "rb");
+    let args: Vec<&str> = v
+        .args
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::repeat_n("untyped", missing))
+        .collect();
+    let application = if inline {
+        format!("#[{}]", args.join(", "))
+    } else {
+        format!("[{}]", args.join(", "))
+    };
+    let plural = if missing == 1 { "" } else { "s" };
+    Some(if v.got == 0 {
+        let count = if missing == 1 {
+            "a".to_string()
+        } else {
+            missing.to_string()
+        };
+        format!("add {count} type argument{plural} after this reference, e.g. `{application}`")
+    } else {
+        format!("add {missing} more type argument{plural}, e.g. `{application}`")
+    })
 }
 
 fn check_one(
@@ -1762,6 +2028,11 @@ fn check_one(
         class: ctx.names().display_type_name(*host_n),
         expected,
         got,
+        args: mixin
+            .args
+            .iter()
+            .map(|a| a.display(ctx.ancestors.types(), ctx.names()))
+            .collect(),
         location: mixin.location.clone(),
     })
 }

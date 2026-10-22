@@ -71,12 +71,27 @@ pub struct OneAncestors {
     pub type_name: Option<TypeName>,
     pub params: Vec<TypeParam>,
     pub super_class: Option<Ancestor>,
+    /// Source anchor of the `< Super` reference (the `.rbs` super name
+    /// or the inline `class A < B` parent constant), kept beside
+    /// `super_class` because [`Ancestor`] carries no location. Only the
+    /// instance side sets it; the arity validator reads it to anchor
+    /// `superclass` diagnostics. `None` for implicit `::Object` supers
+    /// and for declarations without a file.
+    pub super_class_location: Option<SourceLocation>,
     pub self_types: Vec<MixinRef>,
     pub included_modules: Vec<MixinRef>,
     pub included_interfaces: Vec<MixinRef>,
     pub prepended_modules: Vec<MixinRef>,
     pub extended_modules: Vec<MixinRef>,
     pub extended_interfaces: Vec<MixinRef>,
+    /// A super / mixin reference written on this side could not be
+    /// resolved and was dropped (super falls back to `::Object`, a mixin
+    /// is skipped — ADR-0010 has no validation error to raise where rbs
+    /// raises `NoSuperclassFoundError`). The method table built from
+    /// this chain is therefore partial: a lookup miss on it is not
+    /// evidence of absence. Not set for a class that writes no `<` at
+    /// all — that is rbs's own `::Object` default, not a lost reference.
+    pub unresolved_ref: bool,
 }
 
 /// How an [`Ancestor::Instance`] entered the chain. Mirrors rbs's
@@ -167,6 +182,11 @@ pub struct InstanceAncestors {
     pub type_name: TypeName,
     pub params: Vec<TypeVarKey>,
     pub ancestors: Vec<Ancestor>,
+    /// Some node along `ancestors` (this one, a super, or a mixin's own
+    /// chain) dropped an unresolved reference
+    /// ([`OneAncestors::unresolved_ref`]), so the chain is missing
+    /// members it cannot name. `has_complete_ancestor_chain` reads this.
+    pub incomplete: bool,
 }
 
 impl InstanceAncestors {
@@ -190,6 +210,10 @@ impl InstanceAncestors {
 pub struct SingletonAncestors {
     pub type_name: TypeName,
     pub ancestors: Vec<Ancestor>,
+    /// Singleton-side counterpart of [`InstanceAncestors::incomplete`]:
+    /// an unresolved super or `extend` somewhere along the chain. An
+    /// unresolved `include` on the instance side does not set it.
+    pub incomplete: bool,
 }
 
 /// Whether the build-phase mixin walk fills the instance buckets
@@ -513,10 +537,10 @@ impl AncestorBuilder {
                     source_file: inc.source_file,
                     location: inc.location.map(|l| l.range),
                 };
-                if let Some((mref, MixinTargetKind::Interface)) =
-                    resolve_mixin_target(&core, &lowering, &self.env, &scope, misses)
-                {
-                    one.included_interfaces.push(mref);
+                match resolve_mixin_target(&core, &lowering, &self.env, &scope, misses) {
+                    Some((mref, MixinTargetKind::Interface)) => one.included_interfaces.push(mref),
+                    Some((_, MixinTargetKind::Class)) => {}
+                    None => one.unresolved_ref = true,
                 }
             }
         }
@@ -550,18 +574,20 @@ impl AncestorBuilder {
             ClassOrModule::Class(class_entry) => {
                 one.params = class_type_params(class_entry, lowering, &class_scope);
                 if !is_basic_object(name, names) {
-                    let sup = class_super_or_default(
+                    let (sup, unresolved) = class_super_or_default(
                         class_entry,
                         lowering,
                         &self.env,
                         names,
                         &class_scope,
                     );
+                    one.unresolved_ref |= unresolved;
                     one.super_class = Some(Ancestor::Instance {
                         name: sup.name,
                         args: sup.args,
                         source: AncestorSource::Super,
                     });
+                    one.super_class_location = sup.location;
                 }
                 walk_class_mixins(
                     class_entry,
@@ -630,13 +656,14 @@ impl AncestorBuilder {
                         source: AncestorSource::Super,
                     });
                 } else {
-                    let sup = class_super_or_default(
+                    let (sup, unresolved) = class_super_or_default(
                         class_entry,
                         lowering,
                         &self.env,
                         names,
                         &class_scope,
                     );
+                    one.unresolved_ref |= unresolved;
                     one.super_class = Some(Ancestor::Singleton { name: sup.name });
                 }
                 walk_class_mixins(
@@ -740,12 +767,14 @@ impl AncestorBuilder {
                         type_name: normalized,
                         params,
                         ancestors: Vec::new(),
+                        incomplete: false,
                     }),
                     reentered,
                 );
             }
         };
         let mut low = NO_REENTRY;
+        let mut incomplete = one.unresolved_ref;
 
         let self_args: Vec<Ty> = params
             .iter()
@@ -772,6 +801,7 @@ impl AncestorBuilder {
         {
             let (super_ia, l) = self.build_instance_ancestors(super_name, stack);
             low = low.min(l);
+            incomplete |= super_ia.incomplete;
             let mut super_subs = super_ia.apply(super_args, &self.types);
             fill_ancestor_source(&mut super_subs, super_name, AncestorSource::Super);
             prepend_in_place(&mut ancestors, super_subs);
@@ -780,6 +810,7 @@ impl AncestorBuilder {
         for mixin in &one.included_modules {
             let (mod_ia, l) = self.build_instance_ancestors(&mixin.name, stack);
             low = low.min(l);
+            incomplete |= mod_ia.incomplete;
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut mod_subs, &mixin.name, AncestorSource::Include);
             prepend_in_place(&mut ancestors, mod_subs);
@@ -788,6 +819,7 @@ impl AncestorBuilder {
         for mixin in &one.included_interfaces {
             let (iface_ia, l) = self.build_interface_ancestors(&mixin.name, stack);
             low = low.min(l);
+            incomplete |= iface_ia.incomplete;
             let mut iface_subs = iface_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut iface_subs, &mixin.name, AncestorSource::Include);
             prepend_in_place(&mut ancestors, iface_subs);
@@ -798,6 +830,7 @@ impl AncestorBuilder {
         for mixin in &one.prepended_modules {
             let (mod_ia, l) = self.build_instance_ancestors(&mixin.name, stack);
             low = low.min(l);
+            incomplete |= mod_ia.incomplete;
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut mod_subs, &mixin.name, AncestorSource::Prepend);
             prepend_in_place(&mut ancestors, mod_subs);
@@ -808,6 +841,7 @@ impl AncestorBuilder {
             type_name: normalized,
             params,
             ancestors,
+            incomplete,
         });
         if low <= depth {
             return (result, low);
@@ -848,6 +882,7 @@ impl AncestorBuilder {
                     Arc::new(SingletonAncestors {
                         type_name: normalized,
                         ancestors: Vec::new(),
+                        incomplete: false,
                     }),
                     reentered,
                 );
@@ -856,6 +891,7 @@ impl AncestorBuilder {
         let mut low = NO_REENTRY;
 
         let one = self.one_singleton_cached(&normalized);
+        let mut incomplete = one.unresolved_ref;
         let mut ancestors: Vec<Ancestor> = Vec::new();
 
         match &one.super_class {
@@ -866,6 +902,7 @@ impl AncestorBuilder {
             }) => {
                 // BasicObject / Module singleton flips to instance chain.
                 let super_ia = self.instance_ancestors(super_name);
+                incomplete |= super_ia.incomplete;
                 let mut super_subs = super_ia.apply(super_args, &self.types);
                 fill_ancestor_source(&mut super_subs, super_name, AncestorSource::Super);
                 prepend_in_place(&mut ancestors, super_subs);
@@ -873,6 +910,7 @@ impl AncestorBuilder {
             Some(Ancestor::Singleton { name: super_name }) => {
                 let (super_sa, l) = self.build_singleton_ancestors(super_name, stack);
                 low = low.min(l);
+                incomplete |= super_sa.incomplete;
                 prepend_in_place(&mut ancestors, super_sa.ancestors.clone());
             }
             None => {}
@@ -880,6 +918,7 @@ impl AncestorBuilder {
 
         for mixin in &one.extended_modules {
             let mod_ia = self.instance_ancestors(&mixin.name);
+            incomplete |= mod_ia.incomplete;
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             // Match rbs L607-614: `singleton_ancestors`' extended_modules
             // loop fills the chain root with `mod.source`, i.e. the
@@ -891,6 +930,7 @@ impl AncestorBuilder {
         }
         for mixin in &one.extended_interfaces {
             let iface_ia = self.interface_ancestors(&mixin.name);
+            incomplete |= iface_ia.incomplete;
             let mut iface_subs = iface_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut iface_subs, &mixin.name, AncestorSource::Extend);
             prepend_in_place(&mut ancestors, iface_subs);
@@ -900,6 +940,7 @@ impl AncestorBuilder {
 
         for mixin in &one.prepended_modules {
             let mod_ia = self.instance_ancestors(&mixin.name);
+            incomplete |= mod_ia.incomplete;
             let mut mod_subs = mod_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut mod_subs, &mixin.name, AncestorSource::Prepend);
             prepend_in_place(&mut ancestors, mod_subs);
@@ -909,6 +950,7 @@ impl AncestorBuilder {
         let result = Arc::new(SingletonAncestors {
             type_name: normalized,
             ancestors,
+            incomplete,
         });
         if low <= depth {
             return (result, low);
@@ -947,12 +989,14 @@ impl AncestorBuilder {
                         type_name: *name,
                         params,
                         ancestors: Vec::new(),
+                        incomplete: false,
                     }),
                     reentered,
                 );
             }
         };
         let mut low = NO_REENTRY;
+        let mut incomplete = one.unresolved_ref;
 
         let self_args: Vec<Ty> = params
             .iter()
@@ -974,6 +1018,7 @@ impl AncestorBuilder {
         for mixin in &one.included_interfaces {
             let (iface_ia, l) = self.build_interface_ancestors(&mixin.name, stack);
             low = low.min(l);
+            incomplete |= iface_ia.incomplete;
             let mut iface_subs = iface_ia.apply(&mixin.args, &self.types);
             fill_ancestor_source(&mut iface_subs, &mixin.name, AncestorSource::Include);
             prepend_in_place(&mut ancestors, iface_subs);
@@ -986,6 +1031,7 @@ impl AncestorBuilder {
             type_name: *name,
             params,
             ancestors,
+            incomplete,
         });
         if low <= depth {
             return (result, low);
@@ -1227,13 +1273,16 @@ struct SuperView<'a> {
     location: Option<LocationRange>,
 }
 
+/// Returns the super to link plus whether a written super was dropped as
+/// unresolved (`true` only for that case, never for an implicit
+/// `::Object`).
 fn class_super_or_default(
     entry: &ClassEntry,
     lowering: &LoweringEnv<'_>,
     env: &Environment,
     names: &NameTable,
     class_scope: &TypeParamScope,
-) -> MixinRef {
+) -> (MixinRef, bool) {
     let view = match entry.primary_decl() {
         ClassDeclaration::Signature(c) => c.super_class.as_ref().map(|s| SuperView {
             name: s.name,
@@ -1248,24 +1297,40 @@ fn class_super_or_default(
                 .as_ref()
                 .map(|a| a.type_args.as_slice())
                 .unwrap_or(&[]),
-            source_file: None,
-            location: None,
+            // The Ruby decl does not carry its file; the origin paired
+            // with this same `Arc` in `context_decls` does.
+            source_file: entry
+                .context_decls()
+                .iter()
+                .find(|(_, _, d)| matches!(d, ClassDeclaration::Ruby(r) if Arc::ptr_eq(r, c)))
+                .and_then(|(origin, _, _)| origin.file()),
+            location: s
+                .byte_range
+                .map(|(start, end)| LocationRange::new(start, start, end, end)),
         }),
     };
-    if let Some(v) = view
-        && names.type_name_is_absolute(v.name)
-    {
-        return mixin_ref(
-            v.name,
-            v.args,
-            v.source_file,
-            v.location,
-            lowering,
-            env,
-            class_scope,
+    let Some(v) = view else {
+        return (MixinRef::bare(names.builtins().object), false);
+    };
+    if names.type_name_is_absolute(v.name) {
+        return (
+            mixin_ref(
+                v.name,
+                v.args,
+                v.source_file,
+                v.location,
+                lowering,
+                env,
+                class_scope,
+            ),
+            false,
         );
     }
-    MixinRef::bare(names.builtins().object)
+    // A written super that stayed relative is unresolved (see
+    // `absolute_type_name_typename`). Default it to `::Object` so lookup
+    // keeps the Object / Kernel members, but report the loss: the real
+    // super's members are missing from every chain built on this one.
+    (MixinRef::bare(names.builtins().object), true)
 }
 
 fn module_self_types_or_default(
@@ -1496,7 +1561,7 @@ fn walk_class_mixins(
     misses: &mut FxHashSet<TypeName>,
 ) {
     let primary_params = primary_signature_class_type_params(entry);
-    for (_, _, decl) in entry.context_decls() {
+    for (origin, _, decl) in entry.context_decls() {
         match decl {
             ClassDeclaration::Signature(c) => {
                 let decl_scope = decl_param_scope(&c.type_params, primary_params, name, names);
@@ -1517,6 +1582,7 @@ fn walk_class_mixins(
                 for member in &c.members {
                     dispatch_ruby_mixin_member(
                         member,
+                        origin.file(),
                         lowering,
                         env,
                         side,
@@ -1544,7 +1610,7 @@ fn walk_module_mixins(
     misses: &mut FxHashSet<TypeName>,
 ) {
     let primary_params = primary_signature_module_type_params(entry);
-    for (_, _, decl) in entry.context_decls() {
+    for (origin, _, decl) in entry.context_decls() {
         match decl {
             ModuleDeclaration::Signature(m) => {
                 let decl_scope = decl_param_scope(&m.type_params, primary_params, name, names);
@@ -1565,6 +1631,7 @@ fn walk_module_mixins(
                 for member in &m.members {
                     dispatch_ruby_mixin_member(
                         member,
+                        origin.file(),
                         lowering,
                         env,
                         side,
@@ -1663,6 +1730,7 @@ fn dispatch_mixin_member<M: AsMember>(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_ruby_mixin_member(
     member: &RubyMember,
+    source_file: Option<crate::name::Name>,
     lowering: &LoweringEnv<'_>,
     env: &Environment,
     side: Side,
@@ -1671,29 +1739,30 @@ fn dispatch_ruby_mixin_member(
     names: &NameTable,
     misses: &mut FxHashSet<TypeName>,
 ) {
+    // A relative (unresolved) Ruby mixin name is a lost reference on the
+    // side that member feeds, exactly like a `resolve_mixin_target` miss.
     match member {
-        RubyMember::Include(inc) => {
-            if let Some(mixin) = mixin_from_ruby(&inc.mixin, names) {
-                bucket_include(&mixin, lowering, env, side, class_scope, one, misses);
-            }
-        }
-        RubyMember::Extend(ext) => {
-            if let Some(mixin) = mixin_from_ruby(&ext.mixin, names) {
-                bucket_extend(&mixin, lowering, env, side, class_scope, one, misses);
-            }
-        }
-        RubyMember::Prepend(pre) => {
-            if let Some(mixin) = mixin_from_ruby(&pre.mixin, names) {
-                bucket_prepend(&mixin, lowering, env, side, class_scope, one, misses);
-            }
-        }
+        RubyMember::Include(inc) => match mixin_from_ruby(&inc.mixin, source_file, names) {
+            Some(mixin) => bucket_include(&mixin, lowering, env, side, class_scope, one, misses),
+            None => one.unresolved_ref |= side == Side::Instance,
+        },
+        RubyMember::Extend(ext) => match mixin_from_ruby(&ext.mixin, source_file, names) {
+            Some(mixin) => bucket_extend(&mixin, lowering, env, side, class_scope, one, misses),
+            None => one.unresolved_ref |= side == Side::Singleton,
+        },
+        RubyMember::Prepend(pre) => match mixin_from_ruby(&pre.mixin, source_file, names) {
+            Some(mixin) => bucket_prepend(&mixin, lowering, env, side, class_scope, one, misses),
+            None => one.unresolved_ref |= side == Side::Instance,
+        },
         RubyMember::SingletonPrepend(pre) => {
-            if side == Side::Singleton
-                && let Some(mixin) = mixin_from_ruby(&pre.mixin, names)
-                && let Some((mref, _target_kind)) =
-                    resolve_mixin_target(&mixin, lowering, env, class_scope, misses)
-            {
-                one.prepended_modules.push(mref);
+            if side != Side::Singleton {
+                return;
+            }
+            let resolved = mixin_from_ruby(&pre.mixin, source_file, names)
+                .and_then(|mixin| resolve_mixin_target(&mixin, lowering, env, class_scope, misses));
+            match resolved {
+                Some((mref, _target_kind)) => one.prepended_modules.push(mref),
+                None => one.unresolved_ref = true,
             }
         }
         _ => {}
@@ -1707,7 +1776,18 @@ fn dispatch_ruby_mixin_member(
 /// skip them, matching rbs's behaviour for unresolved mixin targets
 /// (ADR-0010). The `starts_with("::")` guard is required before calling
 /// `parse_class_name` because that function panics on relative names.
-fn mixin_from_ruby(member: &RubyMixinMember, names: &NameTable) -> Option<MixinCore> {
+///
+/// `source_file` is the declaring `.rb` (the decl's `DeclOrigin::Path`,
+/// `None` for in-memory decls); with it the mixin's `location` is the
+/// Ruby `include M` call's byte range, as a byte-only
+/// [`LocationRange`] like `primary_decl_location`'s inline branch, so a
+/// diagnostic on the mixin (`RBS::ModuleSelfTypeError`) anchors at the
+/// member in both `.rbs` and `.rb`.
+fn mixin_from_ruby(
+    member: &RubyMixinMember,
+    source_file: Option<crate::name::Name>,
+    names: &NameTable,
+) -> Option<MixinCore> {
     if !member.module_name.starts_with("::") {
         return None;
     }
@@ -1717,11 +1797,14 @@ fn mixin_from_ruby(member: &RubyMixinMember, names: &NameTable) -> Option<MixinC
         .as_ref()
         .map(|a| a.type_args.clone())
         .unwrap_or_default();
+    let (start_byte, end_byte) = member.location;
     Some(MixinCore {
         name,
         args,
-        source_file: None,
-        location: None,
+        source_file,
+        location: Some(LocationRange::new(
+            start_byte, start_byte, end_byte, end_byte,
+        )),
     })
 }
 
@@ -1806,6 +1889,7 @@ fn bucket_include(
     }
     let Some((mref, target_kind)) = resolve_mixin_target(mixin, lowering, env, class_scope, misses)
     else {
+        one.unresolved_ref = true;
         return;
     };
     match target_kind {
@@ -1831,6 +1915,7 @@ fn bucket_extend(
     }
     let Some((mref, target_kind)) = resolve_mixin_target(mixin, lowering, env, class_scope, misses)
     else {
+        one.unresolved_ref = true;
         return;
     };
     match target_kind {
@@ -1858,6 +1943,7 @@ fn bucket_prepend(
     let Some((mref, _target_kind)) =
         resolve_mixin_target(mixin, lowering, env, class_scope, misses)
     else {
+        one.unresolved_ref = true;
         return;
     };
     one.prepended_modules.push(mref);

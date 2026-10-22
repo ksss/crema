@@ -20,6 +20,15 @@
 //!   are overwritten by `rhs` (rhs is the stricter narrow on top).
 //! - `join_branch` — `a && b` falsy / `a || b` truthy. Only keys
 //!   present in both envs survive; their types are unioned.
+//!
+//! An env also records whether its side is unreachable: some scrutinee
+//! narrowed to `bot` (Steep's `LogicTypeInterpreter` result
+//! `unreachable` flag). The flag survives `merge_sequential` from either
+//! side and `join_branch` only from both, so a later narrow of the same
+//! key cannot revive a dead side; `&&` / `||` then reset it from their
+//! left operand ([`CondEnv::with_unreachable`]). Dead arms read such a
+//! scrutinee as `untyped` ([`CondEnv::planted`]) and drop out of the
+//! join.
 
 use rustc_hash::FxHashMap;
 
@@ -42,19 +51,24 @@ pub enum Scrutinee {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CondEnv {
     entries: FxHashMap<Scrutinee, Ty>,
+    unreachable: bool,
 }
 
 impl CondEnv {
     pub(crate) fn empty() -> Self {
         CondEnv {
             entries: FxHashMap::default(),
+            unreachable: false,
         }
     }
 
     pub(crate) fn single(scrutinee: Scrutinee, ty: Ty) -> Self {
         let mut entries = FxHashMap::default();
         entries.insert(scrutinee, ty);
-        CondEnv { entries }
+        CondEnv {
+            entries,
+            unreachable: ty == Ty::BOTTOM,
+        }
     }
 
     #[cfg(test)]
@@ -64,6 +78,33 @@ impl CondEnv {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether this side can never run: a scrutinee narrowed to `bot`.
+    pub(crate) fn is_unreachable(&self) -> bool {
+        self.unreachable
+    }
+
+    /// Override the reachability of a composed env. `&&` / `||` take it
+    /// from the left operand alone (Steep's `:and` / `:or`).
+    pub(crate) fn with_unreachable(mut self, unreachable: bool) -> Self {
+        self.unreachable = unreachable;
+        self
+    }
+
+    /// The type an arm plants for an entry, `None` to leave the binding
+    /// alone. A scrutinee narrowed to `bot` reads as `untyped` inside a
+    /// dead arm (Steep types the value `untyped` there), so the arm's
+    /// diagnostics are not about an artifact of the narrow. In a live
+    /// arm such an entry only comes from the right operand of `&&` /
+    /// `||`, and the arm keeps the scrutinee's type as Steep does for a
+    /// narrow that finds no type.
+    pub(crate) fn planted(&self, ty: Ty) -> Option<Ty> {
+        match ty {
+            Ty::BOTTOM if self.unreachable => Some(Ty::UNTYPED),
+            Ty::BOTTOM => None,
+            _ => Some(ty),
+        }
     }
 
     #[cfg(test)]
@@ -108,10 +149,17 @@ impl CondEnv {
     /// Sequentially compose two envs assuming `rhs` was evaluated with
     /// `self` already in scope. Same-key entries are overwritten by
     /// `rhs`.
+    /// A `bot` entry in `rhs` keeps `self`'s entry for the key: the
+    /// later narrow found no type, which ends that narrow (`unreachable`)
+    /// without undoing the earlier one, as Steep keeps the env.
     pub(crate) fn merge_sequential(mut self, rhs: Self) -> Self {
         for (key, ty) in rhs.entries {
+            if ty == Ty::BOTTOM && self.entries.contains_key(&key) {
+                continue;
+            }
             self.entries.insert(key, ty);
         }
+        self.unreachable |= rhs.unreachable;
         self
     }
 
@@ -126,7 +174,10 @@ impl CondEnv {
                 entries.insert(*key, union_of(*lhs_ty, rhs_ty, env.types()));
             }
         }
-        CondEnv { entries }
+        CondEnv {
+            entries,
+            unreachable: self.unreachable && rhs.unreachable,
+        }
     }
 }
 
@@ -248,6 +299,25 @@ end
             joined.lookup_lvar(x),
             Some(union_of(int, str_ty, env.types()))
         );
+    }
+
+    #[test]
+    fn test_unreachable_survives_merge_from_either_side_and_join_from_both() {
+        let (env, _names, x, y) = fixture();
+        let int = integer_ty(&env);
+        let dead = || CondEnv::single_lvar(x, Ty::BOTTOM);
+        let live = || CondEnv::single_lvar(y, int);
+        assert!(dead().is_unreachable());
+        assert!(!live().is_unreachable());
+        assert!(dead().merge_sequential(live()).is_unreachable());
+        assert!(live().merge_sequential(dead()).is_unreachable());
+        // A later narrow of the same key does not revive a dead side.
+        let revived = dead().merge_sequential(CondEnv::single_lvar(x, int));
+        assert!(revived.is_unreachable());
+        let view = ConsultationView::new(&env, None);
+        assert!(!dead().join_branch(live(), view).is_unreachable());
+        let view = ConsultationView::new(&env, None);
+        assert!(dead().join_branch(dead(), view).is_unreachable());
     }
 
     #[test]

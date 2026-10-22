@@ -197,6 +197,16 @@ pub(super) enum NoMethodReceiverGate {
     Unhandled,
 }
 
+/// What [`TypeChecker::check_block`] leaves for
+/// [`TypeChecker::check_block_body_value`] to compare once the body has
+/// been walked: the block's declared return type and the hint the walk
+/// gives the body's last statement (`None` when the return type still
+/// holds a type variable).
+pub(super) struct BlockBodyCheck {
+    pub(super) expected: Ty,
+    pub(super) body_hint: Option<Ty>,
+}
+
 /// Single-shot resolution of a call site — the target lookup result plus
 /// the receiver's type, computed once per call.
 ///
@@ -725,25 +735,30 @@ impl<'env> TypeChecker<'env> {
             0
         };
         let block_scope_pushed = self.setup_block_scope(site, target, hint);
-        let body_hint = self.check_block(site, target, hint);
+        let pending = self.check_block(site, target, hint);
         errored |= track_error && self.diagnostics_len() > before_block;
-        if track_error && errored {
-            self.extract_flag_call_state(
-                (node.location().start(), node.location().end()),
-                super::ExtractCallState::Error,
-            );
-        }
 
+        let mut body_value = None;
         if let Some(block) = node.block() {
             let saved_concerning = self.enter_concerning_block(node);
             let saved_block_module = self.enter_extract_block_module(node, saved_concerning);
             if !self.walk_concern_block_body(node, &block)
                 && !self.walk_class_methods_block_body(node, &block)
             {
-                self.walk_block(&block, body_hint);
+                body_value = self.walk_block(&block, pending.as_ref().and_then(|p| p.body_hint));
             }
             self.extract_block_module = saved_block_module;
             self.concerning_module = saved_concerning;
+        }
+        // The body's own diagnostics (NoMethod inside the block) never
+        // flag the call; the body-value mismatch does, as it did when it
+        // was reported before the walk.
+        errored |= self.check_block_body_value(site, pending, body_value);
+        if track_error && errored {
+            self.extract_flag_call_state(
+                (node.location().start(), node.location().end()),
+                super::ExtractCallState::Error,
+            );
         }
         if block_scope_pushed {
             self.ctx.pop_scope();
@@ -758,13 +773,20 @@ impl<'env> TypeChecker<'env> {
     /// list type (`check_statements_with_hint`), and a `do ... rescue ...
     /// end` body (BeginNode) walks its rescue / else / ensure arms the
     /// typed way too. The `body_hint` from [`Self::check_block`] reaches
-    /// only the body's last statement, as `check_block` typed it
-    /// read-only, so a hint-driven report comes from the walk once. A
-    /// block argument (`&blk`) has no body and takes the default walk.
-    pub(super) fn walk_block<'pr>(&mut self, block: &Node<'pr>, body_hint: Option<Ty>) {
+    /// only the body's last statement. A block argument (`&blk`) has no
+    /// body and takes the default walk.
+    ///
+    /// Returns the body's value as the walk computed it (`None` without a
+    /// body), which [`Self::check_block_body_value`] compares against the
+    /// block's declared return type after this walk.
+    pub(super) fn walk_block<'pr>(
+        &mut self,
+        block: &Node<'pr>,
+        body_hint: Option<Ty>,
+    ) -> Option<Ty> {
         let Some(b) = block.as_block_node() else {
             self.visit(block);
-            return;
+            return None;
         };
         // A `next` in the body exits this block, so its value is typed
         // under the same expected return type as the tail.
@@ -772,10 +794,8 @@ impl<'env> TypeChecker<'env> {
             if let Some(params) = b.parameters() {
                 checker.visit(&params);
             }
-            if let Some(body) = b.body() {
-                checker.check_node(&body, body_hint);
-            }
-        });
+            b.body().map(|body| checker.check_node(&body, body_hint))
+        })
     }
 
     /// Walk a call's arguments once, left to right, before the call's
@@ -874,17 +894,14 @@ impl<'env> TypeChecker<'env> {
                             let hint = hint_overload.and_then(|o| o.keyword_param_for_call(&name));
                             if let Some(call) = value.as_call_node() {
                                 self.walk_argument_call(&call, hint, carry);
+                            } else if lambda_hinted && value.as_lambda_node().is_some() {
+                                let lambda_hint =
+                                    bind(overload.and_then(|o| o.keyword_param_for_call(&name)));
+                                self.walk_argument_lambda(&value, lambda_hint, hint);
                             } else {
-                                if lambda_hinted && value.as_lambda_node().is_some() {
-                                    let lambda_hint = bind(
-                                        overload.and_then(|o| o.keyword_param_for_call(&name)),
-                                    );
-                                    self.check_node(&value, lambda_hint);
-                                } else {
-                                    // Typed under the keyword's hint, as the
-                                    // collector will (see positional below).
-                                    self.check_node(&value, hint);
-                                }
+                                // Typed under the keyword's hint, as the
+                                // collector will (see positional below).
+                                self.check_node(&value, hint);
                                 self.park_argument_value(&value, hint);
                             }
                         } else {
@@ -918,25 +935,23 @@ impl<'env> TypeChecker<'env> {
                 });
                 if let Some(call) = arg.as_call_node() {
                     self.walk_argument_call(&call, hint, carry);
-                } else {
-                    if arg.as_lambda_node().is_some() {
-                        let lambda_hint =
-                            if simple_shape {
-                                bind(overload.and_then(|o| {
-                                    o.positional_param_for_call(index, positional_count)
-                                }))
-                            } else {
-                                None
-                            };
-                        self.check_node(arg, lambda_hint);
+                } else if arg.as_lambda_node().is_some() {
+                    let lambda_hint = if simple_shape {
+                        bind(
+                            overload
+                                .and_then(|o| o.positional_param_for_call(index, positional_count)),
+                        )
                     } else {
-                        // Typed under the parameter's hint, threaded through
-                        // wrappers (`(x)`, `c ? x : y`, `begin; x; end`), so
-                        // the walk types a wrapped call exactly as the
-                        // collector does: a hint-driven report then comes
-                        // from the walk, not from a read-only re-inference.
-                        self.check_node(arg, hint);
-                    }
+                        None
+                    };
+                    self.walk_argument_lambda(arg, lambda_hint, hint);
+                } else {
+                    // Typed under the parameter's hint, threaded through
+                    // wrappers (`(x)`, `c ? x : y`, `begin; x; end`), so
+                    // the walk types a wrapped call exactly as the
+                    // collector does: a hint-driven report then comes
+                    // from the walk, not from a read-only re-inference.
+                    self.check_node(arg, hint);
                     self.park_argument_value(arg, hint);
                 }
                 positional_index += 1;
@@ -955,6 +970,28 @@ impl<'env> TypeChecker<'env> {
                 .ctx
                 .lookup_local_variable(self.checker_names().intern(super::ANON_KWREST_LVAR))
                 .unwrap_or(Ty::UNTYPED),
+        }
+    }
+
+    /// Walk a lambda-literal argument under `lambda_hint` and park its
+    /// value for the collector. The walk's lambda type is built from the
+    /// body's walked value (`check_lambda_node`), so a body-local read at
+    /// the tail types the lambda's return; it is parked as-is when the
+    /// walk's hint is the one the collector will ask under
+    /// (`collector_hint`). When the two differ (the lambda hint is only
+    /// resolved for a single non-generic overload), the collector's view
+    /// is the read-only type under its own hint, as before.
+    fn walk_argument_lambda<'pr>(
+        &mut self,
+        node: &Node<'pr>,
+        lambda_hint: Option<Ty>,
+        collector_hint: Option<Ty>,
+    ) {
+        let value = self.check_node(node, lambda_hint);
+        if lambda_hint == collector_hint {
+            self.park_value(node, collector_hint, value);
+        } else {
+            self.park_argument_value(node, collector_hint);
         }
     }
 
@@ -1031,6 +1068,16 @@ impl<'env> TypeChecker<'env> {
         if let Some(TrailingAnnotation::TypeApplication { range, body }) =
             self.comments.trailing_annotation(&self.source, end_line)
         {
+            // A receiverless `include` / `extend` / `prepend` is an inline
+            // declaration: the inline parser (`collect_mixin_call`) consumed
+            // its `#[T]` at load phase as type arguments *for the mixin*
+            // (`include Gen #[Integer]` → `Gen[Integer]`). Reading the same
+            // annotation again as type arguments for `Module#include` would
+            // report `UnexpectedTypeArgument` against a method that has no
+            // type params. Same gate as the `#: T` statement assertion.
+            if super::inference::is_inline_declaration_call(node) {
+                return None;
+            }
             let gap = self
                 .source
                 .get(node.location().end() as usize..range.0 as usize);
@@ -2283,6 +2330,20 @@ impl<'env> TypeChecker<'env> {
     ///    body (`x + "wrong"` inside `super { |x| x + "wrong" }` reaches
     ///    `Integer#+` overload resolution this way).
     ///
+    /// Whether `self_ty`'s method table is fully known, so a
+    /// `lookup_super_method` miss means the super target really is
+    /// absent rather than hidden behind an unresolved ancestor. Same
+    /// gate as `classify_no_method_receiver`, keyed on self's side.
+    pub(super) fn self_ancestor_chain_complete(&self, self_ty: Ty) -> bool {
+        match self.env.types().resolve(self_ty) {
+            Type::ClassInstance { name, .. } => self.env.has_complete_ancestor_chain(name),
+            Type::ClassSingleton { name, .. } => {
+                self.env.has_complete_singleton_ancestor_chain(name)
+            }
+            _ => true,
+        }
+    }
+
     /// An unresolvable super (`lookup_super_method` is `None`) emits
     /// `Ruby::UnexpectedSuper` and bails before argument checks (Steep
     /// matches super(args) only when the target resolves; argument
@@ -2309,7 +2370,10 @@ impl<'env> TypeChecker<'env> {
         let Some((method, bindings)) = self.env.lookup_super_method(self_ty, sym) else {
             // Mirror `emit_unexpected_super_if_unresolvable`: module methods
             // defer super resolution to the include site, so stay silent.
-            if has_rbs_decl && !self.is_inside_module_definition() {
+            if has_rbs_decl
+                && !self.is_inside_module_definition()
+                && self.self_ancestor_chain_complete(self_ty)
+            {
                 let position = self.offset_to_location(node.location().start() as usize);
                 self.push_diagnostic(Diagnostic {
                     scope: None,
@@ -2382,13 +2446,14 @@ impl<'env> TypeChecker<'env> {
             0
         };
         let block_scope_pushed = self.setup_block_scope(site, target_ref, None);
-        self.check_block(site, target_ref, None);
+        let pending = self.check_block(site, target_ref, None);
         errored |= track_error && self.diagnostics_len() > before_block;
+        let body_value = node
+            .block()
+            .and_then(|block| self.walk_block(&block, pending.as_ref().and_then(|p| p.body_hint)));
+        errored |= self.check_block_body_value(site, pending, body_value);
         if track_error && errored {
             self.extract_flag_call_state(super_span, super::ExtractCallState::Error);
-        }
-        if let Some(block) = node.block() {
-            self.walk_block(&block, None);
         }
         if block_scope_pushed {
             self.ctx.pop_scope();
@@ -2433,12 +2498,15 @@ impl<'env> TypeChecker<'env> {
             0
         };
         self.setup_block_scope(site, target_ref, None);
-        self.check_block(site, target_ref, None);
-        if track_error && self.diagnostics_len() > before {
+        let pending = self.check_block(site, target_ref, None);
+        let mut errored = track_error && self.diagnostics_len() > before;
+        let body_value =
+            self.walk_block(&block.as_node(), pending.as_ref().and_then(|p| p.body_hint));
+        errored |= self.check_block_body_value(site, pending, body_value);
+        if track_error && errored {
             let span = (node.location().start(), node.location().end());
             self.extract_flag_call_state(span, super::ExtractCallState::Error);
         }
-        self.walk_block(&block.as_node(), None);
         self.ctx.pop_scope();
     }
 
@@ -3190,15 +3258,10 @@ impl<'env> TypeChecker<'env> {
             .unwrap_or_else(|| self.infer_receiver_type(node, OwnKey::Unbuilt));
         // A bot receiver is a NoMethod on `bot`, as in Steep (`type_send` has
         // no bot arm: `calculate_interface(bot)` is nil whether or not the
-        // send is reachable). The exception is a local narrowed to bot in an
-        // unreachable branch: Steep types that branch's local as `untyped`
-        // (case-else) or as the narrowed-to class, never bot, so crema's bot
-        // there is its own artifact and stays silent. Only a local bound
-        // from a bot value (`y = boom`, `a, b = boom`) reports.
-        if raw_receiver == Ty::BOTTOM
-            && let Some(receiver) = node.receiver()
-            && self.is_bot_receiver_reportable(receiver)
-        {
+        // send is reachable). A narrow never yields bot here: a dead arm
+        // reads its emptied scrutinee as `untyped` (`CondEnv::planted`), so
+        // every bot receiver comes from a value (`boom`, `y = boom`).
+        if raw_receiver == Ty::BOTTOM && node.receiver().is_some() {
             self.push_diagnostic(Diagnostic {
                 scope: None,
                 location: name_location,
@@ -3211,20 +3274,6 @@ impl<'env> TypeChecker<'env> {
             return;
         }
         self.check_no_method_at(raw_receiver, &method_name, name_location);
-    }
-
-    /// Whether a receiver typed as bot is reported (see `check_no_method`):
-    /// any expression except a local read whose bot came from narrowing.
-    /// Parentheses are looked through, so `(x).foo` follows `x.foo`.
-    fn is_bot_receiver_reportable(&self, receiver: Node<'_>) -> bool {
-        match super::visitor::unwrap_top_level_parens(receiver).as_local_variable_read_node() {
-            Some(lvar) => {
-                let name_str = String::from_utf8_lossy(lvar.name().as_slice());
-                let name = self.checker_names().intern(&name_str);
-                self.ctx.is_bot_rhs_local_variable(name)
-            }
-            None => true,
-        }
     }
 
     /// CallNode-free core of `check_no_method`. Reused by the synthetic-call
@@ -4010,8 +4059,15 @@ impl<'env> TypeChecker<'env> {
             _ => return NoMethodReceiverGate::Unhandled,
         };
         match self.env.types().resolve(widened) {
-            Type::ClassInstance { name, .. } | Type::ClassSingleton { name, .. } => {
+            Type::ClassInstance { name, .. } => {
                 if self.env.has_complete_ancestor_chain(name) {
+                    NoMethodReceiverGate::Pass
+                } else {
+                    NoMethodReceiverGate::Unnameable
+                }
+            }
+            Type::ClassSingleton { name, .. } => {
+                if self.env.has_complete_singleton_ancestor_chain(name) {
                     NoMethodReceiverGate::Pass
                 } else {
                     NoMethodReceiverGate::Unnameable
@@ -5153,17 +5209,22 @@ impl<'env> TypeChecker<'env> {
         true
     }
 
-    /// Check block parameter types and return type against the RBS block type.
+    /// Pre-walk half of the block check: resolve the block's declared
+    /// type, report an empty body that cannot be `nil`, and hand back the
+    /// comparison [`Self::check_block_body_value`] runs once the body has
+    /// been walked. The walk's value is the body's type (it tracked the
+    /// body's own locals, narrowing and rescue joins); typing the body
+    /// read-only here, before the walk, would read a body-local as
+    /// `untyped` and skip the check (`Foo.run { a = "x"; a }`).
     ///
-    /// Returns the hint the body's last statement is typed under (the
-    /// block's declared return type, when concrete), so the walk of the
-    /// body types that statement as this check's read-only inference did.
+    /// `None` when there is nothing to compare after the walk (no block,
+    /// no target, `&:sym` pass, untyped / `void` return, empty body).
     pub(super) fn check_block<'pr>(
         &mut self,
         node: CallSite<'_, 'pr>,
         target: Option<&CallTarget>,
         call_hint: Option<Ty>,
-    ) -> Option<Ty> {
+    ) -> Option<BlockBodyCheck> {
         let block_node = node.block()?;
         let target = target?;
         if let Some((name, sym_span)) = block_pass_symbol(&block_node) {
@@ -5210,16 +5271,15 @@ impl<'env> TypeChecker<'env> {
         } else {
             Some(block_return_type)
         };
-        let actual = self.infer_type(&body, body_hint);
-        // Extract-mode hand-off: `actual` is the body's tail-expression
-        // type (`infer_statements_with_hint` infers exactly the last
-        // statement), so when the tail is itself a call, carry the value
-        // to its record point (reached by `check_call`'s block visit
-        // AFTER this). The read-only infer applies no statement
-        // assertions, so the carried value is the call's own computed
-        // type. Deposited before the untyped early-return below — an
-        // untyped body type is still a value this check computed.
+        // Extract-mode hand-off: the body's tail-expression type, typed
+        // read-only (`infer_statements_with_hint` infers exactly the last
+        // statement), is carried to the tail call's record point (reached
+        // by `check_call`'s block visit AFTER this) when the tail is itself
+        // a call. The read-only infer applies no statement assertions, so
+        // the carried value is the call's own computed type. Untyped is
+        // deposited too — it is still a value this check computed.
         if self.extract.is_some() {
+            let actual = self.infer_type(&body, body_hint);
             let tail = body
                 .as_statements_node()
                 .and_then(|stmts| stmts.body().iter().last());
@@ -5228,25 +5288,68 @@ impl<'env> TypeChecker<'env> {
                 self.extract_carry_type((tail.location().start(), tail.location().end()), actual);
             }
         }
+        Some(BlockBodyCheck {
+            expected: block_return_type,
+            body_hint,
+        })
+    }
+
+    /// Post-walk half of the block check: compare the body's value with
+    /// the block's declared return type and report `BlockBodyTypeMismatch`
+    /// once per block. Returns whether it reported.
+    ///
+    /// `body_value` is what [`Self::walk_block`] computed. The same two
+    /// shapes `check_def_node_in_current_context` falls back on go to the
+    /// read-only `infer_type` of the body instead: `untyped` (a few
+    /// declaration-kind tails still shortcut the walk's value) and
+    /// `bot` (sticky-bot after a `return` / `raise`, where the textually
+    /// last statement is still held to the declared type). `None`
+    /// (no walk reached the body, e.g. a `concerning` body) takes the
+    /// read-only type too. Runs inside the block scope, so the fallback
+    /// still sees the block's params.
+    pub(super) fn check_block_body_value<'pr>(
+        &mut self,
+        node: CallSite<'_, 'pr>,
+        pending: Option<BlockBodyCheck>,
+        body_value: Option<Ty>,
+    ) -> bool {
+        let Some(BlockBodyCheck {
+            expected,
+            body_hint,
+        }) = pending
+        else {
+            return false;
+        };
+        let Some(block) = node.block().and_then(|n| n.as_block_node()) else {
+            return false;
+        };
+        let Some(body) = block.body() else {
+            return false;
+        };
+        let actual = match body_value {
+            Some(ty) if !ty.is_untyped() && ty != Ty::BOTTOM => ty,
+            _ => self.infer_type(&body, body_hint),
+        };
         if actual.is_untyped() {
-            return body_hint;
+            return false;
         }
 
         let subtyper = self.subtyper();
-        if !subtyper.check(actual, block_return_type) {
-            let method_name = self.method_name_for_site(node);
-            let location = self.offset_to_location(block.location().start() as usize);
-            self.push_diagnostic(Diagnostic {
-                scope: None,
-                location,
-                kind: DiagnosticKind::BlockBodyTypeMismatch {
-                    method_name,
-                    expected: self.display_type(block_return_type),
-                    actual: self.display_type(actual),
-                },
-            });
+        if subtyper.check(actual, expected) {
+            return false;
         }
-        body_hint
+        let method_name = self.method_name_for_site(node);
+        let location = self.offset_to_location(block.location().start() as usize);
+        self.push_diagnostic(Diagnostic {
+            scope: None,
+            location,
+            kind: DiagnosticKind::BlockBodyTypeMismatch {
+                method_name,
+                expected: self.display_type(expected),
+                actual: self.display_type(actual),
+            },
+        });
+        true
     }
 
     /// `block_param_types` when the call's block type resolved to a typed

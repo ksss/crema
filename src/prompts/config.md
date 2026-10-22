@@ -174,3 +174,13 @@ Covers the [sidekiq](https://github.com/sidekiq/sidekiq) gem, whose `include Sid
 Independent of `[infusion.rails]`. Only classes are synthesized; a module that includes `Sidekiq::Job` is skipped, because the `extend` would land on that module's singleton, not on its includers. The `Sidekiq::Job` types come from the rbs collection (the `sidekiq` gem's entry); when absent, the original `Ruby::NoMethod` diagnostics stay.
 
 Propose it when the Gemfile depends on sidekiq and job classes include `Sidekiq::Job` (or `Sidekiq::Worker`).
+
+### [infusion.class_methods]
+
+Covers the `ClassMethods` idiom: a module that carries a nested `ClassMethods` module and extends it onto every includer at runtime (`ActiveSupport::Concern`, or a hand-written `def self.included(base) base.extend ClassMethods end`). RBS cannot express "including me extends you", so an `include` of such a module declared only in RBS leaves its class-level API unresolved.
+
+- `enabled` — `Boolean`, default `false`. Every class or module whose body calls `include M` gains `extend X::ClassMethods` for each module `X` on `M`'s include chain that declares a nested `ClassMethods` module (`prepend M` gains the same modules prepended to the singleton). The chain follows `include` members only; a module declared in Ruby is followed only when it extends `ActiveSupport::Concern`, since a plain Ruby module does not forward its includes to its own includers. Modules are emitted dependencies first, so the included module's own `ClassMethods` is closest to the singleton.
+
+Independent of `[infusion.rails]`. The `include` must be written in Ruby; an `include` in RBS is left to the RBS author, who can write the `extend` there. Only modules named exactly `ClassMethods` are recognized. An `extend` the class already carries (hand-written, or from another provider) is not duplicated. Nothing is synthesized onto a module that itself extends `ActiveSupport::Concern`; its includers receive the `extend` through the chain instead.
+
+Propose it when the project includes modules from gems that rely on the idiom (`ActiveModel::Model`, `ActiveModel::Attributes`, `ActiveModel::Validations`, ...) and their RBS carries a nested `ClassMethods` module.

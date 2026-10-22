@@ -246,7 +246,7 @@ fn overwrite_proc_call(
 /// The rewrite has to happen at lookup time, not at definition build,
 /// because `Kernel`'s own definition cannot know who included it
 /// (ADR-0021 Decision).
-fn maybe_rewrite_kernel_class(
+pub(crate) fn maybe_rewrite_kernel_class(
     env: ConsultationView,
     method: Arc<Method>,
     method_name: Symbol,

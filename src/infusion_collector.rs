@@ -14,6 +14,7 @@ pub mod active_record_synthesis;
 pub mod activemodel;
 pub mod activerecord;
 pub mod activesupport;
+pub(crate) mod class_methods;
 pub mod config;
 pub(crate) mod inflector;
 pub(crate) mod paranoia;

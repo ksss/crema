@@ -209,6 +209,14 @@ enum Commands {
     /// exactly like `crema check`. With `-e`, the document covers the
     /// snippet alone.
     Extract {
+        /// Narrow the document to these files, with the same view
+        /// semantics as `crema check <path>...`: the scope and the
+        /// environment stay crema.toml's, `files` holds only the
+        /// targets (a directory is intersected with the scope), and a
+        /// target outside the scope is an error. Omitted, `files`
+        /// covers the whole scope.
+        files: Vec<PathBuf>,
+
         /// Extract from inline Ruby code instead of the config scope:
         /// `files` holds just the `-e` pseudo-file. The scope's RBS
         /// environment is still built, so the snippet sees project
@@ -1942,6 +1950,9 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
     // comparison miss (one wasted rebuild, self-correcting) rather than
     // baking a stale-forever pair into this snapshot.
     let manifest = crema::snapshot::freshness::scan(&g_dirs);
+    // `build` drops directives; the snapshot bakes the gem files' `use`
+    // clauses for re-resolving their relative references later.
+    let file_uses = draft.file_use_clauses();
 
     let frozen = match draft.build() {
         Ok(env) => std::sync::Arc::new(env),
@@ -1964,9 +1975,14 @@ fn run_snapshot_dump(project_root: &Path, cli_config: Option<&Path>, no_bundler:
 
     let cache_path = project_root.join(G_SNAPSHOT_FILE);
     let cache_path = cache_path.as_path();
-    if let Err(e) =
-        crema::snapshot::write::write_g_snapshot(cache_path, &key, &frozen, &g_warnings, &manifest)
-    {
+    if let Err(e) = crema::snapshot::write::write_g_snapshot(
+        cache_path,
+        &key,
+        &frozen,
+        &file_uses,
+        &g_warnings,
+        &manifest,
+    ) {
         eprintln!(
             "error: failed to write snapshot {}: {}",
             cache_path.display(),
@@ -2441,11 +2457,13 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // still writes, so a project-wide check warms the cache the editor
     // hook's single-file checks then hit. Writing shares the G
     // snapshot's gates: no crema.toml, no persistence; `-e` never
-    // persists; extract reads every AST and neither reads nor writes
-    // the cache. The lookup condition is `diagnostic_filter.is_some()`
-    // spelled from its inputs, since the filter is built after the walk.
-    let ingest_cache_lookup =
-        matches!(mode, RunMode::Check) && (eval_active || !cli_targets.is_empty());
+    // persists. Extract never writes; under a filter (positional
+    // targets or `-e`) it looks up like a filtered check, since its
+    // non-target files need no AST either, while a bare extract reads
+    // every AST and so neither reads nor writes. The lookup condition
+    // is `diagnostic_filter.is_some()` spelled from its inputs, since
+    // the filter is built after the walk.
+    let ingest_cache_lookup = eval_active || !cli_targets.is_empty();
     let ingest_cache_write = matches!(mode, RunMode::Check) && has_config && !eval_active;
     let mut ingest_cache_cold_reason: Option<String> = None;
     let mut ingest_cache_records: FxHashMap<String, crema::ingest_cache::Record> =
@@ -2556,6 +2574,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         || resolved.infusion.activemodel
         || resolved.infusion.activerecord
         || resolved.infusion.sidekiq
+        || resolved.infusion.class_methods
         || resolved.config_infusion.is_some()
         || resolved.active_decorator_infusion.is_some();
     // Shared by every infusion ingest site below — one build so
@@ -2754,6 +2773,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
             // Scanning here means such a race instead makes the
             // *next* run's comparison miss (one wasted rebuild).
             let g_manifest = crema::snapshot::freshness::scan(&g_dirs);
+            let g_file_uses = draft.file_use_clauses();
             let g_env = match draft.build() {
                 Ok(env) => std::sync::Arc::new(env),
                 Err((e, names)) => {
@@ -2764,8 +2784,13 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
                     process::exit(2);
                 }
             };
-            let bytes =
-                crema::snapshot::write::encode_g_snapshot(key, &g_env, &g_warnings, &g_manifest);
+            let bytes = crema::snapshot::write::encode_g_snapshot(
+                key,
+                &g_env,
+                &g_file_uses,
+                &g_warnings,
+                &g_manifest,
+            );
             // Write failures are silent: a warning would make the
             // flag-on run's stderr diverge from the flag-off run.
             let write_result = crema::snapshot::write::write_atomic_bytes(&g_snapshot_path, &bytes);
@@ -2915,8 +2940,12 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // check`, and the eval pseudo-file participates in the same
     // Pass 0/1 (its declarations join the in-memory environment
     // so a self-contained snippet can define + call its own
-    // classes). What `-e` never does is *persist*: every
-    // snapshot write below is gated on `!eval_active`. It keeps
+    // classes). What `-e` never persists is anything built from the
+    // snippet: the ingest-cache write below is gated on
+    // `!eval_active`. The G snapshot (written above, before sig/ and
+    // inline join the draft) holds no project or `-e` source, so a
+    // `-e` run in a project reads and writes it like any other run;
+    // only a run without crema.toml skips it (`no_g_snapshot`). It keeps
     // the pseudo-path `-e` both for diagnostic display and for
     // Location tracking (the build-layer validator resolves `-e`
     // via the in-memory source cache below). The file path is
@@ -2977,7 +3006,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     const INGEST_BATCH: usize = 32;
     debug_assert_eq!(
         ingest_cache_lookup,
-        matches!(mode, RunMode::Check) && check_filter.is_some(),
+        check_filter.is_some(),
         "the lookup gate restates the diagnostic filter's condition"
     );
     // The previous run's listings served the walk; drop them before
@@ -3062,7 +3091,8 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // that follow read them.
     draft.compact_names();
 
-    if snapshot_timing && matches!(mode, RunMode::Check) {
+    // Bare extract stays silent: it neither reads nor writes the cache.
+    if snapshot_timing && (matches!(mode, RunMode::Check) || ingest_cache_lookup) {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let note = match (&ingest_cache_cold_reason, ingest_cache_lookup) {
             (Some(reason), _) => format!(" cold ({reason})"),
@@ -3246,10 +3276,9 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
     // construction: the C-side prism heap holds these nodes at ~10x
     // the source size, and a single-file check (ADR-0029) would
     // otherwise carry every other scope file's tree through the
-    // footprint peak. Extract reads every AST, so it is exempt.
-    if matches!(mode, RunMode::Check)
-        && let Some(filter) = &check_filter
-    {
+    // footprint peak. Extract under a filter skips the same files
+    // (`run_extract`); a bare extract has no filter and keeps them all.
+    if let Some(filter) = &check_filter {
         let mut dead_asts = Vec::new();
         for parsed in &mut parsed_sources {
             if !filter.contains(parsed.file)
@@ -3339,7 +3368,9 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
                 .chain(units.iter().map(|unit| unit.name))
                 .collect(),
         };
-        env_diags.extend(validator::validate_decl_namespaces(&env, user_files));
+        let user_decls = validator::user_decls(&env, user_files);
+        env_diags.extend(validator::validate_decl_namespaces(&env, &user_decls));
+        env_diags.extend(validator::validate_module_self_types(&env, &user_decls));
         let d_validate_cold = t_validate.elapsed();
 
         (env, d_build_cold, d_defbuild_cold, d_validate_cold)
@@ -3360,7 +3391,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
                 &sources,
                 &mut parsed_sources,
                 &project_root,
-                eval_active,
+                check_filter.as_ref(),
                 snapshot_timing,
             );
             return;
@@ -4121,8 +4152,10 @@ fn run_in_walk_order<J: Send, R: Send>(
 /// definitions from the environment, and print the whole document to
 /// stdout as one JSON value. Nothing is persisted.
 ///
-/// In `-e` mode (`eval_active`) the document is narrowed to the `-e`
-/// pseudo-file.
+/// Under a diagnostic filter (`targets`: the positional files, or the
+/// `-e` pseudo-file in `-e` mode) the document is narrowed to the
+/// filter's files: every other scope file is skipped before its AST is
+/// asked for, since an ingest-cache hit has none.
 ///
 /// Extract is opt-in and allowed to be slower than `crema check`;
 /// recording costs exist only on this path.
@@ -4131,7 +4164,7 @@ fn run_extract(
     sources: &[(PathBuf, Arc<[u8]>)],
     parsed_sources: &mut [ParsedSource<'_>],
     project_root: &Path,
-    eval_active: bool,
+    targets: Option<&HashSet<PathBuf>>,
     timing: bool,
 ) {
     let t_extract = std::time::Instant::now();
@@ -4156,14 +4189,16 @@ fn run_extract(
     // an entry with its content hash and empty record arrays.
     let mut files: std::collections::BTreeMap<String, crema::extract::FileRecord> =
         std::collections::BTreeMap::new();
-    // The `-e` pseudo-path `run_check` appended on top of the scope
-    // (ADR-0029 §5). In `-e` mode it is the only file the document may
-    // contain, so the scope files are skipped here: extract mode sinks
-    // its diagnostics, so a record nobody reads is the sole thing their
-    // check would produce.
-    let eval_file = Path::new("-e");
+    // Under a filter (the positional targets, or the `-e` pseudo-path
+    // `run_check` appended on top of the scope, ADR-0029 §5) only the
+    // filter's files may appear, so every other scope file is skipped
+    // here and in both passes below: extract mode sinks its
+    // diagnostics, so a record nobody reads is the sole thing their
+    // check would produce. `sources` alone does not narrow it: a cold
+    // cache leaves every scope file's bytes in it.
+    let is_target = |file: &Path| targets.is_none_or(|t| t.contains(file));
     for (file, bytes) in sources {
-        if eval_active && file != eval_file {
+        if !is_target(file) {
             continue;
         }
         files.insert(
@@ -4184,7 +4219,8 @@ fn run_extract(
     // order keeps the fold's cost profile identical to a serial loop.
     let mut jobs = Vec::new();
     for parsed in parsed_sources.iter_mut() {
-        if eval_active && parsed.file != eval_file {
+        // Before `take()`: an ingest-cache hit has no AST to take.
+        if !is_target(parsed.file) {
             continue;
         }
         jobs.push(ExtractJob {
@@ -4229,7 +4265,7 @@ fn run_extract(
     for file_name in env.env().path_index_files() {
         let path_string = names.resolve(file_name);
         let path = Path::new(&path_string);
-        if eval_active && path != eval_file {
+        if !is_target(path) {
             continue;
         }
         let source: std::borrow::Cow<'_, [u8]> = match source_by_path.get(path) {
@@ -4401,11 +4437,15 @@ fn main() {
             },
             RunMode::Check,
         ),
-        Commands::Extract { eval, threads } => run_check(
+        Commands::Extract {
+            files,
+            eval,
+            threads,
+        } => run_check(
             cli_config.as_deref(),
             no_bundler,
             CheckInvocation {
-                files: Vec::new(),
+                files,
                 eval,
                 script: None,
                 sig_dirs: Vec::new(),

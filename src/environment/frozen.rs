@@ -554,10 +554,9 @@ pub struct Environment {
     /// accessor stays a direct map borrow.
     pub(crate) g: Option<Arc<GSnapshotBackend>>,
     /// Per-kind count of names present in both the A-layer map and the
-    /// snapshot (reopened classes/modules, flatten-shadowed interfaces).
-    /// Subtracted in [`Decls::len`] so the layered view counts each name
-    /// once. Kinds whose cross-layer duplicates are build errors have no
-    /// overlap and are omitted.
+    /// snapshot (reopened classes/modules, flatten-shadowed interfaces,
+    /// gem entries re-resolved against the A layer). Subtracted in
+    /// [`Decls::len`] so the layered view counts each name once.
     pub(crate) g_overlap: GOverlap,
     /// Reverse index from a source file to the [`PathIndexKey`]s it
     /// contributed. Carried over verbatim from
@@ -628,6 +627,12 @@ pub struct ConcernBlockTargets {
 pub(crate) struct GOverlap {
     pub(crate) class: usize,
     pub(crate) interface: usize,
+    /// The single-decl kinds overlap only through re-resolved gem
+    /// entries (`crate::environment::g_relative`): an A-side collision
+    /// with a gem name is dropped as a duplicate.
+    pub(crate) type_alias: usize,
+    pub(crate) constant: usize,
+    pub(crate) global: usize,
 }
 
 /// Read-only view over one decl namespace of a frozen [`Environment`].
@@ -950,7 +955,11 @@ impl Environment {
     pub fn type_alias_decls(&self) -> Decls<'_, TypeName, SingleEntry<TypeAlias>> {
         match &self.g {
             None => Decls::built(&self.type_alias_decls),
-            Some(g) => Decls::layered(&self.type_alias_decls, Self::type_alias_g_view(g), 0),
+            Some(g) => Decls::layered(
+                &self.type_alias_decls,
+                Self::type_alias_g_view(g),
+                self.g_overlap.type_alias,
+            ),
         }
     }
 
@@ -974,7 +983,11 @@ impl Environment {
     pub fn constant_decls(&self) -> Decls<'_, TypeName, SingleEntry<Constant>> {
         match &self.g {
             None => Decls::built(&self.constant_decls),
-            Some(g) => Decls::layered(&self.constant_decls, Self::constant_g_view(g), 0),
+            Some(g) => Decls::layered(
+                &self.constant_decls,
+                Self::constant_g_view(g),
+                self.g_overlap.constant,
+            ),
         }
     }
 
@@ -992,7 +1005,11 @@ impl Environment {
     pub fn global_decls(&self) -> Decls<'_, Symbol, GlobalEntry> {
         match &self.g {
             None => Decls::built(&self.global_decls),
-            Some(g) => Decls::layered(&self.global_decls, Self::global_g_view(g), 0),
+            Some(g) => Decls::layered(
+                &self.global_decls,
+                Self::global_g_view(g),
+                self.g_overlap.global,
+            ),
         }
     }
 

@@ -67,11 +67,12 @@ const SIDEKIQ_JOB_OPTIONS: &str = "::Sidekiq::Job::Options";
 const SIDEKIQ_JOB_OPTIONS_CLASS_METHODS: &str = "::Sidekiq::Job::Options::ClassMethods";
 
 /// One receiver-less `include X` in a class body, as the collector
-/// recorded it: the including class and the namespace-qualified
-/// candidates for `X` (innermost first).
-pub(crate) struct SidekiqSite {
+/// recorded it: the including class, `X` as written and the cref it
+/// was written under (outer-first, without the root).
+pub(crate) struct SidekiqSite<'a> {
     pub(crate) target: TypeName,
-    pub(crate) module_names: Vec<TypeName>,
+    pub(crate) raw_module_name: &'a str,
+    pub(crate) lexical_context: &'a [TypeName],
 }
 
 /// Attach the three sidekiq mixin members to every class whose include
@@ -82,7 +83,7 @@ pub(crate) struct SidekiqSite {
 /// lands on that module's singleton and never reaches the classes that
 /// include the module later — synthesizing there would hide a real
 /// runtime `NoMethodError`.
-pub(crate) fn synthesize(draft: &mut EnvironmentDraft, sites: &[SidekiqSite]) {
+pub(crate) fn synthesize(draft: &mut EnvironmentDraft, sites: &[SidekiqSite<'_>]) {
     if sites.is_empty() {
         return;
     }
@@ -95,17 +96,16 @@ pub(crate) fn synthesize(draft: &mut EnvironmentDraft, sites: &[SidekiqSite]) {
         let mut seen = FxHashSet::default();
         let mut targets = Vec::new();
         for site in sites {
-            // First candidate that names a declared class/module or an
-            // alias — the same innermost-first order Ruby's constant
-            // lookup uses for the include argument.
-            let Some(resolved) = site
-                .module_names
-                .iter()
-                .find_map(|candidate| resolver.try_resolve_typename(*candidate, &[]))
-            else {
+            let Some(module) = resolve_mixin_argument(
+                &resolver,
+                &aliases,
+                names,
+                site.raw_module_name,
+                site.lexical_context,
+            ) else {
                 continue;
             };
-            if normalize_alias(resolved, &aliases, &resolver) != job {
+            if module != job {
                 continue;
             }
             if seen.insert(site.target) {
@@ -123,7 +123,7 @@ pub(crate) fn synthesize(draft: &mut EnvironmentDraft, sites: &[SidekiqSite]) {
     }
 }
 
-type AliasMap = FxHashMap<TypeName, (String, Context)>;
+pub(crate) type AliasMap = FxHashMap<TypeName, (String, Context)>;
 
 /// `TypeNameResolver` alias input over both layers: the A draft's alias
 /// decls (raw `old_name` + declaring context) and the G snapshot's
@@ -133,7 +133,7 @@ type AliasMap = FxHashMap<TypeName, (String, Context)>;
 /// signature aliases (`module Sidekiq; module Worker = Job; end`) have
 /// to be walked out of their parents' members: `build`'s flatten pass
 /// is what lifts them into `class_alias_decls`, and it has not run yet.
-fn alias_map(draft: &EnvironmentDraft) -> AliasMap {
+pub(crate) fn alias_map(draft: &EnvironmentDraft) -> AliasMap {
     let names = draft.names();
     let mut aliases = FxHashMap::default();
     for entry in draft.class_alias_decls.values() {
@@ -242,12 +242,31 @@ fn collect_nested_alias(
     }
 }
 
+/// Ruby's constant lookup for a mixin argument `raw` written under
+/// `lexical_context` (outer-first, without the root): every enclosing
+/// cref outward, then the root, then through aliases to the module the
+/// name stands for. The one rule the strict Concern pass, this pass and
+/// the `class_methods` pass share for `include X` / `prepend X`.
+pub(crate) fn resolve_mixin_argument(
+    resolver: &TypeNameResolver<'_>,
+    aliases: &AliasMap,
+    names: &NameTable,
+    raw: &str,
+    lexical_context: &[TypeName],
+) -> Option<TypeName> {
+    let context: Vec<TypeName> = std::iter::once(names.absolute_root())
+        .chain(lexical_context.iter().copied())
+        .collect();
+    let resolved = resolver.try_resolve(raw, &context)?;
+    Some(normalize_alias(resolved, aliases, resolver))
+}
+
 /// Follow `name` through the alias chain to the declared class/module
 /// it stands for (`::Sidekiq::Worker` → `::Sidekiq::Job`). Stops at the
 /// first non-alias, at an unresolvable alias target, or on a cycle —
 /// in every case returning the last name reached, which the caller
 /// compares against `::Sidekiq::Job` and simply fails to match.
-fn normalize_alias(
+pub(crate) fn normalize_alias(
     name: TypeName,
     aliases: &AliasMap,
     resolver: &TypeNameResolver<'_>,

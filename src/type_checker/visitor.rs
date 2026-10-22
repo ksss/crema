@@ -1199,27 +1199,6 @@ impl<'env> TypeChecker<'env> {
         node: &ruby_prism::LocalVariableTargetNode<'_>,
         ty: Ty,
     ) {
-        self.bind_local_variable_target_with(node, ty, false);
-    }
-
-    /// `bind_local_variable_target` for a target that takes the RHS value
-    /// itself (`a, b = boom` binds `a` to `boom`). A bot RHS is recorded the
-    /// way `check_local_variable_write` records `y = boom`, so `a.foo`
-    /// reports NoMethod on `bot` while a narrowed-to-bot local stays silent.
-    fn bind_local_variable_target_from_rhs(
-        &mut self,
-        node: &ruby_prism::LocalVariableTargetNode<'_>,
-        ty: Ty,
-    ) {
-        self.bind_local_variable_target_with(node, ty, true);
-    }
-
-    fn bind_local_variable_target_with(
-        &mut self,
-        node: &ruby_prism::LocalVariableTargetNode<'_>,
-        ty: Ty,
-        from_rhs: bool,
-    ) {
         let name_str = String::from_utf8_lossy(node.name().as_slice());
         let name = self.checker_names().intern(&name_str);
         let ty = self.freeze_lvar_bound_type(ty, node.depth());
@@ -1233,12 +1212,7 @@ impl<'env> TypeChecker<'env> {
         {
             return;
         }
-        if from_rhs {
-            self.ctx
-                .set_local_variable_at_depth_from_bot_rhs(name, ty, node.depth());
-        } else {
-            self.ctx.set_local_variable_at_depth(name, ty, node.depth());
-        }
+        self.ctx.set_local_variable_at_depth(name, ty, node.depth());
     }
 
     /// Multi-assignment fallback helper: bind the target's lvar to UNTYPED
@@ -1388,7 +1362,7 @@ impl<'env> TypeChecker<'env> {
     ) {
         let mut targets = lefts.iter().chain(rights.iter());
         if let Some(first) = targets.next() {
-            self.bind_local_variable_target_from_rhs(first, value_ty);
+            self.bind_local_variable_target(first, value_ty);
         }
         for target in targets {
             self.bind_local_variable_target(target, Ty::NIL);
@@ -3422,14 +3396,9 @@ impl<'env> TypeChecker<'env> {
         // the node as the RHS type): the assignment never completes, so
         // the enclosing statement list diverges (sticky-bot) and an arm
         // containing it drops out of the env join. Later statements are
-        // still walked, and the bot-RHS binding lets `y.foo` report
-        // NoMethod on `bot` (`test_bottom_lvar_receiver_reports_no_method`).
-        if value_type == Ty::BOTTOM && bound_ty == Ty::BOTTOM {
-            self.ctx
-                .set_local_variable_at_depth_from_bot_rhs(name, bound_ty, depth);
-        } else {
-            self.ctx.set_local_variable_at_depth(name, bound_ty, depth);
-        }
+        // still walked, and `y.foo` reports NoMethod on `bot`
+        // (`test_bottom_lvar_receiver_reports_no_method`).
+        self.ctx.set_local_variable_at_depth(name, bound_ty, depth);
         bound_ty
     }
 

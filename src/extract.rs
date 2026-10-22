@@ -420,6 +420,7 @@ pub fn consulted_symbols(
             | InterfaceMethodNames(n)
             | SuperclassTypeName(n)
             | HasCompleteAncestorChain(n)
+            | HasCompleteSingletonAncestorChain(n)
             | InstanceAncestors(n)
             | SingletonAncestors(n)
             | OneInstanceAncestors(n) => out.push(type_name(*n)),

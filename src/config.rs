@@ -111,6 +111,8 @@ pub struct InfusionTable {
     pub paranoia: Option<ParanoiaInfusionTable>,
     #[serde(default)]
     pub sidekiq: Option<SidekiqInfusionTable>,
+    #[serde(default)]
+    pub class_methods: Option<ClassMethodsInfusionTable>,
 }
 
 /// `[infusion.rails]` table shape. Held as a sub-table (not a scalar bool)
@@ -223,6 +225,19 @@ pub struct SidekiqInfusionTable {
     pub enabled: bool,
 }
 
+/// `[infusion.class_methods]` table shape. Covers the `X::ClassMethods`
+/// idiom (`ActiveSupport::Concern`, or a hand-written `self.included`
+/// hook) for modules whose only declaration is RBS, where the hook's
+/// `extend` cannot be written. Independent of the rails preset: the
+/// idiom is not Rails-specific and the pass reads only declarations
+/// already in the environment.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClassMethodsInfusionTable {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Resolved view of `[infusion]`. Plain `Copy` bool fields so the
 /// infusion collector can take it by value without lifetime entanglements.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -236,6 +251,8 @@ pub struct InfusionOptions {
     pub paranoia: bool,
     /// `[infusion.sidekiq] enabled = true`.
     pub sidekiq: bool,
+    /// `[infusion.class_methods] enabled = true`.
+    pub class_methods: bool,
 }
 
 impl InfusionOptions {
@@ -716,6 +733,11 @@ impl Config {
             .as_ref()
             .and_then(|d| d.sidekiq.as_ref())
             .is_some_and(|t| t.enabled);
+        let class_methods_infusion = file
+            .infusion
+            .as_ref()
+            .and_then(|d| d.class_methods.as_ref())
+            .is_some_and(|t| t.enabled);
         let config_infusion = file.infusion.and_then(|d| d.config);
         let infusion = InfusionOptions {
             activesupport: rails_infusion,
@@ -723,6 +745,7 @@ impl Config {
             activerecord: rails_infusion,
             paranoia: paranoia_infusion,
             sidekiq: sidekiq_infusion,
+            class_methods: class_methods_infusion,
         };
         Ok((
             ResolvedConfig {

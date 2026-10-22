@@ -34,6 +34,7 @@ use std::sync::{Arc, OnceLock};
 
 use rustc_hash::FxHashMap;
 
+use crate::ast::directives::{UseClause, UseSingleClause, UseWildcardClause};
 use crate::definition::{VariableDuplication, VariableDuplicationKind};
 use crate::definition_builder::{
     AliasCycleEntry, AliasCycles, BakedAncestorCycle, BakedArityViolation,
@@ -45,11 +46,12 @@ use crate::environment::frozen::{
     ClassAliasDeclaration, ClassAliasEntry, ClassEntry, ClassOrModule, ClassOrModuleAliasEntry,
     InterfaceEntry, ModuleAliasDeclaration, ModuleAliasEntry, ModuleDeclaration, ModuleEntry,
 };
+use crate::environment::g_relative::{GEntryKey, GRelativeDecl, GRelativeEntry, GRelativeRefs};
 use crate::location::{DuplicateSource, LocationRange, RubyLocation, SourceLocation};
 use crate::name::{NameTable, Symbol};
 use crate::snapshot::flat;
 use crate::snapshot::mirror::{
-    MBakedDiagnostics, MBakedLoc, MBakedMethodGroup, MClassOrModule, MEntry,
+    MBakedDiagnostics, MBakedLoc, MBakedMethodGroup, MClassOrModule, MEntry, MRelativeRefs,
 };
 use crate::snapshot::rebuild::{
     DecodeTables, Decoder, EntryMemo, EntrySource, NestedDecls, RebuildError, corrupt,
@@ -219,6 +221,7 @@ fn baked_from_mirror(
                             class: v.class.clone(),
                             expected: v.expected.clone(),
                             got: v.got as usize,
+                            args: v.args.clone(),
                             location: v.location.as_ref().map(baked_loc),
                         })
                     })
@@ -266,6 +269,71 @@ fn baked_from_mirror(
             unresolved,
         },
         warnings: m.warnings.clone(),
+        relative_refs: relative_refs_from_mirror(&m.relative_refs, names)?,
+    })
+}
+
+/// Rehydrate the baked relative references. Reference, context and key
+/// ids are content-addressed names the cold walk took from declarations,
+/// so the interned tables already hold them; `use` clause names are
+/// spelled out (they appear in no declaration) and re-parsed here.
+fn relative_refs_from_mirror(
+    m: &MRelativeRefs,
+    names: &NameTable,
+) -> Result<GRelativeRefs, RebuildError> {
+    let tns = |v: &[u64]| v.iter().map(|id| TypeName::from_hash(*id)).collect();
+    let use_groups = m
+        .use_groups
+        .iter()
+        .map(|clauses| {
+            clauses
+                .iter()
+                .map(|c| match c.kind {
+                    0 => Ok(UseClause::Single(UseSingleClause {
+                        type_name: names.parse_type_name(&c.name),
+                        new_name: c.new_name.as_deref().map(|n| names.intern_symbol(n)),
+                        location: None,
+                    })),
+                    1 => Ok(UseClause::Wildcard(UseWildcardClause {
+                        namespace: names.parse_type_name(&c.name),
+                        location: None,
+                    })),
+                    k => Err(corrupt(format!("unknown use clause kind {k}"))),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries = m
+        .entries
+        .iter()
+        .map(|e| {
+            let tn = TypeName::from_hash(e.id);
+            let key = match e.kind {
+                0 => GEntryKey::Class(tn),
+                1 => GEntryKey::Interface(tn),
+                2 => GEntryKey::TypeAlias(tn),
+                3 => GEntryKey::Constant(tn),
+                4 => GEntryKey::Global(Symbol::from_raw_id(e.id)),
+                5 => GEntryKey::Alias(tn),
+                k => return Err(corrupt(format!("unknown relative-ref entry kind {k}"))),
+            };
+            let decls = e
+                .decls
+                .iter()
+                .map(|d| GRelativeDecl {
+                    index: d.index,
+                    use_group: d.use_group,
+                    context: tns(&d.context),
+                    outer_refs: tns(&d.outer_refs),
+                    inner_refs: tns(&d.inner_refs),
+                })
+                .collect();
+            Ok(GRelativeEntry { key, decls })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GRelativeRefs {
+        use_groups,
+        entries,
     })
 }
 

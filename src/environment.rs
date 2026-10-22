@@ -199,6 +199,7 @@ impl MixinRef {
 pub mod draft;
 pub(crate) mod extras_state;
 pub mod frozen;
+pub(crate) mod g_relative;
 pub mod invalidation;
 pub mod resolution;
 pub mod ruby_decl;

@@ -860,10 +860,14 @@ impl<'a> SubtypeChecker<'a> {
         // methods (`def self.foo`) instead of the instance-method chain.
         // `sub_args` carries the receiver's own type-arg slice (e.g.
         // `Foo[String]` -> `[::String]`); empty for singleton receivers.
-        let (sub_class_name, sub_args, is_singleton) = match &sub_type {
-            Type::ClassInstance { name, args } => (*name, args.clone(), false),
-            Type::Interface { name, args } => (*name, args.clone(), false),
-            Type::ClassSingleton { name } => (*name, Vec::new(), true),
+        // `sub_is_class_instance` marks the arms whose `sub_class_name` is
+        // a class the receiver is an instance of (so `Kernel#class` on it
+        // returns `singleton(sub_class_name)`); the Interface arm walks an
+        // interface's own methods and gets no such rewrite.
+        let (sub_class_name, sub_args, is_singleton, sub_is_class_instance) = match &sub_type {
+            Type::ClassInstance { name, args } => (*name, args.clone(), false, true),
+            Type::Interface { name, args } => (*name, args.clone(), false, false),
+            Type::ClassSingleton { name } => (*name, Vec::new(), true, false),
             // `nil` is a singleton value of `::NilClass`; walk the
             // NilClass method chain so `T?` = `T | nil` satisfies any
             // interface whose methods live on Kernel / Object. Without
@@ -872,7 +876,12 @@ impl<'a> SubtypeChecker<'a> {
             // parity: `Interface::Builder#shape` bridges `AST::Types::
             // Nil` to `NilClass` at `steep/lib/steep/interface/
             // builder.rb`).
-            Type::Nil => (self.env.names().builtins().nil_class, Vec::new(), false),
+            Type::Nil => (
+                self.env.names().builtins().nil_class,
+                Vec::new(),
+                false,
+                true,
+            ),
             // Structural types take their methods from the class they widen
             // to, while `sub` (the structural type itself) stays the `self`
             // those methods are substituted with. Steep `raw_shape` builds
@@ -884,21 +893,21 @@ impl<'a> SubtypeChecker<'a> {
                 let Some((name, args)) = class_instance_parts(types, widened) else {
                     return false;
                 };
-                (name, args, false)
+                (name, args, false, true)
             }
             Type::Tuple(members) => {
                 let Some((name, args)) = class_instance_parts(types, self.tuple_as_array(members))
                 else {
                     return false;
                 };
-                (name, args, false)
+                (name, args, false, true)
             }
             Type::Record { fields } => {
                 let Some((name, args)) = class_instance_parts(types, self.record_as_hash(fields))
                 else {
                     return false;
                 };
-                (name, args, false)
+                (name, args, false, true)
             }
             _ => return false,
         };
@@ -942,6 +951,24 @@ impl<'a> SubtypeChecker<'a> {
             };
             let Some((sub_method, sub_bindings)) = sub_lookup else {
                 return false;
+            };
+            // `Kernel#class` returns `singleton(<receiver class>)` for an
+            // instance receiver, the same rewrite `lookup_method` applies
+            // at call sites (Steep `object_shape` → `replace_kernel_class`
+            // in `lib/steep/interface/builder.rb`). Without it `interface
+            // _K; def class: () -> _KClass` compares `::Class <: _KClass`
+            // and every includer of `module M : _K` fails. Steep's
+            // `singleton_shape` leaves the singleton side as `Class`, so
+            // `is_singleton` receivers are not rewritten.
+            let sub_method = if sub_is_class_instance {
+                crate::type_checker::method_resolver::maybe_rewrite_kernel_class(
+                    self.env,
+                    sub_method,
+                    method_name,
+                    &sub_class_name,
+                )
+            } else {
+                sub_method
             };
             let Some(iface_method) = definition_builder::lookup_instance_method_by_type_name(
                 self.env,

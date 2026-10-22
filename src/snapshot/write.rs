@@ -5,8 +5,11 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::ast::directives::UseClause;
 use crate::definition_builder::{self, RoastedGScan};
+use crate::environment::draft::FileUseClauses;
 use crate::environment::frozen::Environment;
+use crate::environment::g_relative::{self, GEntryKey, GRelativeRefs};
 use crate::infusion_collector::active_record_synthesis;
 use crate::location::{DuplicateSource, SourceLocation};
 use crate::name::NameTable;
@@ -15,7 +18,7 @@ use crate::snapshot::invalidation::InvalidationKey;
 use crate::snapshot::mirror::{
     MBakedAliasCycle, MBakedAncestorCycle, MBakedArityGroup, MBakedArityViolation,
     MBakedDiagnostics, MBakedLoc, MBakedMethodGroup, MBakedUnresolvedSuperEdge, MBakedVariableDup,
-    MBakedVariableGroup, MEntry,
+    MBakedVariableGroup, MEntry, MRelativeDecl, MRelativeEntry, MRelativeRefs, MUseClause,
 };
 use crate::snapshot::{convert, flat};
 use crate::validator;
@@ -44,8 +47,13 @@ pub const G_SNAPSHOT_MAGIC: u64 = 0xC5EA_05A9_0000_0001;
 /// layout. v3 added validator findings (ancestor cycles, mixin arity,
 /// slice 2b-2); v2 appended the diagnostics section after the flat
 /// payload, located via the header's diag offset/len words. Older
-/// versions fail the check and fall back to a cold rebuild.
-pub const G_SNAPSHOT_SCHEMA_VERSION: u32 = 8;
+/// versions fail the check and fall back to a cold rebuild. v9: baked
+/// mixin-arity violations carry the supplied type arguments' display
+/// forms (for the diagnostic's `help`). v10: baked diagnostics gain
+/// `relative_refs` — the gem references the G-only resolver left
+/// relative, retried against the A ∪ G names at build time
+/// (`g_snapshot_gem_decl_relative_names_not_reresolved_at_warm`).
+pub const G_SNAPSHOT_SCHEMA_VERSION: u32 = 10;
 pub const HEADER_LEN: usize = 80;
 /// Absolute file offset of the baked-diagnostics section, stored in the
 /// header words that were reserved in v1.
@@ -75,14 +83,18 @@ pub fn build_header(key: &InvalidationKey) -> [u8; HEADER_LEN] {
 /// produced `env` already printed — baked in so a later warm hit can
 /// replay them (see `G_SNAPSHOT_SCHEMA_VERSION`'s v7 note). `manifest` is
 /// the G-layer freshness manifest (`G_SNAPSHOT_SCHEMA_VERSION`'s v8 note).
+/// `file_uses` is the gem draft's per-file `use` clauses
+/// ([`EnvironmentDraft::file_use_clauses`](crate::environment::draft::EnvironmentDraft::file_use_clauses)),
+/// which the frozen `env` no longer carries.
 pub fn write_g_snapshot(
     cache_path: &Path,
     key: &InvalidationKey,
     env: &Arc<Environment>,
+    file_uses: &FileUseClauses,
     warnings: &[String],
     manifest: &GFreshnessManifest,
 ) -> io::Result<()> {
-    let bytes = encode_g_snapshot(key, env, warnings, manifest);
+    let bytes = encode_g_snapshot(key, env, file_uses, warnings, manifest);
     write_atomic_bytes(cache_path, &bytes)
 }
 
@@ -93,6 +105,7 @@ pub fn write_g_snapshot(
 pub fn encode_g_snapshot(
     key: &InvalidationKey,
     env: &Arc<Environment>,
+    file_uses: &FileUseClauses,
     warnings: &[String],
     manifest: &GFreshnessManifest,
 ) -> Vec<u8> {
@@ -109,6 +122,7 @@ pub fn encode_g_snapshot(
     // can rerun them against the merged A ∪ G resolver.
     baked.super_edges = active_record_synthesis::roast_g_super_edges(env);
     baked.warnings = warnings.to_vec();
+    baked.relative_refs = g_relative::collect(env, file_uses);
     let diag_blob = bincode::serialize(&baked_to_mirror(&baked, env.names()))
         .expect("MBakedDiagnostics serialize is infallible");
     let manifest_blob =
@@ -239,6 +253,7 @@ fn baked_to_mirror(baked: &RoastedGScan, names: &NameTable) -> MBakedDiagnostics
                         class: v.class.clone(),
                         expected: v.expected.clone(),
                         got: v.got as u64,
+                        args: v.args.clone(),
                         location: v.location.as_ref().map(baked_loc),
                     })
                     .collect(),
@@ -285,6 +300,63 @@ fn baked_to_mirror(baked: &RoastedGScan, names: &NameTable) -> MBakedDiagnostics
                 .collect(),
         },
         warnings: baked.warnings.clone(),
+        relative_refs: relative_refs_to_mirror(&baked.relative_refs, names),
+    }
+}
+
+fn relative_refs_to_mirror(refs: &GRelativeRefs, names: &NameTable) -> MRelativeRefs {
+    let ids = |v: &[crate::type_name::TypeName]| v.iter().map(|t| t.get()).collect();
+    MRelativeRefs {
+        use_groups: refs
+            .use_groups
+            .iter()
+            .map(|clauses| {
+                clauses
+                    .iter()
+                    .map(|c| match c {
+                        UseClause::Single(sc) => MUseClause {
+                            kind: 0,
+                            name: names.display_type_name(sc.type_name),
+                            new_name: sc.new_name.map(|n| names.resolve(n).to_string()),
+                        },
+                        UseClause::Wildcard(wc) => MUseClause {
+                            kind: 1,
+                            name: names.display_type_name(wc.namespace),
+                            new_name: None,
+                        },
+                    })
+                    .collect()
+            })
+            .collect(),
+        entries: refs
+            .entries
+            .iter()
+            .map(|e| {
+                let (kind, id) = match e.key {
+                    GEntryKey::Class(t) => (0, t.get()),
+                    GEntryKey::Interface(t) => (1, t.get()),
+                    GEntryKey::TypeAlias(t) => (2, t.get()),
+                    GEntryKey::Constant(t) => (3, t.get()),
+                    GEntryKey::Global(s) => (4, convert::sym_id_of(names.resolve(s))),
+                    GEntryKey::Alias(t) => (5, t.get()),
+                };
+                MRelativeEntry {
+                    kind,
+                    id,
+                    decls: e
+                        .decls
+                        .iter()
+                        .map(|d| MRelativeDecl {
+                            index: d.index,
+                            use_group: d.use_group,
+                            context: ids(&d.context),
+                            outer_refs: ids(&d.outer_refs),
+                            inner_refs: ids(&d.inner_refs),
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
     }
 }
 

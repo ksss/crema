@@ -67,7 +67,10 @@ pub const INGEST_CACHE_FILE: &str = ".crema/ingest_cache_v1.bin";
 /// Identifies a crema ingest-cache file ("C5EA 1A6E" ≈ crema ingest).
 pub const INGEST_CACHE_MAGIC: u64 = 0xC5EA_1A6E_0000_0001;
 /// 2: directory listings were added in front of the records.
-pub const INGEST_CACHE_SCHEMA_VERSION: u32 = 2;
+/// 3: `ConcernSite` gained the call's byte range.
+/// 4: `ConcernSite` / `ConcernDependency` carry the argument as written
+///    plus its cref instead of two namespace candidates.
+pub const INGEST_CACHE_SCHEMA_VERSION: u32 = 4;
 /// magic u64 LE | schema_version u32 LE | reserved u32 = 0 | key 32 bytes
 pub const HEADER_LEN: usize = 48;
 
