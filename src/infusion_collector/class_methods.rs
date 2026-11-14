@@ -486,11 +486,12 @@ enum DraftDecl<'a> {
 }
 
 /// Every declaration of `name` in the draft. Before `build` only
-/// top-level names are entries in `class_decls`; a nested `module
-/// Sidekiq::Job` (RBS or Ruby) lives in `module Sidekiq`'s members, so
-/// this walks down from the outermost enclosing entry through each of
-/// its declaration sites. Constants are the one thing the Ruby insert
-/// path flattens, and they are not looked for here.
+/// top-level declarations are entries in `class_decls`; a nested `module
+/// Sidekiq::Job` (RBS or Ruby) lives in `module Sidekiq`'s members, while
+/// a compact `module Sidekiq::Job` is an entry of its own. So this starts
+/// from every enclosing name that has an entry and walks down through
+/// each of its declaration sites. Constants are the one thing the Ruby
+/// insert path flattens, and they are not looked for here.
 fn draft_decls(draft: &EnvironmentDraft, name: TypeName) -> Vec<DraftDecl<'_>> {
     let names = draft.names();
     let root = names.absolute_root();
@@ -508,38 +509,38 @@ fn draft_decls(draft: &EnvironmentDraft, name: TypeName) -> Vec<DraftDecl<'_>> {
         }
     }
     path.reverse();
-    let Some((outer, rest)) = path.split_first() else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    match draft.class_decls.get(outer) {
-        Some(ClassOrModuleDraft::Class(entry)) => {
-            for (_origin, context, decl) in &entry.context_decls {
-                let inner = inner_context(context, *outer);
-                match decl {
-                    ClassDeclarationDraft::Signature(decl) => {
-                        descend(DraftDecl::SigClass(decl, inner), rest, &mut out)
-                    }
-                    ClassDeclarationDraft::Ruby(decl) => {
-                        descend(DraftDecl::RubyClass(decl, inner), rest, &mut out)
-                    }
-                }
-            }
-        }
-        Some(ClassOrModuleDraft::Module(entry)) => {
-            for (_origin, context, decl) in &entry.context_decls {
-                let inner = inner_context(context, *outer);
-                match decl {
-                    ModuleDeclarationDraft::Signature(decl) => {
-                        descend(DraftDecl::SigModule(decl, inner), rest, &mut out)
-                    }
-                    ModuleDeclarationDraft::Ruby(decl) => {
-                        descend(DraftDecl::RubyModule(decl, inner), rest, &mut out)
+    for (depth, entry_name) in path.iter().enumerate() {
+        let rest = &path[depth + 1..];
+        match draft.class_decls.get(entry_name) {
+            Some(ClassOrModuleDraft::Class(entry)) => {
+                for (_origin, context, decl) in &entry.context_decls {
+                    let inner = inner_context(context, *entry_name);
+                    match decl {
+                        ClassDeclarationDraft::Signature(decl) => {
+                            descend(DraftDecl::SigClass(decl, inner), rest, &mut out)
+                        }
+                        ClassDeclarationDraft::Ruby(decl) => {
+                            descend(DraftDecl::RubyClass(decl, inner), rest, &mut out)
+                        }
                     }
                 }
             }
+            Some(ClassOrModuleDraft::Module(entry)) => {
+                for (_origin, context, decl) in &entry.context_decls {
+                    let inner = inner_context(context, *entry_name);
+                    match decl {
+                        ModuleDeclarationDraft::Signature(decl) => {
+                            descend(DraftDecl::SigModule(decl, inner), rest, &mut out)
+                        }
+                        ModuleDeclarationDraft::Ruby(decl) => {
+                            descend(DraftDecl::RubyModule(decl, inner), rest, &mut out)
+                        }
+                    }
+                }
+            }
+            None => {}
         }
-        None => {}
     }
     out
 }

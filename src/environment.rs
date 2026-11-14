@@ -90,7 +90,11 @@ pub enum InfusionUnit {
     Config,
     Paranoia,
     ActionMailer,
+    ActionDispatch,
     Sidekiq,
+    ActiveModel,
+    ActionView,
+    DryInitializer,
 }
 
 impl InfusionUnit {
@@ -101,7 +105,11 @@ impl InfusionUnit {
             InfusionUnit::Config => "config",
             InfusionUnit::Paranoia => "paranoia",
             InfusionUnit::ActionMailer => "actionmailer",
+            InfusionUnit::ActionDispatch => "actiondispatch",
             InfusionUnit::Sidekiq => "sidekiq",
+            InfusionUnit::DryInitializer => "dryinitializer",
+            InfusionUnit::ActiveModel => "activemodel",
+            InfusionUnit::ActionView => "actionview",
         }
     }
 }

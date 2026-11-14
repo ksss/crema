@@ -215,8 +215,7 @@ impl Context {
     /// Push a class that owns `self` / `def` but is *not* a cref frame:
     /// the `Const = Class.new do ... end` block body. Constant reads and
     /// bare writes inside keep resolving against the enclosing cref.
-    pub fn push_class_outside_cref(&mut self, name: &str, names: &NameTable) {
-        let type_name = self.qualified_class_name(name, names);
+    pub fn push_class_outside_cref(&mut self, type_name: TypeName) {
         self.class_stack.push(type_name);
         self.class_stack_in_cref.push(false);
     }
@@ -225,7 +224,7 @@ impl Context {
     /// enclosing `self`-owner: `class Widget` inside a `Const = Class.new
     /// do ... end` block defines `::Widget` (Ruby's `class` keyword, like
     /// a bare constant write, defines into the cref).
-    fn qualified_class_name(&self, name: &str, names: &NameTable) -> TypeName {
+    pub fn qualified_class_name(&self, name: &str, names: &NameTable) -> TypeName {
         let qualified = match self.cref_stack.last() {
             Some(parent) => format!("{}::{}", names.display_type_name(*parent), name),
             None => format!("::{}", name),

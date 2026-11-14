@@ -1529,11 +1529,52 @@ impl<'env> TypeChecker<'env> {
         }
     }
 
-    /// Walk the body of a `Const = <ctor>(<args?>) do ... end` class
-    /// construction (`Class.new`, `Struct.new`, or `Data.define`) as
-    /// the body of `class Const`. The dispatch site has already
-    /// confirmed the call shape and that the LHS is declared in RBS as
-    /// a class.
+    /// The class-construction fast path shared by `Const = ...` and
+    /// `A::Const = ...`: when `target` (the LHS's resolved module
+    /// target) is declared as a class and `value` is a recognized
+    /// construction call with a block, walk the block as the body of
+    /// `class_name` and return `true`. Otherwise walk nothing and
+    /// return `false`, leaving the caller on its default route.
+    fn try_walk_class_construction(
+        &mut self,
+        value: &Node<'_>,
+        target: TypeName,
+        class_name: TypeName,
+    ) -> bool {
+        if self.env.declared_kind_by_type_name(&target) != Some(DeclKindLocal::Class) {
+            return false;
+        }
+        let Some(unwrapped) = unwrap_single_cast_call(value) else {
+            return false;
+        };
+        if !(is_class_new_named_lhs_pattern(&unwrapped.call)
+            || is_data_struct_named_lhs_pattern(&unwrapped.call))
+        {
+            return false;
+        }
+        // The default walker's cast-form path (`visit_local_variable_write_node`)
+        // resolves the trailing `#: T` on the inner `_ =` line via
+        // `lookup_trailing_assertion`. Returning from the fast path
+        // bypasses that walker, so surface the same assertion side
+        // effects (`UnknownTypeName` / `AnnotationSyntaxError`) here.
+        // The outer `ConstantWriteNode` / `ConstantPathWriteNode` is
+        // excluded from `is_statement_assertion_eligible`, so no other
+        // site would.
+        if let Some(cast) = &unwrapped.cast {
+            self.lookup_trailing_assertion(
+                cast.location().start() as usize,
+                cast.location().end() as usize,
+            );
+        }
+        self.walk_class_construction_block_body(&unwrapped.call, class_name);
+        true
+    }
+
+    /// Walk the body of a `Const = <ctor>(<args?>) do ... end` (or
+    /// `A::Const = ...`) class construction (`Class.new`, `Struct.new`,
+    /// or `Data.define`) as the body of `class_name`. The dispatch site
+    /// has already confirmed the call shape and that the LHS is declared
+    /// as a class.
     ///
     /// Arguments are walked first (in the outer lexical scope) so a
     /// missing parent constant / member symbol still emits its usual
@@ -1550,14 +1591,18 @@ impl<'env> TypeChecker<'env> {
     /// enclosing scope and `INNER` reads resolve from there (rbs's
     /// `InlineParser` drops such writes entirely; Steep with sig-only
     /// resolves them at the outer scope as well).
-    fn walk_class_construction_block_body<'pr>(&mut self, call: &CallNode<'pr>, lhs_name: &str) {
+    fn walk_class_construction_block_body<'pr>(
+        &mut self,
+        call: &CallNode<'pr>,
+        class_name: TypeName,
+    ) {
         if let Some(args) = call.arguments() {
             for arg in args.arguments().iter() {
                 self.check_node(&arg, None);
             }
         }
 
-        self.ctx.push_class_outside_cref(lhs_name, self.env.names());
+        self.ctx.push_class_outside_cref(class_name);
         let saved_singleton_class_depth = self.ctx.replace_singleton_class_depth(0);
 
         if let Some(block_arg) = call.block()
@@ -2535,27 +2580,11 @@ impl<'env> TypeChecker<'env> {
         if let Some(target) = resolved.as_ref().and_then(|rc| match &rc.origin {
             ConstantOrigin::Module { target } => Some(*target),
             ConstantOrigin::Constant => None,
-        }) && self.env.declared_kind_by_type_name(&target) == Some(DeclKindLocal::Class)
-            && let Some(unwrapped) = unwrap_single_cast_call(&node.value())
-            && (is_class_new_named_lhs_pattern(&unwrapped.call)
-                || is_data_struct_named_lhs_pattern(&unwrapped.call))
-        {
-            // The default walker's cast-form path (`visit_local_variable_write_node`
-            // line 400-421) resolves the trailing `#: T` on the inner
-            // `_ =` line via `lookup_trailing_assertion`. Returning
-            // from the fast path bypasses that walker, so surface the
-            // same assertion side effects (`UnknownTypeName` /
-            // `AnnotationSyntaxError`) here. The outer
-            // `ConstantWriteNode` is excluded from
-            // `is_statement_assertion_eligible`, so no other site would.
-            if let Some(cast) = &unwrapped.cast {
-                self.lookup_trailing_assertion(
-                    cast.location().start() as usize,
-                    cast.location().end() as usize,
-                );
+        }) {
+            let class_name = self.ctx.qualified_class_name(&name_str, self.env.names());
+            if self.try_walk_class_construction(&node.value(), target, class_name) {
+                return Ty::UNTYPED;
             }
-            self.walk_class_construction_block_body(&unwrapped.call, &name_str);
-            return Ty::UNTYPED;
         }
 
         let name_loc = node.name_loc();
@@ -2663,15 +2692,26 @@ impl<'env> TypeChecker<'env> {
                 kind: ConstantPathOutcomeKind::Resolved(declared, Some(leaf)),
                 ..
             } = &outcome
-                && matches!(leaf.origin, ConstantOrigin::Constant)
             {
-                let target_loc = target.location();
-                return self.check_constant_write_value(
-                    &node.value(),
-                    leaf.name,
-                    *declared,
-                    (target_loc.start() as usize, target_loc.end() as usize),
-                );
+                match leaf.origin {
+                    ConstantOrigin::Constant => {
+                        let target_loc = target.location();
+                        return self.check_constant_write_value(
+                            &node.value(),
+                            leaf.name,
+                            *declared,
+                            (target_loc.start() as usize, target_loc.end() as usize),
+                        );
+                    }
+                    // The path is already resolved, so its module target
+                    // is the class itself — no cref qualification as in
+                    // the bare write (`::A::B` and `Inner::X` alike).
+                    ConstantOrigin::Module { target } => {
+                        if self.try_walk_class_construction(&node.value(), target, target) {
+                            return Ty::UNTYPED;
+                        }
+                    }
+                }
             }
             let declared_ty = outcome.resolved_ty();
             let hint = (!declared_ty.is_untyped()).then_some(declared_ty);
@@ -3012,14 +3052,13 @@ impl<'env> TypeChecker<'env> {
                         w.value(),
                         w.location().start() as usize,
                     )
-                } else if let Some(w) = node.as_instance_variable_and_write_node() {
+                } else {
+                    let w = node.as_instance_variable_and_write_node()?;
                     (
                         w.name().as_slice().to_vec(),
                         w.value(),
                         w.location().start() as usize,
                     )
-                } else {
-                    return None;
                 };
             let array = value.as_array_node()?;
             Some(CompoundIvarWriteLiteral {

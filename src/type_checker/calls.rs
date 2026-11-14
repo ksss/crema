@@ -639,8 +639,10 @@ impl<'env> TypeChecker<'env> {
         cached: Option<Ty>,
     ) -> Ty {
         self.push_call_frame(node, resolved);
-        self.check_call_in_frame(node, hint, resolved);
-        let ty = cached.unwrap_or_else(|| self.infer_call_return_type(node, hint, resolved));
+        let literal = self.check_call_in_frame(node, hint, resolved);
+        let ty = literal
+            .or(cached)
+            .unwrap_or_else(|| self.infer_call_return_type(node, hint, resolved));
         self.call_frames.borrow_mut().pop();
         ty
     }
@@ -657,12 +659,16 @@ impl<'env> TypeChecker<'env> {
         });
     }
 
+    /// Returns the call's type when the walk itself produced it — a
+    /// `Kernel#lambda` block typed as a lambda literal, whose return comes
+    /// from the body's walked value (`check_lambda_source`) — else `None`
+    /// and the read-only `infer_call_return_type` decides.
     fn check_call_in_frame<'pr>(
         &mut self,
         node: &CallNode<'pr>,
         hint: Option<Ty>,
         resolved: &ResolvedCall,
-    ) {
+    ) -> Option<Ty> {
         let target = resolved.target.as_ref();
 
         // Extract-mode `error` attribution: the call's own diagnostics
@@ -728,6 +734,21 @@ impl<'env> TypeChecker<'env> {
         self.extract_carry_armed.set(carry_prev);
         let mut errored = track_error && self.diagnostics_len() > before;
 
+        // `lambda { |x| ... }`: the block is the lambda literal, not a
+        // block passed to `Kernel#lambda` (Steep `type_lambda` dispatch,
+        // type_construction.rb:3688). No block scope / block-type check
+        // against the signature — the literal walk binds its own params.
+        if let Some(source) = self.kernel_lambda_block(node, target) {
+            let ty = self.check_lambda_source(&source, self.kernel_lambda_hint(hint));
+            if track_error && errored {
+                self.extract_flag_call_state(
+                    (node.location().start(), node.location().end()),
+                    super::ExtractCallState::Error,
+                );
+            }
+            return Some(ty);
+        }
+
         let site = CallSite::Call(node);
         let before_block = if track_error {
             self.diagnostics_len()
@@ -763,6 +784,7 @@ impl<'env> TypeChecker<'env> {
         if block_scope_pushed {
             self.ctx.pop_scope();
         }
+        None
     }
 
     /// Walk a call's block (inside the block scope `setup_block_scope`
@@ -6511,13 +6533,9 @@ impl<'env> TypeChecker<'env> {
         let mut first_failure: Option<(ForwardingMismatchKind, MethodType)> = None;
         for callee_mt in method_def.method_types() {
             let callee_mt = substitution.apply_method_type(callee_mt, types_tbl);
-            match self.forwarding_compat(caller_mt, &callee_mt) {
-                None => return None,
-                Some(kind) => {
-                    if first_failure.is_none() {
-                        first_failure = Some((kind, callee_mt));
-                    }
-                }
+            let kind = self.forwarding_compat(caller_mt, &callee_mt)?;
+            if first_failure.is_none() {
+                first_failure = Some((kind, callee_mt));
             }
         }
         first_failure

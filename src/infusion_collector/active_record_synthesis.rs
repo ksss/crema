@@ -89,6 +89,7 @@ const ENUMERABLE: &str = "::Enumerable";
 #[allow(clippy::too_many_arguments)] // cold-pass globals, same shape as synthesize_model below
 pub(crate) fn synthesize(
     draft: &mut EnvironmentDraft,
+    models: &[TypeName],
     associations: &[ActiveRecordAssociation],
     scopes: &[ActiveRecordScope],
     enum_mappings: &[ActiveRecordEnumMapping],
@@ -96,7 +97,6 @@ pub(crate) fn synthesize(
     batch_files: &FxHashSet<Name>,
     expansion_contributions: &FxHashSet<(TypeName, Name)>,
 ) {
-    let models = active_record_model_names(draft);
     if models.is_empty() {
         return;
     }
@@ -105,7 +105,7 @@ pub(crate) fn synthesize(
     let model_names = models.iter().copied().collect::<FxHashSet<_>>();
     let nested_class_methods = collect_nested_class_methods(draft, &model_names);
     let context = Arc::from([draft.names().absolute_root()]);
-    for model in models {
+    for &model in models {
         let owner = model_owner(draft, model, batch_files, expansion_contributions);
         synthesize_model(
             draft,
@@ -170,11 +170,19 @@ pub(crate) fn active_record_model_names(draft: &EnvironmentDraft) -> Vec<TypeNam
 /// different root.
 pub(crate) fn descendant_class_names(draft: &EnvironmentDraft, base: &str) -> Vec<TypeName> {
     let names = draft.names();
-    let base = names.parse_type_name(base);
+    let bases = FxHashSet::from_iter([names.parse_type_name(base)]);
+    let mut candidates: Vec<TypeName> = descendants_of(draft, &bases).into_iter().collect();
+    candidates.sort_by_key(|name| names.display_type_name(*name));
+    candidates
+}
+
+/// Every resolved `(class, superclass)` edge of the draft (A layer) and
+/// the G snapshot.
+pub(crate) fn resolved_super_edges(draft: &EnvironmentDraft) -> Vec<(TypeName, TypeName)> {
+    let names = draft.names();
     let all_names = collect_declared_class_module_names(draft);
     let aliases = FxHashMap::default();
     let resolver = TypeNameResolver::new(&all_names, &aliases, names);
-    let mut candidates = Vec::new();
     let mut supers = Vec::new();
 
     // Warm walks the live A draft with a merged A ∪ G resolver, so a
@@ -213,12 +221,21 @@ pub(crate) fn descendant_class_names(draft: &EnvironmentDraft, base: &str) -> Ve
             supers.push((edge.class, resolved));
         }
     }
+    supers
+}
 
+/// Every class in the draft (A layer) or the G snapshot whose super
+/// chain reaches one of `bases`, the bases themselves excluded.
+pub(crate) fn descendants_of(
+    draft: &EnvironmentDraft,
+    bases: &FxHashSet<TypeName>,
+) -> FxHashSet<TypeName> {
+    let supers = resolved_super_edges(draft);
     let mut models = FxHashSet::default();
     loop {
         let before = models.len();
         for (name, super_name) in &supers {
-            if *super_name == base || models.contains(super_name) {
+            if bases.contains(super_name) || models.contains(super_name) {
                 models.insert(*name);
             }
         }
@@ -226,10 +243,7 @@ pub(crate) fn descendant_class_names(draft: &EnvironmentDraft, base: &str) -> Ve
             break;
         }
     }
-
-    candidates.extend(models);
-    candidates.sort_by_key(|name| names.display_type_name(*name));
-    candidates
+    models
 }
 
 pub(crate) fn collect_declared_class_module_names(draft: &EnvironmentDraft) -> FxHashSet<TypeName> {
@@ -1208,7 +1222,7 @@ pub(crate) fn include_member(name: TypeName, args: Vec<AstType>) -> ClassMember 
     }))
 }
 
-fn method_with_type(name: Symbol, kind: MethodKind, method_type: MethodType) -> Member {
+pub(crate) fn method_with_type(name: Symbol, kind: MethodKind, method_type: MethodType) -> Member {
     Member::MethodDefinition(MethodDefinition {
         name,
         kind,
@@ -1286,7 +1300,7 @@ pub(crate) fn class_instance(name: TypeName) -> AstType {
     })
 }
 
-fn untyped_type() -> AstType {
+pub(crate) fn untyped_type() -> AstType {
     AstType::Base(BaseType {
         kind: BaseTypeKind::Any { todo: false },
         location: None,

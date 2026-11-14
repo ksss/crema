@@ -405,6 +405,10 @@ fn class_or_module_declared_in(
 ///   mixin's args (`include Gen[Integer]` against `module Gen[T] : _E[T]`
 ///   gives `::_E[::Integer]`).
 ///
+/// A self type that only an infusion provider declared
+/// (`OneAncestors::assumed_self_types`) is not a `sup`: Steep has no
+/// counterpart, since nothing in rbs synthesizes self types.
+///
 /// Only the user's own classes and modules are walked (`decls`, see
 /// [`user_decls`]): a library sig is not re-validated on every run. A
 /// library class the user reopens is walked with its library mixins too;
@@ -530,6 +534,9 @@ fn check_mixin_constraints(
             .collect();
         let subst = Substitution::from_mapping(mapping);
         for self_type in &mixin_one.self_types {
+            if mixin_one.assumed_self_types.contains(&self_type.name) {
+                continue;
+            }
             let sup = subst.apply(mixin_ref_type(self_type, names, types), types);
             if satisfied.contains(&sup) {
                 continue;

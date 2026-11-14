@@ -9,6 +9,7 @@ use ruby_prism::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast::MethodKind;
+use crate::ast::members::Visibility;
 use crate::ast::ruby::declarations::{ClassDecl, Declaration, ModuleDecl};
 use crate::ast::ruby::members::{
     AttrAccessorMember, AttrReaderMember, AttrWriterMember, AttributeMember, AttributeNameNode,
@@ -23,10 +24,13 @@ use crate::environment::frozen::ConcernBlockTargets;
 use crate::environment::resolution::TypeNameResolver;
 
 use crate::environment::ruby_decl::build_annotation_syntax_error;
+use crate::infusion_collector::action_dispatch;
 use crate::infusion_collector::active_record_synthesis::collect_declared_class_module_names;
+use crate::infusion_collector::activemodel::ActiveModelAttribute;
 use crate::infusion_collector::activerecord::{
     ActiveRecordAssociation, ActiveRecordEnumMapping, ActiveRecordScope,
 };
+use crate::infusion_collector::dry_initializer::{self, DryInitializerBody, DryInitializerSite};
 use crate::infusion_collector::inflector::{self, Inflector};
 use crate::infusion_collector::sidekiq::resolve_mixin_argument;
 use crate::infusion_collector::{
@@ -106,7 +110,7 @@ pub fn load_all_with_options<'a>(
     options: InfusionOptions,
     inflector: &Inflector,
 ) -> Vec<Diagnostic> {
-    load_all_with_schema(sources, draft, options, inflector, true, None)
+    load_all_with_schema(sources, draft, options, inflector, true, None, None)
 }
 
 /// `load_all_with_options` plus the pre-parsed ActiveRecord schema
@@ -122,6 +126,7 @@ pub fn load_all_with_schema<'a>(
     inflector: &Inflector,
     inline_mode: bool,
     schema: Option<activerecord::PreparsedSchema>,
+    routes: Option<action_dispatch::PreparsedRoutes>,
 ) -> Vec<Diagnostic> {
     let collected = sources
         .iter()
@@ -146,7 +151,7 @@ pub fn load_all_with_schema<'a>(
             ))
         })
         .collect();
-    load_collected(collected, draft, options, inflector, schema)
+    load_collected(collected, draft, options, inflector, schema, routes)
 }
 
 /// The collect half of `load_all_with_schema` for one file: walk the
@@ -189,10 +194,10 @@ pub fn collect_source<'a>(
     let root = parse_result.node();
     collector.visit(&root);
     let mut diagnostics = collector.diagnostics;
-    let table_name_assignments = if options.activerecord {
-        activerecord::collect_table_name_assignments(&root, file, source, &mut diagnostics)
+    let table_name_facts = if options.activerecord {
+        activerecord::collect_table_name_facts(&root, file, source, &mut diagnostics)
     } else {
-        Vec::new()
+        activerecord::TableNameFacts::default()
     };
     CollectedSource {
         source: SourceRef::Bytes(source),
@@ -202,9 +207,12 @@ pub fn collect_source<'a>(
         active_record_scopes: collector.active_record_scopes,
         active_record_enum_mappings: collector.active_record_enum_mappings,
         paranoia_models: collector.paranoia_models,
+        active_model_attributes: collector.active_model_attributes,
+        dry_initializer_sites: collector.dry_initializer_sites,
         concerns: collector.concerns,
         concern_sites: collector.concern_sites,
-        table_name_assignments,
+        url_helpers_sites: collector.url_helpers_sites,
+        table_name_facts,
         diagnostics,
     }
 }
@@ -234,6 +242,7 @@ pub fn load_collected<'a>(
     options: InfusionOptions,
     inflector: &Inflector,
     schema: Option<activerecord::PreparsedSchema>,
+    routes: Option<action_dispatch::PreparsedRoutes>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut collected = collected;
@@ -265,6 +274,22 @@ pub fn load_collected<'a>(
                 &mut diagnostics,
             );
         }
+    }
+
+    // Zeitwerk-style implicit namespace synthesis (see
+    // `crate::infusion_collector::zeitwerk_synthesis`). Rails autovivifies
+    // `Out` before `class Out::In < Out::Base` is evaluated, so it runs
+    // before every pass below that resolves a name (concern sites,
+    // ActiveRecord / ActiveModel descendants, sidekiq, class_methods):
+    // their resolvers require each namespace segment to be declared. The
+    // Ruby-source names it enumerates are all in by now; the later passes
+    // only insert into already-declared Ruby classes or add Signature
+    // declarations, which add no new prefix. Gated on rails-on: standalone
+    // activerecord/activemodel/activesupport must not synthesize
+    // namespaces, since compact `class A::B` outside a Rails app is a
+    // plain-Ruby NameError we intentionally preserve.
+    if options.rails_enabled() {
+        super::zeitwerk_synthesis::synthesize(draft);
     }
 
     let mut concerns = FxHashMap::default();
@@ -334,6 +359,16 @@ pub fn load_collected<'a>(
         .flatten()
         .flat_map(|source| source.paranoia_models.iter().copied())
         .collect::<Vec<_>>();
+    let mut active_model_attributes = collected
+        .iter()
+        .flatten()
+        .flat_map(|source| source.active_model_attributes.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut dry_initializer_sites = collected
+        .iter()
+        .flatten()
+        .flat_map(|source| source.dry_initializer_sites.iter().cloned())
+        .collect::<Vec<_>>();
     // Every site and concern dependency is resolved up front, against
     // the draft as the Ruby decls above left it: the expansion below
     // inserts into the draft, which the resolver borrows. Without a
@@ -390,7 +425,7 @@ pub fn load_collected<'a>(
             let associations = synthetic
                 .body
                 .active_record_associations(draft.names(), options);
-            let scopes = synthetic.body.active_record_scopes(options);
+            let scopes = synthetic.body.active_record_scopes(options, inflector);
             let enum_mappings = synthetic
                 .body
                 .active_record_enum_mappings(options, inflector);
@@ -399,6 +434,20 @@ pub fn load_collected<'a>(
             // yields no members (and thus no decl) but still marks
             // its include target as a paranoia model.
             paranoia_models.extend(synthetic.body.paranoia_model(options));
+            active_model_attributes.extend(synthetic.body.active_model_attributes(options));
+            if !synthetic.body.dry_initializer.is_empty()
+                && matches!(synthetic.body.owner_kind, InfusionOwnerKind::Class)
+            {
+                dry_initializer_sites.push(DryInitializerSite {
+                    target: synthetic.body.owner,
+                    lexical_context: graph
+                        .concerns
+                        .get(&synthetic.concern)
+                        .map_or_else(Vec::new, |concern| concern.lexical_context.clone()),
+                    from_concern: true,
+                    body: synthetic.body.dry_initializer.clone(),
+                });
+            }
             // Also before the bail, for the same reason: the target
             // list must not depend on whether any member came out.
             if let Some(entry) =
@@ -477,6 +526,10 @@ pub fn load_collected<'a>(
     draft.set_concern_block_targets(concern_block_targets);
 
     if options.activerecord {
+        // One A ∪ G super-edge fixpoint per load: the schema emission
+        // below only reopens classes already in this set, so the
+        // association synthesis after it sees the same models.
+        let models = active_record_synthesis::active_record_model_names(draft);
         if let Some(schema) = schema.as_ref() {
             let mut enums_by_attr: FxHashMap<TypeName, FxHashSet<String>> = FxHashMap::default();
             for mapping in &active_record_enum_mappings {
@@ -485,15 +538,16 @@ pub fn load_collected<'a>(
                     .or_default()
                     .insert(mapping.attr_name.clone());
             }
-            let table_names = activerecord::table_name_overrides(
+            let rules = activerecord::table_name_rules(
                 collected
                     .iter()
                     .flatten()
-                    .flat_map(|source| &source.table_name_assignments),
+                    .map(|source| &source.table_name_facts),
             );
             activerecord::emit_schema(
                 schema,
-                &table_names,
+                &models,
+                &rules,
                 draft,
                 inflector,
                 &enums_by_attr,
@@ -511,6 +565,7 @@ pub fn load_collected<'a>(
             .collect();
         active_record_synthesis::synthesize(
             draft,
+            &models,
             &active_record_associations,
             &active_record_scopes,
             &active_record_enum_mappings,
@@ -526,6 +581,23 @@ pub fn load_collected<'a>(
         if options.paranoia {
             super::paranoia::synthesize(draft, &paranoia_models);
         }
+    }
+
+    // After the Concern expansion above, which contributes the
+    // `attribute` calls of `included do` blocks.
+    if options.activemodel {
+        let sites: Vec<activemodel::ActiveModelIncludeSite> = collected
+            .iter()
+            .flatten()
+            .flat_map(|source| source.concern_sites.iter())
+            .filter(|site| matches!(site.kind, ConcernSiteKind::Include))
+            .map(|site| activemodel::ActiveModelIncludeSite {
+                target: site.target,
+                raw_module_name: &site.raw_module_name,
+                lexical_context: &site.lexical_context,
+            })
+            .collect();
+        activemodel::synthesize(draft, &active_model_attributes, &sites);
     }
 
     // sidekiq: class-body `include Sidekiq::Job` sites, matched after
@@ -549,11 +621,17 @@ pub fn load_collected<'a>(
         super::sidekiq::synthesize(draft, &sites);
     }
 
+    // After the Concern expansion above, which contributes the
+    // `extend Dry::Initializer` and `param` / `option` calls of
+    // `included do` blocks.
+    if options.dry_initializer {
+        super::dry_initializer::synthesize(draft, &dry_initializer_sites);
+    }
+
     // `X::ClassMethods` along the include chain of every Ruby
     // `include` / `prepend` site (see `class_methods`). After sidekiq
     // and the strict Concern expansion above, whose `extend`s it
-    // recognizes as already present; before zeitwerk, which only adds
-    // namespaces.
+    // recognizes as already present.
     if options.class_methods {
         let sites: Vec<super::class_methods::ClassMethodsSite> = collected
             .iter()
@@ -580,18 +658,23 @@ pub fn load_collected<'a>(
         }
     }
 
-    // Zeitwerk-style implicit namespace synthesis (see
-    // `crate::infusion_collector::zeitwerk_synthesis`). Runs after every
-    // Ruby-source declaration (top-level + concern expansion +
-    // active-record synth) has been inserted, so proper-prefix
-    // enumeration sees the full draft. Gated on rails-on: standalone
-    // activerecord/activemodel/activesupport must not synthesize
-    // namespaces, since compact `class A::B` outside a Rails app is a
-    // plain-Ruby NameError we intentionally preserve.
+    // Route helper modules and their attachments. After every Ruby-source
+    // declaration and concern expansion is in: the explicit
+    // `include Rails.application.routes.url_helpers` sites reopen user
+    // classes, and the gem-class attachments are gated on those classes
+    // being declared.
     if options.rails_enabled() {
-        super::zeitwerk_synthesis::synthesize(draft);
-        // Reads the Ruby `def`s of every `ActionMailer::Base` descendant,
-        // so it too runs after every Ruby-source declaration is in.
+        let sites: Vec<action_dispatch::UrlHelpersSite> = collected
+            .iter()
+            .flatten()
+            .flat_map(|source| source.url_helpers_sites.iter().cloned())
+            .collect();
+        action_dispatch::emit_routes(routes.as_ref(), &sites, draft);
+    }
+
+    // Reads the Ruby `def`s of every `ActionMailer::Base` descendant, so
+    // it runs after every Ruby-source declaration is in.
+    if options.rails_enabled() {
         super::action_mailer::synthesize(draft);
     }
 
@@ -605,6 +688,7 @@ fn activesupport_options() -> InfusionOptions {
         activerecord: false,
         paranoia: false,
         sidekiq: false,
+        dry_initializer: false,
         class_methods: false,
     }
 }
@@ -626,11 +710,17 @@ pub struct CollectedSource<'a> {
     active_record_scopes: Vec<ActiveRecordScope>,
     active_record_enum_mappings: Vec<ActiveRecordEnumMapping>,
     paranoia_models: Vec<TypeName>,
+    active_model_attributes: Vec<ActiveModelAttribute>,
+    /// Empty unless the dry_initializer provider is on.
+    dry_initializer_sites: Vec<DryInitializerSite>,
     concerns: Vec<ConcernDef>,
     concern_sites: Vec<ConcernSite>,
-    /// `self.table_name =` assignments as `(absolute model path, table)`
-    /// in source order; empty unless the activerecord provider is on.
-    table_name_assignments: Vec<(String, String)>,
+    /// Class-body `include` / `extend Rails.application.routes.url_helpers`
+    /// sites; empty unless the rails preset is on.
+    url_helpers_sites: Vec<action_dispatch::UrlHelpersSite>,
+    /// `self.table_name =` / `table_name_prefix` / `table_name_suffix`
+    /// facts in source order; empty unless the activerecord provider is on.
+    table_name_facts: activerecord::TableNameFacts,
     /// Collection-time diagnostics, drained by `load_collected` in
     /// file order before any insert-time diagnostic is pushed.
     diagnostics: Vec<Diagnostic>,
@@ -655,9 +745,12 @@ struct Collector<'a> {
     active_record_scopes: Vec<ActiveRecordScope>,
     active_record_enum_mappings: Vec<ActiveRecordEnumMapping>,
     paranoia_models: Vec<TypeName>,
+    active_model_attributes: Vec<ActiveModelAttribute>,
+    dry_initializer_sites: Vec<DryInitializerSite>,
     diagnostics: Vec<Diagnostic>,
     concerns: Vec<ConcernDef>,
     concern_sites: Vec<ConcernSite>,
+    url_helpers_sites: Vec<action_dispatch::UrlHelpersSite>,
 }
 
 struct ScopeFrame {
@@ -679,6 +772,8 @@ struct InfusionBody {
     calls: Vec<InfusionCall>,
     members: Vec<Member>,
     origin: InfusionBodyOrigin,
+    /// Empty unless the dry_initializer provider is on.
+    dry_initializer: DryInitializerBody,
 }
 
 impl InfusionBody {
@@ -696,7 +791,11 @@ impl InfusionBody {
             .collect()
     }
 
-    fn active_record_scopes(&self, options: InfusionOptions) -> Vec<ActiveRecordScope> {
+    fn active_record_scopes(
+        &self,
+        options: InfusionOptions,
+        inflector: &Inflector,
+    ) -> Vec<ActiveRecordScope> {
         if !options.activerecord || !matches!(self.owner_kind, InfusionOwnerKind::Class) {
             return Vec::new();
         }
@@ -711,6 +810,9 @@ impl InfusionBody {
                 activerecord::scope_from_call(self.owner, call)
                     .into_iter()
                     .chain(activerecord::enum_scopes_from_call(self.owner, call))
+                    .chain(activerecord::delegated_type_scopes_from_call(
+                        self.owner, call, inflector,
+                    ))
             })
             .collect()
     }
@@ -726,6 +828,16 @@ impl InfusionBody {
         self.calls
             .iter()
             .filter_map(|call| activerecord::enum_mapping_from_call(self.owner, call, inflector))
+            .collect()
+    }
+
+    fn active_model_attributes(&self, options: InfusionOptions) -> Vec<ActiveModelAttribute> {
+        if !options.activemodel || !matches!(self.owner_kind, InfusionOwnerKind::Class) {
+            return Vec::new();
+        }
+        self.calls
+            .iter()
+            .filter_map(|call| activemodel::attribute_from_call(self.owner, call))
             .collect()
     }
 
@@ -774,6 +886,12 @@ pub(crate) struct InfusionCall {
     pub(crate) enum_values: Vec<InfusionEnumValue>,
     pub(crate) keyword_bools: Vec<InfusionKeywordBool>,
     pub(crate) keyword_strings: Vec<InfusionKeywordString>,
+    /// Keywords whose value is an array literal of string / symbol
+    /// literals (`types: %w[Message Comment]`). A keyword whose array
+    /// has any other element shape is absent here, so consumers cannot
+    /// tell "non-literal" from "not given" — both mean "not
+    /// deterministic, do not synthesize".
+    pub(crate) keyword_string_lists: Vec<InfusionKeywordStringList>,
     /// `scope` calls only: the body lambda's parameter structure when the
     /// body is a `->` literal, `None` for non-literal bodies (constant,
     /// method call, `lambda { }`) — those fall back to `(?)`. Mirrors
@@ -834,6 +952,12 @@ pub(crate) struct InfusionKeywordBool {
 pub(crate) struct InfusionKeywordString {
     pub(crate) name: String,
     pub(crate) value: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InfusionKeywordStringList {
+    pub(crate) name: String,
+    pub(crate) values: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1311,6 +1435,7 @@ impl<'pr, 'a> Visit<'pr> for ClassMethodsCollector<'a> {
         self.members.push(Member::Def(DefMember {
             visibility: None,
             ivar_param_pairs: Vec::new(),
+            initialize_params: None,
             name: String::from_utf8_lossy(node.name().as_slice()).to_string(),
             kind,
             location: prism_location_range(node.location()),
@@ -1450,9 +1575,12 @@ impl<'a> Collector<'a> {
             active_record_scopes: vec![],
             active_record_enum_mappings: vec![],
             paranoia_models: vec![],
+            active_model_attributes: vec![],
+            dry_initializer_sites: vec![],
             diagnostics: vec![],
             concerns: vec![],
             concern_sites: vec![],
+            url_helpers_sites: vec![],
         }
     }
 
@@ -1482,11 +1610,13 @@ impl<'a> Collector<'a> {
         self.active_record_associations
             .extend(body.active_record_associations(self.names, self.options));
         self.active_record_scopes
-            .extend(body.active_record_scopes(self.options));
+            .extend(body.active_record_scopes(self.options, self.inflector));
         self.active_record_enum_mappings
             .extend(body.active_record_enum_mappings(self.options, self.inflector));
         self.paranoia_models
             .extend(body.paranoia_model(self.options));
+        self.active_model_attributes
+            .extend(body.active_model_attributes(self.options));
     }
 
     fn current_class_typename(&self) -> Option<TypeName> {
@@ -1547,6 +1677,9 @@ impl<'a> Collector<'a> {
         if self.collect_synthetic_attr_call(node) {
             return true;
         }
+        if self.collect_dry_initializer_call(node) {
+            return true;
+        }
         let Some(frame) = self.current_frame_mut() else {
             return self.is_supported_dsl_call(node);
         };
@@ -1563,13 +1696,16 @@ impl<'a> Collector<'a> {
                 | "cattr_accessor"
                 | "mattr_accessor"
                 | "class_attribute"
+                | "delegate"
                 | "has_secure_password"
+                | "attribute"
                 | "belongs_to"
                 | "has_one"
                 | "has_many"
                 | "enum"
                 | "scope"
                 | "acts_as_paranoid"
+                | "delegated_type"
         ) {
             return false;
         }
@@ -1577,6 +1713,7 @@ impl<'a> Collector<'a> {
         let mut enum_values = Vec::new();
         let mut keyword_bools = Vec::new();
         let mut keyword_strings = Vec::new();
+        let mut keyword_string_lists = Vec::new();
         let mut scope_lambda_params = None;
         if let Some(arguments) = node.arguments() {
             let args = arguments.arguments();
@@ -1620,6 +1757,34 @@ impl<'a> Collector<'a> {
                     enum_values,
                     keyword_bools,
                     keyword_strings,
+                    keyword_string_lists: std::mem::take(&mut keyword_string_lists),
+                    scope_lambda_params: scope_lambda_params.take(),
+                    location: prism_location_range(node.location()),
+                });
+                return true;
+            }
+            if name == "attribute" {
+                let mut iter = args.iter();
+                let Some(name_arg) = iter.next().and_then(|arg| arg.as_symbol_node()) else {
+                    return true;
+                };
+                symbol_args.push(InfusionSymbolArg {
+                    name: String::from_utf8_lossy(name_arg.unescaped()).to_string(),
+                    location: prism_location_range(name_arg.location()),
+                });
+                if let Some(cast_type) = iter.next().and_then(|arg| arg.as_symbol_node()) {
+                    symbol_args.push(InfusionSymbolArg {
+                        name: String::from_utf8_lossy(cast_type.unescaped()).to_string(),
+                        location: prism_location_range(cast_type.location()),
+                    });
+                }
+                frame.body.calls.push(InfusionCall {
+                    name: name.to_string(),
+                    symbol_args,
+                    enum_values,
+                    keyword_bools,
+                    keyword_strings,
+                    keyword_string_lists: std::mem::take(&mut keyword_string_lists),
                     scope_lambda_params: scope_lambda_params.take(),
                     location: prism_location_range(node.location()),
                 });
@@ -1652,6 +1817,7 @@ impl<'a> Collector<'a> {
                     enum_values,
                     keyword_bools,
                     keyword_strings,
+                    keyword_string_lists: std::mem::take(&mut keyword_string_lists),
                     scope_lambda_params: scope_lambda_params.take(),
                     location: prism_location_range(node.location()),
                 });
@@ -1667,6 +1833,7 @@ impl<'a> Collector<'a> {
                 }
                 collect_keyword_bools(&arg, &mut keyword_bools);
                 collect_keyword_strings(&arg, &mut keyword_strings);
+                collect_keyword_string_lists(&arg, &mut keyword_string_lists);
             }
         }
         frame.body.calls.push(InfusionCall {
@@ -1675,10 +1842,68 @@ impl<'a> Collector<'a> {
             enum_values,
             keyword_bools,
             keyword_strings,
+            keyword_string_lists,
             scope_lambda_params: scope_lambda_params.take(),
             location: prism_location_range(node.location()),
         });
         true
+    }
+
+    /// A receiver-less `param` / `option` in a class or Concern block
+    /// body. Kept apart from `InfusionBody::calls` so that the Rails
+    /// rules never see these two very common names. Claims the call
+    /// only when it has a block: the block declares a nested struct's
+    /// options, which belong to another class and must not be read as
+    /// this one's.
+    fn collect_dry_initializer_call(&mut self, node: &CallNode<'_>) -> bool {
+        if !self.options.dry_initializer || node.receiver().is_some() {
+            return false;
+        }
+        let option = match node.name().as_slice() {
+            b"param" => false,
+            b"option" => true,
+            _ => return false,
+        };
+        let Some(frame) = self.current_frame_mut() else {
+            return false;
+        };
+        frame
+            .body
+            .dry_initializer
+            .definitions
+            .push(dry_initializer::definition_from_call(node, option));
+        node.block().is_some()
+    }
+
+    fn collect_dry_initializer_extend(&mut self, node: &CallNode<'_>) {
+        if !self.options.dry_initializer {
+            return;
+        }
+        let Some(frame) = self.current_frame_mut() else {
+            return;
+        };
+        frame
+            .body
+            .dry_initializer
+            .extends
+            .extend(dry_initializer::extend_site(node));
+    }
+
+    /// Record a class body's dry-initializer facts. Modules are dropped:
+    /// the gem's `extended` hook raises on one.
+    fn collect_dry_initializer_site(&mut self, body: &mut InfusionBody) {
+        let facts = std::mem::take(&mut body.dry_initializer);
+        if facts.is_empty() || !matches!(body.owner_kind, InfusionOwnerKind::Class) {
+            return;
+        }
+        let mut lexical_context = self.class_stack_context();
+        lexical_context.push(body.owner);
+        self.dry_initializer_sites.push(DryInitializerSite {
+            target: body.owner,
+            lexical_context,
+            from_concern: false,
+            body: facts,
+        });
     }
 
     fn collect_synthetic_attr_call(&mut self, node: &CallNode<'_>) -> bool {
@@ -1752,13 +1977,16 @@ impl<'a> Collector<'a> {
                 | "cattr_accessor"
                 | "mattr_accessor"
                 | "class_attribute"
+                | "delegate"
                 | "has_secure_password"
+                | "attribute"
                 | "belongs_to"
                 | "has_one"
                 | "has_many"
                 | "enum"
                 | "scope"
                 | "acts_as_paranoid"
+                | "delegated_type"
         )
     }
 
@@ -1769,12 +1997,15 @@ impl<'a> Collector<'a> {
         let name = String::from_utf8_lossy(node.name().as_slice());
         match name.as_ref() {
             "extend" => {
+                self.collect_dry_initializer_extend(node);
                 self.collect_extend_concern(node);
                 self.collect_concern_block_mixins(node);
+                self.collect_url_helpers_site(node, true);
             }
             "include" => {
                 self.collect_concern_site(node, ConcernSiteKind::Include);
                 self.collect_concern_block_mixins(node);
+                self.collect_url_helpers_site(node, false);
             }
             "prepend" => {
                 self.collect_concern_site(node, ConcernSiteKind::Prepend);
@@ -1799,6 +2030,7 @@ impl<'a> Collector<'a> {
     /// include target — so they become members of the synthesized body.
     /// The inline parser does not collect them there.
     fn collect_concern_block_mixins(&mut self, node: &CallNode<'_>) {
+        let rails = self.options.rails_enabled();
         let Some(frame) = self.current_frame_mut() else {
             return;
         };
@@ -1806,6 +2038,39 @@ impl<'a> Collector<'a> {
             return;
         }
         frame.body.members.extend(concern_block_mixin_members(node));
+        if rails {
+            frame
+                .body
+                .members
+                .extend(url_helpers_block_mixin_members(node));
+        }
+    }
+
+    /// `include` / `extend Rails.application.routes.url_helpers` written
+    /// directly in a class or module body (not in a Concern block, which
+    /// `collect_concern_block_mixins` turns into body members). Recorded
+    /// as a site; `action_dispatch::emit_routes` reopens the owner with
+    /// the synthesized modules.
+    fn collect_url_helpers_site(&mut self, node: &CallNode<'_>, extend: bool) {
+        if !self.options.rails_enabled() {
+            return;
+        }
+        let Some(supports_path) = action_dispatch::url_helpers_mixin_argument(node) else {
+            return;
+        };
+        let Some(frame) = self.scope_stack.last() else {
+            return;
+        };
+        if frame.body.origin.is_synthetic() {
+            return;
+        }
+        self.url_helpers_sites
+            .push(action_dispatch::UrlHelpersSite {
+                target: frame.body.owner,
+                target_kind: frame.body.owner_kind,
+                extend,
+                supports_path,
+            });
     }
 
     fn collect_extend_concern(&mut self, node: &CallNode<'_>) {
@@ -1886,6 +2151,7 @@ impl<'a> Collector<'a> {
             calls: Vec::new(),
             members: Vec::new(),
             origin: body_kind.origin(),
+            dry_initializer: DryInitializerBody::default(),
         };
         self.scope_stack.push(ScopeFrame {
             body: synthetic_body,
@@ -2013,6 +2279,7 @@ impl<'a> Collector<'a> {
                 calls: Vec::new(),
                 members: Vec::new(),
                 origin: InfusionBodyOrigin::SyntheticConcerningModule,
+                dry_initializer: DryInitializerBody::default(),
             },
             nested_decls: Vec::new(),
             dependencies: Vec::new(),
@@ -2225,11 +2492,10 @@ fn lambda_scope_params(node: &Node<'_>) -> Option<InfusionScopeParams> {
         if let Some(keyword) = param.as_required_keyword_parameter_node() {
             out.required_keywords
                 .push(String::from_utf8_lossy(keyword.name().as_slice()).to_string());
-        } else if let Some(keyword) = param.as_optional_keyword_parameter_node() {
+        } else {
+            let keyword = param.as_optional_keyword_parameter_node()?;
             out.optional_keywords
                 .push(String::from_utf8_lossy(keyword.name().as_slice()).to_string());
-        } else {
-            return None;
         }
     }
     if let Some(keyword_rest) = params.keyword_rest() {
@@ -2255,6 +2521,28 @@ pub(crate) fn push_def(
     push_def_with_source_file(members, name, kind, location, name_location, None);
 }
 
+/// Same as [`push_def`] but with an explicit Ruby-side visibility
+/// marker (`DefMember::visibility` contract: `None` = public). Used by
+/// DSLs whose keyword decides visibility (`delegate ..., private: true`).
+pub(crate) fn push_def_with_visibility(
+    members: &mut Vec<Member>,
+    name: String,
+    kind: MethodKind,
+    location: PrismByteRange,
+    name_location: PrismByteRange,
+    visibility: Option<Visibility>,
+) {
+    push_def_full(
+        members,
+        name,
+        kind,
+        location,
+        name_location,
+        None,
+        visibility,
+    );
+}
+
 fn push_def_with_source_file(
     members: &mut Vec<Member>,
     name: String,
@@ -2263,11 +2551,32 @@ fn push_def_with_source_file(
     name_location: PrismByteRange,
     source_file: Option<Name>,
 ) {
+    push_def_full(
+        members,
+        name,
+        kind,
+        location,
+        name_location,
+        source_file,
+        None,
+    );
+}
+
+fn push_def_full(
+    members: &mut Vec<Member>,
+    name: String,
+    kind: MethodKind,
+    location: PrismByteRange,
+    name_location: PrismByteRange,
+    source_file: Option<Name>,
+    visibility: Option<Visibility>,
+) {
     Collector::push_member(
         members,
         Member::Def(DefMember {
-            visibility: None,
+            visibility,
             ivar_param_pairs: Vec::new(),
+            initialize_params: None,
             name,
             kind,
             location,
@@ -2390,6 +2699,42 @@ fn collect_keyword_strings(node: &Node<'_>, out: &mut Vec<InfusionKeywordString>
     }
 }
 
+fn collect_keyword_string_lists(node: &Node<'_>, out: &mut Vec<InfusionKeywordStringList>) {
+    let Some(kw_hash) = node.as_keyword_hash_node() else {
+        return;
+    };
+    for elem in kw_hash.elements().iter() {
+        let Some(assoc) = elem.as_assoc_node() else {
+            continue;
+        };
+        let Some(sym) = assoc.key().as_symbol_node() else {
+            continue;
+        };
+        let Some(array) = assoc.value().as_array_node() else {
+            continue;
+        };
+        let values: Option<Vec<String>> = array
+            .elements()
+            .iter()
+            .map(|elem| {
+                if let Some(sym) = elem.as_symbol_node() {
+                    Some(String::from_utf8_lossy(sym.unescaped()).to_string())
+                } else {
+                    elem.as_string_node()
+                        .map(|string| String::from_utf8_lossy(string.unescaped()).to_string())
+                }
+            })
+            .collect();
+        let Some(values) = values else {
+            continue;
+        };
+        out.push(InfusionKeywordStringList {
+            name: String::from_utf8_lossy(sym.unescaped()).to_string(),
+            values,
+        });
+    }
+}
+
 fn collect_enum_values(node: &Node<'_>, out: &mut Vec<InfusionEnumValue>) {
     if let Some(array) = node.as_array_node() {
         // Rails assigns array labels their index (`each_with_index`), so
@@ -2479,6 +2824,7 @@ impl InfusionBody {
             calls: self.calls.clone(),
             members: self.members.clone(),
             origin,
+            dry_initializer: self.dry_initializer.clone(),
         }
     }
 }
@@ -2526,7 +2872,48 @@ fn concern_block_mixin_members(node: &CallNode<'_>) -> Vec<Member> {
     members
 }
 
-fn constant_node_to_string(node: &Node<'_>) -> Option<String> {
+/// `include` / `extend Rails.application.routes.url_helpers` inside a
+/// Concern block, as members naming the synthesized helper modules.
+fn url_helpers_block_mixin_members(node: &CallNode<'_>) -> Vec<Member> {
+    if node.receiver().is_some() {
+        return Vec::new();
+    }
+    let kind = node.name().as_slice();
+    if !matches!(kind, b"include" | b"extend") {
+        return Vec::new();
+    }
+    let Some(supports_path) = action_dispatch::url_helpers_mixin_argument(node) else {
+        return Vec::new();
+    };
+    let Some(arguments) = node.arguments() else {
+        return Vec::new();
+    };
+    let Some(arg) = arguments.arguments().iter().next() else {
+        return Vec::new();
+    };
+    let mut modules = vec![action_dispatch::URL_HELPERS_MODULE];
+    if supports_path {
+        modules.push(action_dispatch::PATH_HELPERS_MODULE);
+    }
+    modules
+        .into_iter()
+        .map(|module_name| {
+            let mixin = MixinMember {
+                module_name: module_name.to_string(),
+                location: prism_location_range(node.location()),
+                name_location: prism_location_range(arg.location()),
+                annotation: None,
+            };
+            if kind == b"extend" {
+                Member::Extend(ExtendMember { mixin })
+            } else {
+                Member::Include(IncludeMember { mixin })
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn constant_node_to_string(node: &Node<'_>) -> Option<String> {
     if let Some(constant) = node.as_constant_read_node() {
         Some(String::from_utf8_lossy(constant.name().as_slice()).to_string())
     } else {
@@ -2575,6 +2962,7 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
                 calls: Vec::new(),
                 members: Vec::new(),
                 origin: InfusionBodyOrigin::Real,
+                dry_initializer: DryInitializerBody::default(),
             },
             nested_decls: Vec::new(),
             dependencies: Vec::new(),
@@ -2585,8 +2973,9 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
             class_methods: None,
         });
         ruby_prism::visit_class_node(self, node);
-        let frame = self.scope_stack.pop().unwrap();
+        let mut frame = self.scope_stack.pop().unwrap();
         self.class_stack.pop();
+        self.collect_dry_initializer_site(&mut frame.body);
         if frame.extends_concern {
             let class_methods_module = frame.class_methods_module.or_else(|| {
                 self.find_existing_class_methods_module(frame.body.owner, &frame.nested_decls)
@@ -2640,6 +3029,7 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
                 calls: Vec::new(),
                 members: Vec::new(),
                 origin: InfusionBodyOrigin::Real,
+                dry_initializer: DryInitializerBody::default(),
             },
             nested_decls: Vec::new(),
             dependencies: Vec::new(),
@@ -2650,8 +3040,9 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
             class_methods: None,
         });
         ruby_prism::visit_module_node(self, node);
-        let frame = self.scope_stack.pop().unwrap();
+        let mut frame = self.scope_stack.pop().unwrap();
         self.class_stack.pop();
+        self.collect_dry_initializer_site(&mut frame.body);
         if frame.extends_concern {
             let class_methods_module = frame.class_methods_module.or_else(|| {
                 self.find_existing_class_methods_module(frame.body.owner, &frame.nested_decls)
@@ -2703,6 +3094,13 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
 
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         let source_file = self.source_file;
+        if self.options.dry_initializer
+            && node.receiver().is_none()
+            && node.name().as_slice() == b"initialize"
+            && let Some(frame) = self.scope_stack.last_mut()
+        {
+            frame.body.dry_initializer.defines_initialize = true;
+        }
         if !self
             .scope_stack
             .last()
@@ -2734,6 +3132,7 @@ impl<'pr, 'a> Visit<'pr> for Collector<'a> {
             Member::Def(DefMember {
                 visibility: None,
                 ivar_param_pairs: Vec::new(),
+                initialize_params: None,
                 name: String::from_utf8_lossy(node.name().as_slice()).to_string(),
                 kind,
                 location: prism_location_range(node.location()),
@@ -2772,11 +3171,13 @@ mod tests {
                 enum_values: Vec::new(),
                 keyword_bools: Vec::new(),
                 keyword_strings: Vec::new(),
+                keyword_string_lists: Vec::new(),
                 scope_lambda_params: None,
                 location: (0, 0),
             }],
             members: Vec::new(),
             origin,
+            dry_initializer: DryInitializerBody::default(),
         }
     }
 
@@ -2806,6 +3207,7 @@ mod tests {
             members: vec![Member::Def(DefMember {
                 visibility: None,
                 ivar_param_pairs: Vec::new(),
+                initialize_params: None,
                 name: method.to_string(),
                 kind: MethodKind::Instance,
                 location: (0, 0),
@@ -3239,6 +3641,7 @@ end
             activerecord: true,
             paranoia: false,
             sidekiq: false,
+            dry_initializer: false,
             class_methods: false,
         }
     }

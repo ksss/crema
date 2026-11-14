@@ -2574,6 +2574,7 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         || resolved.infusion.activemodel
         || resolved.infusion.activerecord
         || resolved.infusion.sidekiq
+        || resolved.infusion.dry_initializer
         || resolved.infusion.class_methods
         || resolved.config_infusion.is_some()
         || resolved.active_decorator_infusion.is_some();
@@ -3232,8 +3233,9 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         }
         let schema = if resolved.infusion.activerecord {
             // The schema dumps parse independently of the Ruby sources
-            // (their `self.table_name =` overrides were collected per file
-            // on the ingest workers); load_collected emits the schema
+            // (the table-name facts — `self.table_name =` overrides and the
+            // `table_name_prefix` / `_suffix` hooks — were collected per
+            // file on the ingest workers); load_collected emits the schema
             // declarations once the post-concern-expansion enum set is
             // known.
             let (schema, schema_diags) =
@@ -3243,13 +3245,34 @@ fn run_check(cli_config: Option<&Path>, no_bundler: bool, args: CheckInvocation,
         } else {
             None
         };
+        let routes = if resolved.infusion.rails_enabled() {
+            // `config/routes.rb` (+ `draw`n files) parses independently of
+            // the Ruby sources; the helper modules are emitted by
+            // load_collected once every user class is in the draft.
+            let (routes, routes_diags) = crema::infusion_collector::action_dispatch::prepare_routes(
+                &project_root,
+                &inflector_owner,
+            );
+            env_diags.extend(routes_diags);
+            Some(routes)
+        } else {
+            None
+        };
         env_diags.extend(crema::infusion_collector::load_collected(
             infusion_collected,
             &mut draft,
             resolved.infusion,
             &inflector_owner,
             schema,
+            routes,
         ));
+        // Helper modules under app/helpers include the route helper
+        // modules load_collected has just declared.
+        crema::infusion_collector::action_view::synthesize(
+            &mut draft,
+            &project_root,
+            resolved.infusion,
+        );
         // Last: decorator modules take their self-type from a
         // model that may be declared in any other file, so every
         // Ruby-source declaration has to be in the draft first.

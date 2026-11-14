@@ -448,7 +448,7 @@ fn build_doc_style_method_type(
         .iter()
         .map(&resolve_entry)
         .collect();
-    func.rest_positional = doc.rest_positionals.as_ref().map(&resolve_splat_rest);
+    func.rest_positional = doc.rest_positionals.as_ref().map(resolve_splat_rest);
     func.trailing_positionals = doc
         .trailing_positionals
         .iter()
@@ -464,7 +464,7 @@ fn build_doc_style_method_type(
         .iter()
         .map(|(n, e)| (n.clone(), resolve_entry(e)))
         .collect();
-    func.rest_keyword = doc.rest_keywords.as_ref().map(&resolve_double_splat_rest);
+    func.rest_keyword = doc.rest_keywords.as_ref().map(resolve_double_splat_rest);
 
     MethodType {
         type_params: vec![],

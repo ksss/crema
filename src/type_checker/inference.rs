@@ -1940,8 +1940,7 @@ impl<'env> TypeChecker<'env> {
                 &predicate_less_condition_narrow,
             ) {
                 (Some((s, _)), Some(target), _) => {
-                    let truthy_ty =
-                        crate::narrowing::narrow(iter_falsy_ty.unwrap(), target, self.env);
+                    let truthy_ty = self.narrow(iter_falsy_ty.unwrap(), target);
                     CondEnv::single(*s, truthy_ty)
                 }
                 (_, _, Some((truthy, _))) => truthy.clone(),
@@ -1974,8 +1973,7 @@ impl<'env> TypeChecker<'env> {
             if let (Some((s, _)), Some(target), true) =
                 (scrutinee.as_ref(), target_union, residue_alive)
             {
-                let next_falsy =
-                    crate::narrowing::subtract(iter_falsy_ty.unwrap(), target, self.env);
+                let next_falsy = self.subtract(iter_falsy_ty.unwrap(), target);
                 iter_falsy_ty = Some(next_falsy);
                 self.ctx.restore_scopes(base.clone());
                 match s {
@@ -2237,9 +2235,8 @@ impl<'env> TypeChecker<'env> {
             } else {
                 None
             };
-            let truthy_ty = target.map(|t| {
-                crate::narrowing::narrow(iter_falsy_ty.expect("target implies ty"), t, self.env)
-            });
+            let truthy_ty =
+                target.map(|t| self.narrow(iter_falsy_ty.expect("target implies ty"), t));
             let cond_env = match (scrutinee.as_ref(), truthy_ty) {
                 (Some((s, _)), Some(ty)) => CondEnv::single(*s, ty),
                 _ => CondEnv::empty(),
@@ -2261,11 +2258,7 @@ impl<'env> TypeChecker<'env> {
                 // its pattern type must stay in the residue.
                 (Some(_), Some(_)) if guard.is_some() || !residue_alive => {}
                 (Some((s, _)), Some(t)) => {
-                    let next = crate::narrowing::subtract(
-                        iter_falsy_ty.expect("target implies ty"),
-                        t,
-                        self.env,
-                    );
+                    let next = self.subtract(iter_falsy_ty.expect("target implies ty"), t);
                     iter_falsy_ty = Some(next);
                     self.ctx.restore_scopes(base.clone());
                     match s {
@@ -2928,7 +2921,7 @@ impl<'env> TypeChecker<'env> {
         }
         if let Some((scrutinee, current, target_ty, exact)) = self.is_a_predicate_target(call) {
             if exact {
-                let truthy_ty = crate::narrowing::narrow(current, target_ty, self.env);
+                let truthy_ty = self.narrow(current, target_ty);
                 return (CondEnv::single(scrutinee, truthy_ty), CondEnv::empty());
             }
             return self.narrow_pair(scrutinee, current, target_ty);
@@ -3288,8 +3281,8 @@ impl<'env> TypeChecker<'env> {
         let types = self.env.types();
         let false_ty = types.intern(Type::Literal(Literal::Bool(false)));
         let nil_or_false = union_of(Ty::NIL, false_ty, types);
-        let truthy_ty = crate::narrowing::subtract(current, nil_or_false, self.env);
-        let falsy_ty = crate::narrowing::narrow(current, nil_or_false, self.env);
+        let truthy_ty = self.subtract(current, nil_or_false);
+        let falsy_ty = self.narrow(current, nil_or_false);
         let truthy = if truthy_ty != current && truthy_ty != Ty::BOTTOM {
             CondEnv::single(scrutinee, truthy_ty)
         } else {
@@ -3309,8 +3302,8 @@ impl<'env> TypeChecker<'env> {
     /// `scrutinee` selects whether the narrow plants on the lvar scope
     /// chain or on the pure-call cache (ADR-0024).
     fn narrow_pair(&self, scrutinee: Scrutinee, current: Ty, target: Ty) -> (CondEnv, CondEnv) {
-        let truthy_ty = crate::narrowing::narrow(current, target, self.env);
-        let falsy_ty = crate::narrowing::subtract(current, target, self.env);
+        let truthy_ty = self.narrow(current, target);
+        let falsy_ty = self.subtract(current, target);
         (
             CondEnv::single(scrutinee, truthy_ty),
             CondEnv::single(scrutinee, falsy_ty),
@@ -3715,12 +3708,21 @@ impl<'env> TypeChecker<'env> {
     /// narrows anything, so the caller can fall through to the bare
     /// pure-call arm for a union receiver whose predicate is itself pure
     /// (ADR-0024) but whose members don't diverge in truthiness.
+    ///
+    /// The union test and the hit test both run on the dispatch-boundary
+    /// normalized receiver: Steep folds `T?` into `T | nil` at type
+    /// translation, while crema keeps `Type::Optional` and aliases, so a
+    /// raw `Type::Union` gate would skip `String?` and `type t = String?`.
+    /// A side whose member set equals the normalized receiver is not a
+    /// hit, which keeps the declared spelling (e.g. `::str_opt`) on the
+    /// un-narrowed branch.
     fn union_member_predicate_env<'pr>(&self, call: &CallNode<'pr>) -> Option<(CondEnv, CondEnv)> {
         if call.block().is_some() {
             return None;
         }
         let receiver = call.receiver()?;
         let (scrutinee, current) = self.scrutinee_and_current_ty(&receiver)?;
+        let current = definition_builder::normalize_receiver(self.env, current);
         if !matches!(self.env.types().resolve(current), Type::Union(_)) {
             return None;
         }
@@ -3813,7 +3815,7 @@ impl<'env> TypeChecker<'env> {
         if !self.eq_resolves_to_builtin_value_class(current) {
             return None;
         }
-        if crate::narrowing::narrow(current, target_ty, self.env) == Ty::BOTTOM {
+        if self.narrow(current, target_ty) == Ty::BOTTOM {
             return None;
         }
         Some((scrutinee, current, target_ty))
@@ -3871,7 +3873,8 @@ impl<'env> TypeChecker<'env> {
         let resolved_ty = if let Some(cr) = node.as_constant_read_node() {
             let name_str = String::from_utf8_lossy(cr.name().as_slice()).to_string();
             self.try_resolve_constant_read(&name_str)?.ty
-        } else if let Some(path) = node.as_constant_path_node() {
+        } else {
+            let path = node.as_constant_path_node()?;
             match self.resolve_constant_path_outcome(&path) {
                 ConstantPathOutcome::Walked {
                     kind: ConstantPathOutcomeKind::Resolved(ty, _),
@@ -3879,8 +3882,6 @@ impl<'env> TypeChecker<'env> {
                 } => ty,
                 _ => return None,
             }
-        } else {
-            return None;
         };
 
         let types = self.env.types();
@@ -4026,8 +4027,8 @@ impl<'env> TypeChecker<'env> {
         let types = self.env.types();
         let false_ty = types.intern(Type::Literal(Literal::Bool(false)));
         let nil_or_false = union_of(Ty::NIL, false_ty, types);
-        let truthy_ty = crate::narrowing::subtract(current, nil_or_false, self.env);
-        let falsy_ty = crate::narrowing::narrow(current, nil_or_false, self.env);
+        let truthy_ty = self.subtract(current, nil_or_false);
+        let falsy_ty = self.narrow(current, nil_or_false);
         let useful = |narrow_ty: Ty| {
             if narrow_ty != current && narrow_ty != Ty::BOTTOM {
                 Some(narrow_ty)
@@ -4258,7 +4259,7 @@ impl<'env> TypeChecker<'env> {
         let types = self.env.types();
         let false_ty = types.intern(Type::Literal(Literal::Bool(false)));
         let nil_or_false = union_of(Ty::NIL, false_ty, types);
-        let truthy_value = crate::narrowing::subtract(left_ty, nil_or_false, self.env);
+        let truthy_value = self.subtract(left_ty, nil_or_false);
         // `x = y or raise`: when the right arm diverges, `x` is
         // confirmed non-{nil,false} for the remainder of this
         // statement's control flow. `analyze_condition`'s own narrow of
@@ -5073,10 +5074,9 @@ impl<'env> TypeChecker<'env> {
                             _ => None,
                         };
                         let truthy_ty = target_union.map(|target| {
-                            crate::narrowing::narrow(
+                            self.narrow(
                                 iter_falsy_ty.expect("target implies scrutinee type"),
                                 target,
-                                self.env,
                             )
                         });
                         // Mirror of `check_case_node`: a dead `when`
@@ -5101,10 +5101,9 @@ impl<'env> TypeChecker<'env> {
                         tys.push(arm_ty);
                         match target_union {
                             Some(target) if residue_alive => {
-                                iter_falsy_ty = Some(crate::narrowing::subtract(
+                                iter_falsy_ty = Some(self.subtract(
                                     iter_falsy_ty.expect("target implies scrutinee type"),
                                     target,
-                                    self.env,
                                 ));
                             }
                             Some(_) => {}
@@ -5173,13 +5172,8 @@ impl<'env> TypeChecker<'env> {
                     } else {
                         None
                     };
-                    let truthy_ty = target.map(|t| {
-                        crate::narrowing::narrow(
-                            iter_falsy_ty.expect("target implies ty"),
-                            t,
-                            self.env,
-                        )
-                    });
+                    let truthy_ty =
+                        target.map(|t| self.narrow(iter_falsy_ty.expect("target implies ty"), t));
                     let arm_ty = match in_node.statements() {
                         _ if truthy_ty == Some(Ty::BOTTOM) => Ty::BOTTOM,
                         Some(stmts) => match (scrutinee.as_ref(), truthy_ty) {
@@ -5197,11 +5191,8 @@ impl<'env> TypeChecker<'env> {
                     match target {
                         Some(_) if guard.is_some() || !residue_alive => {}
                         Some(t) => {
-                            iter_falsy_ty = Some(crate::narrowing::subtract(
-                                iter_falsy_ty.expect("target implies ty"),
-                                t,
-                                self.env,
-                            ));
+                            iter_falsy_ty =
+                                Some(self.subtract(iter_falsy_ty.expect("target implies ty"), t));
                         }
                         None if scrutinee.is_some() => residue_alive = false,
                         None => {}
@@ -6055,6 +6046,10 @@ impl<'env> TypeChecker<'env> {
         let Some(target) = resolved.target.as_ref() else {
             return Ty::UNTYPED;
         };
+
+        if let Some(source) = self.kernel_lambda_block(call, Some(target)) {
+            return self.lambda_type_with_body(&source, self.kernel_lambda_hint(hint), None);
+        }
 
         match target {
             CallTarget::Method {
@@ -7934,7 +7929,8 @@ impl<'env> TypeChecker<'env> {
                     let v_ty = self.infer_type(&assoc.value(), Some(value_hint));
                     self.push_flat_union_members(k_ty, &mut key_members);
                     self.push_flat_union_members(v_ty, &mut value_members);
-                } else if let Some(splat) = elem.as_assoc_splat_node() {
+                } else {
+                    let splat = elem.as_assoc_splat_node()?;
                     // Steep `type_construction.rb:5241-5250` parity:
                     // synthesize the kwsplat value with a `Hash[K, V]`
                     // hint (Steep's `hint_hash`), then if the result is
@@ -7951,8 +7947,6 @@ impl<'env> TypeChecker<'env> {
                             &mut value_members,
                         );
                     }
-                } else {
-                    return None;
                 }
             }
         }
@@ -8041,6 +8035,19 @@ impl<'env> TypeChecker<'env> {
             }
             _ => {}
         }
+    }
+
+    /// [`crate::narrowing::narrow`] with this context's concrete `self`
+    /// as the bound for a `Ty::SELF_TYPE` leaf. Every narrowing in the
+    /// checker goes through here so no call site is left env-only.
+    pub(super) fn narrow(&self, ty: Ty, target: Ty) -> Ty {
+        crate::narrowing::narrow(ty, target, self.env, Some(self.current_self_type()))
+    }
+
+    /// [`crate::narrowing::subtract`] with this context's concrete `self`
+    /// as the bound; see [`Self::narrow`].
+    pub(super) fn subtract(&self, ty: Ty, target: Ty) -> Ty {
+        crate::narrowing::subtract(ty, target, self.env, Some(self.current_self_type()))
     }
 
     /// Compute the type of `self` in the current context.
@@ -8176,12 +8183,46 @@ impl<'env> TypeChecker<'env> {
     /// self) stays untyped so `self.foo` is suppressed under gradual typing.
     /// Method lookup re-concretizes `SELF_TYPE` via `current_self_type()` at
     /// the call boundary (`resolve_call_target`).
+    ///
+    /// A `self` scrutinee narrowed by `case self when C` / `self.is_a?(C)`
+    /// is planted under the `SelfRef` pure key (`scrutinee_and_current_ty`),
+    /// so the narrowed type is read back from there first, like
+    /// `pure_call_cached` does for `self.path`. The lookup is skipped under
+    /// a block `[self: T]` override: the entry describes the enclosing
+    /// method's `self`, not the rebound one (the pure env is method-scoped
+    /// and does not track block-entry self changes).
+    ///
+    /// A dead arm plants its emptied scrutinee as `untyped`
+    /// (`CondEnv::planted`); a live narrow of `self` is never `untyped`
+    /// or `bot` (the `self` leaf in `narrowing` yields `self`, the target
+    /// class, or `bot`, and `bot` is what makes the arm dead). Such an
+    /// entry is therefore only the dead-arm mark, which `CondEnv` already
+    /// reports, and `self` itself is never absent, so it keeps reading as
+    /// the opaque `self` there. That keeps an `else raise` after an
+    /// exhaustive `case self` divergent (the implicit receiver of `raise`
+    /// is `self`) and matches Steep, which checks calls in such an arm
+    /// against the enclosing class.
     pub(super) fn self_receiver_type(&self) -> Ty {
         if self.current_self_type().is_untyped() {
-            Ty::UNTYPED
-        } else {
-            Ty::SELF_TYPE
+            return Ty::UNTYPED;
         }
+        if !self.self_is_rebound() {
+            let key = self.pure_keys().intern(PureNode::SelfRef);
+            if let Some(ty) = self.pure_call_cached(Some(&key))
+                && !ty.is_untyped()
+                && ty != Ty::BOTTOM
+            {
+                return ty;
+            }
+        }
+        Ty::SELF_TYPE
+    }
+
+    /// True while a block `[self: T]` (checked or read-only walk) overrides
+    /// the lexical `self`.
+    fn self_is_rebound(&self) -> bool {
+        !self.readonly_self_stack.borrow().is_empty()
+            || self.ctx.current_self_type_override().is_some()
     }
 
     pub(super) fn freeze_self_type_for_lvar_binding(&self, ty: Ty) -> Ty {
@@ -8267,6 +8308,43 @@ impl<'env> TypeChecker<'env> {
             .with_self_bound(self.current_self_type())
     }
 
+    /// The block of a `lambda { |x| ... }` / `Kernel.lambda { }` call, as a
+    /// lambda literal source. Steep `SPECIAL_METHOD_NAMES[:lambda]`
+    /// (type_construction.rb:3630): the call must resolve to
+    /// `::Kernel#lambda` / `::Kernel.lambda` — keyed on the resolved decl,
+    /// not the name, so a user-defined `def lambda` keeps its own
+    /// signature — and carry a block literal (`lambda(&blk)` stays on the
+    /// signature path, as in Steep). The signature's `{ () -> untyped }`
+    /// is never consulted: its zero params would type `x` as nil.
+    pub(super) fn kernel_lambda_block<'pr>(
+        &self,
+        call: &CallNode<'pr>,
+        target: Option<&CallTarget>,
+    ) -> Option<LambdaSource<'pr>> {
+        if call.name().as_slice() != b"lambda" {
+            return None;
+        }
+        let block = call.block()?.as_block_node()?;
+        let method = target?.method_definition()?;
+        let kernel = self.env.names().builtins().kernel;
+        method
+            .defs
+            .iter()
+            .any(|td| td.defined_in == kernel)
+            .then_some(LambdaSource::Block(block))
+    }
+
+    /// The hint a `Kernel#lambda` block is typed under. An argument-slot
+    /// hint reaches the call form through `check_call`'s `hint` (not the
+    /// lambda pre-dispatch in `visit_call_arguments`, which only sees
+    /// `LambdaNode`s and only for a non-generic overload), so the same
+    /// guard is applied here: a hint still holding a type variable would
+    /// bind a free variable to a param and make the body walk a
+    /// false-positive source.
+    pub(super) fn kernel_lambda_hint(&self, hint: Option<Ty>) -> Option<Ty> {
+        hint.filter(|&h| !crate::types::contains_type_variable(h, self.env.types()))
+    }
+
     /// Side-effecting walk of a lambda literal's body, then the literal
     /// type built from the walk's body value (`lambda_type_with_body`).
     /// The walk tracked the body's own locals, so a body-local read at the
@@ -8287,7 +8365,21 @@ impl<'env> TypeChecker<'env> {
     /// undeclared-shape lambda can't produce false positives.
     fn check_lambda_node<'pr>(&mut self, node: &Node<'pr>, hint: Option<Ty>) -> Ty {
         if let Some(lambda) = node.as_lambda_node() {
-            let param_tys = self.lambda_walk_param_types(&lambda, hint);
+            return self.check_lambda_source(&LambdaSource::Lambda(lambda), hint);
+        }
+        self.infer_type(node, hint)
+    }
+
+    /// The side-effecting half of a lambda literal's typing for any
+    /// source shape (`->(x) { }`, or the block of a `Kernel#lambda` call
+    /// — Steep `type_lambda` serves both). See [`Self::check_lambda_node`].
+    pub(super) fn check_lambda_source<'pr>(
+        &mut self,
+        lambda: &LambdaSource<'pr>,
+        hint: Option<Ty>,
+    ) -> Ty {
+        {
+            let param_tys = self.lambda_walk_param_types(lambda, hint);
             let lambda_hint = self.lambda_hint_proc(hint);
             let body_hint = lambda_hint
                 .as_ref()
@@ -8329,9 +8421,8 @@ impl<'env> TypeChecker<'env> {
             // an `untyped` or sticky-`bot` walk value yields to the
             // read-only type of the body.
             let body_value = body_value.filter(|ty| !ty.is_untyped() && *ty != Ty::BOTTOM);
-            return self.lambda_type_with_body(node, hint, body_value);
+            self.lambda_type_with_body(lambda, hint, body_value)
         }
-        self.infer_type(node, hint)
     }
 
     /// Param types for the body walk's binding table: the hint's declared
@@ -8342,7 +8433,7 @@ impl<'env> TypeChecker<'env> {
     /// `lookup_local_variable` to an enclosing lambda's same-named param.
     fn lambda_walk_param_types<'pr>(
         &self,
-        lambda: &ruby_prism::LambdaNode<'pr>,
+        lambda: &LambdaSource<'pr>,
         hint: Option<Ty>,
     ) -> Vec<Ty> {
         if let Some(hint) = self.lambda_hint_proc(hint) {
@@ -8362,20 +8453,23 @@ impl<'env> TypeChecker<'env> {
     /// the tail is `untyped` here. `check_lambda_node` passes the walk's
     /// body value instead.
     fn lambda_literal_type<'pr>(&self, node: &Node<'pr>, hint: Option<Ty>) -> Ty {
-        self.lambda_type_with_body(node, hint, None)
+        match node.as_lambda_node() {
+            Some(lambda) => self.lambda_type_with_body(&LambdaSource::Lambda(lambda), hint, None),
+            None => self
+                .env
+                .class_instance_type(self.env.names().builtins().proc),
+        }
     }
 
     /// `lambda_literal_type` with the body's return type taken from
     /// `body_value` when given (the walk's value), else inferred read-only.
-    fn lambda_type_with_body<'pr>(
+    pub(super) fn lambda_type_with_body<'pr>(
         &self,
-        node: &Node<'pr>,
+        lambda: &LambdaSource<'pr>,
         hint: Option<Ty>,
         body_value: Option<Ty>,
     ) -> Ty {
-        if let Some(hint) = self.lambda_hint_proc(hint)
-            && let Some(lambda) = node.as_lambda_node()
-        {
+        if let Some(hint) = self.lambda_hint_proc(hint) {
             let LambdaHint {
                 function,
                 self_type,
@@ -8417,17 +8511,12 @@ impl<'env> TypeChecker<'env> {
             })));
         }
 
-        if let Some(lambda) = node.as_lambda_node() {
-            let function = self.unhinted_lambda_function(lambda, body_value);
-            return self.env.types().intern(Type::Proc(Box::new(ProcType {
-                type_: FunctionType::Typed(function),
-                self_type: None,
-                block: None,
-            })));
-        }
-
-        self.env
-            .class_instance_type(self.env.names().builtins().proc)
+        let function = self.unhinted_lambda_function(lambda, body_value);
+        self.env.types().intern(Type::Proc(Box::new(ProcType {
+            type_: FunctionType::Typed(function),
+            self_type: None,
+            block: None,
+        })))
     }
 
     /// The hint a hinted lambda's body tail (and its `next` values) is
@@ -8519,7 +8608,7 @@ impl<'env> TypeChecker<'env> {
     /// return `body_value` when given (the walk's), else inferred read-only.
     fn unhinted_lambda_function<'pr>(
         &self,
-        lambda: ruby_prism::LambdaNode<'pr>,
+        lambda: &LambdaSource<'pr>,
         body_value: Option<Ty>,
     ) -> Function {
         let mut function = Function::empty(Ty::UNTYPED);
@@ -9969,6 +10058,32 @@ pub(super) fn is_statement_assertion_eligible<'pr>(stmt: &Node<'pr>) -> bool {
 /// The Proc member of a call-argument hint that a lambda literal adopts
 /// (see `TypeChecker::lambda_hint_proc`). `proc_ty` is the interned Proc
 /// itself — the hinted lambda's own type when its body's return fits.
+/// A lambda literal's parts, whichever syntax carries them: the stabby
+/// `->(x) { }` (`LambdaNode`) or the block of a `Kernel#lambda` /
+/// `Kernel.lambda` call (`BlockNode`). Steep's `type_lambda` types both
+/// from the params + body alone, so the lambda helpers take this instead
+/// of a node kind.
+pub(super) enum LambdaSource<'pr> {
+    Lambda(ruby_prism::LambdaNode<'pr>),
+    Block(ruby_prism::BlockNode<'pr>),
+}
+
+impl<'pr> LambdaSource<'pr> {
+    fn parameters(&self) -> Option<Node<'pr>> {
+        match self {
+            Self::Lambda(lambda) => lambda.parameters(),
+            Self::Block(block) => block.parameters(),
+        }
+    }
+
+    fn body(&self) -> Option<Node<'pr>> {
+        match self {
+            Self::Lambda(lambda) => lambda.body(),
+            Self::Block(block) => block.body(),
+        }
+    }
+}
+
 struct LambdaHint {
     function: Function,
     self_type: Option<Ty>,

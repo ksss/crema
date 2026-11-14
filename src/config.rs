@@ -112,6 +112,8 @@ pub struct InfusionTable {
     #[serde(default)]
     pub sidekiq: Option<SidekiqInfusionTable>,
     #[serde(default)]
+    pub dry_initializer: Option<DryInitializerInfusionTable>,
+    #[serde(default)]
     pub class_methods: Option<ClassMethodsInfusionTable>,
 }
 
@@ -225,6 +227,19 @@ pub struct SidekiqInfusionTable {
     pub enabled: bool,
 }
 
+/// `[infusion.dry_initializer]` table shape. The
+/// [dry-initializer](https://github.com/dry-rb/dry-initializer) gem's
+/// `param` / `option` synthesis has no project-level options, so the
+/// table carries only the opt-in switch. Independent of the rails preset
+/// (reaching it through an `ActiveSupport::Concern` still needs the
+/// preset, which owns Concern expansion).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DryInitializerInfusionTable {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// `[infusion.class_methods]` table shape. Covers the `X::ClassMethods`
 /// idiom (`ActiveSupport::Concern`, or a hand-written `self.included`
 /// hook) for modules whose only declaration is RBS, where the hook's
@@ -251,6 +266,8 @@ pub struct InfusionOptions {
     pub paranoia: bool,
     /// `[infusion.sidekiq] enabled = true`.
     pub sidekiq: bool,
+    /// `[infusion.dry_initializer] enabled = true`.
+    pub dry_initializer: bool,
     /// `[infusion.class_methods] enabled = true`.
     pub class_methods: bool,
 }
@@ -733,6 +750,11 @@ impl Config {
             .as_ref()
             .and_then(|d| d.sidekiq.as_ref())
             .is_some_and(|t| t.enabled);
+        let dry_initializer_infusion = file
+            .infusion
+            .as_ref()
+            .and_then(|d| d.dry_initializer.as_ref())
+            .is_some_and(|t| t.enabled);
         let class_methods_infusion = file
             .infusion
             .as_ref()
@@ -745,6 +767,7 @@ impl Config {
             activerecord: rails_infusion,
             paranoia: paranoia_infusion,
             sidekiq: sidekiq_infusion,
+            dry_initializer: dry_initializer_infusion,
             class_methods: class_methods_infusion,
         };
         Ok((

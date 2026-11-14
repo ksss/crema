@@ -48,10 +48,26 @@
 //! code out of scope. Widening it would silently relax unrelated
 //! modules' types.
 //!
-//! Non-goals, both of which are dynamic in the gem and therefore out of
-//! reach for static infusion: `ActiveDecorator::Helpers`'s
-//! `method_missing` delegation to the view context, and `decorator_for`'s
-//! `base_class` walk for STI subclasses.
+//! View helpers (`content_tag`, `t`, ...) reach decorator bodies through
+//! `ActiveDecorator::Helpers#method_missing`, which forwards to the view
+//! context. The receiver of that forward is only known at runtime, but
+//! its type is not: every view context is an `ActionView::Base`. So that
+//! class joins the model as a second self-type — `module UserDecorator :
+//! ActionView::Base, User` — whenever the type environment declares it
+//! (typically through gem_rbs_collection's actionview). This goes beyond
+//! the orthoses port, which emits the model only. Ordering follows the
+//! runtime: the model's own methods shadow the view context's, and RBS
+//! self-type lookup lets the later entry win, so the model goes last.
+//!
+//! Self-types double as includer constraints, so a class that writes
+//! `include UserDecorator` must now be an `ActionView::Base` as well as
+//! a `User` (`RBS::ModuleSelfTypeError` otherwise). That is stricter
+//! than the gem, where `ActiveDecorator::Helpers` is included into the
+//! decorator module and so forwards for any includer too. Accepted: the
+//! gem applies decorators with `extend`, and an `include` is rare.
+//!
+//! Non-goal, dynamic in the gem and therefore out of reach for static
+//! infusion: `decorator_for`'s `base_class` walk for STI subclasses.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -74,16 +90,20 @@ use crate::type_name::TypeName;
 /// read from. Fixed rather than configurable — see the module docs.
 const DECORATORS_DIR: &str = "app/decorators";
 
+/// Static type of the view context `ActiveDecorator::Helpers` forwards
+/// to. See the module docs.
+const VIEW_CONTEXT: &str = "::ActionView::Base";
+
 /// Attach `self` types to decorator modules declared under
 /// `<project_root>/app/decorators`.
 ///
 /// A module qualifies when its name ends with `decorator_suffix`, the
 /// name with that suffix removed is declared somewhere in the type
 /// environment (the draft or an attached G snapshot), and it does not
-/// already carry a self-type. Anything else is skipped silently: a
-/// `FooDecorator` with no `Foo` is indistinguishable from a module that
-/// merely happens to end in `Decorator`, and reporting on it would fire
-/// on unrelated code.
+/// already carry a self-type. It also gains `ActionView::Base` when that
+/// is declared. Anything else is skipped silently: a `FooDecorator` with
+/// no `Foo` is indistinguishable from a module that merely happens to end
+/// in `Decorator`, and reporting on it would fire on unrelated code.
 ///
 /// Runs after every Ruby-source declaration has been inserted, since
 /// the model may be declared in a file this pass has no other reason to
@@ -101,12 +121,27 @@ pub fn synthesize(draft: &mut EnvironmentDraft, project_root: &Path, decorator_s
     };
 
     let scan = scan_draft(draft, &decorators_root);
-    let targets = resolve_targets(draft, &scan, decorator_suffix);
-    if targets.is_empty() {
+    let models = resolve_targets(draft, &scan, decorator_suffix);
+    if models.is_empty() {
         return;
     }
+    let view_context = draft.names().parse_type_name(VIEW_CONTEXT);
+    let view_context = scan
+        .is_declared(draft, view_context)
+        .then_some(view_context);
+    let targets = models
+        .into_iter()
+        .map(|(decorator, model)| {
+            // Model last: later self-types win lookup (see module docs).
+            let self_types = view_context.into_iter().chain([model]).collect();
+            (decorator, self_types)
+        })
+        .collect();
     attach_self_types(draft, &decorators_root, &targets);
 }
+
+/// `decorator module -> self-types to attach`, in declaration order.
+type Targets = FxHashMap<TypeName, Vec<TypeName>>;
 
 /// What one read-only pass over the draft's declaration trees yields.
 ///
@@ -129,6 +164,14 @@ struct Scan {
     /// never enter: RBS self-types are a module-only construct, and the
     /// gem rejects classes too (`unless Class === d` in `decorator_for`).
     candidates: FxHashSet<TypeName>,
+}
+
+impl Scan {
+    /// Whether `name` is declared in the draft or the G snapshot — the
+    /// static stand-in for orthoses's `constantize` succeeding.
+    fn is_declared(&self, draft: &EnvironmentDraft, name: TypeName) -> bool {
+        self.declared.contains(&name) || g_declares(draft, name)
+    }
 }
 
 fn scan_draft(draft: &EnvironmentDraft, decorators_root: &Path) -> Scan {
@@ -210,7 +253,7 @@ fn resolve_targets(
         .filter(|name| !scan.self_typed.contains(name))
         .filter_map(|&name| {
             let model = strip_suffix(draft, name, decorator_suffix)?;
-            (scan.declared.contains(&model) || g_declares(draft, model)).then_some((name, model))
+            scan.is_declared(draft, model).then_some((name, model))
         })
         .collect()
 }
@@ -237,9 +280,8 @@ fn strip_suffix(draft: &EnvironmentDraft, name: TypeName, suffix: &str) -> Optio
     Some(names.append_type_name(parent, names.intern_symbol(stem)))
 }
 
-/// Whether the G snapshot declares `name` — the gem-layer half of the
-/// static stand-in for orthoses's `constantize` succeeding. The draft
-/// half lives in [`Scan::declared`].
+/// Whether the G snapshot declares `name` — the gem-layer half of
+/// [`Scan::is_declared`].
 fn g_declares(draft: &EnvironmentDraft, name: TypeName) -> bool {
     draft.g.as_ref().is_some_and(|g| g.class_contains(&name))
 }
@@ -249,11 +291,7 @@ fn g_declares(draft: &EnvironmentDraft, name: TypeName) -> bool {
 /// Only declarations under `app/decorators` are visited, so a decorator
 /// module reopened elsewhere keeps that other file's decl untouched —
 /// self-types aggregate per module, so one attachment suffices.
-fn attach_self_types(
-    draft: &mut EnvironmentDraft,
-    decorators_root: &Path,
-    targets: &FxHashMap<TypeName, TypeName>,
-) {
+fn attach_self_types(draft: &mut EnvironmentDraft, decorators_root: &Path, targets: &Targets) {
     // Split borrow: `names` and `class_decls` are disjoint fields, which
     // is what lets the origin test run inside a `values_mut` walk.
     let names = &draft.names;
@@ -294,22 +332,24 @@ fn attach_self_types(
 /// annotation's location: `RubyModuleDecl::self_types` drops it
 /// (`location: None`) when lifting members into self-types, so no
 /// diagnostic can point at it and no synthetic span escapes.
-fn attach_in_module(decl: &mut RubyModuleDecl, targets: &FxHashMap<TypeName, TypeName>) {
-    if let Some(&self_type_name) = targets.get(&decl.module_name) {
+fn attach_in_module(decl: &mut RubyModuleDecl, targets: &Targets) {
+    if let Some(self_type_names) = targets.get(&decl.module_name) {
         let name_location = decl.name_location;
-        decl.members.push(Member::ModuleSelf(ModuleSelfMember {
-            annotation: ModuleSelfAnnotation {
-                name: self_type_name,
-                name_location,
-                args: Vec::new(),
-                location: name_location,
-            },
-        }));
+        for &name in self_type_names {
+            decl.members.push(Member::ModuleSelf(ModuleSelfMember {
+                annotation: ModuleSelfAnnotation {
+                    name,
+                    name_location,
+                    args: Vec::new(),
+                    location: name_location,
+                },
+            }));
+        }
     }
     attach_in_members(&mut decl.members, targets);
 }
 
-fn attach_in_members(members: &mut [Member], targets: &FxHashMap<TypeName, TypeName>) {
+fn attach_in_members(members: &mut [Member], targets: &Targets) {
     for member in members.iter_mut() {
         let Member::Declaration(d) = member else {
             continue;

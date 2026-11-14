@@ -21,9 +21,10 @@ use crate::ast::types::{
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::environment::draft::EnvironmentDraft;
+use crate::infusion_collector::active_record_synthesis::collect_nested_declared_names;
 use crate::infusion_collector::inflector::Inflector;
 use crate::infusion_collector::pipeline::{
-    EnumLiteral, InfusionCall, InfusionScopeParams, push_def,
+    EnumLiteral, InfusionCall, InfusionKeywordStringList, InfusionScopeParams, push_def,
 };
 use crate::inline_parser::{prism_location_range, push_class_abs_path};
 use crate::name::NameTable;
@@ -109,6 +110,67 @@ pub(crate) fn enum_scopes_from_call(
         }
     }
     scopes
+}
+
+/// `delegated_type` scopes ride the same channel: Rails defines one
+/// `scope <tableized type>, -> { where(role_type => type) }` per type
+/// (delegated_type.rb `define_delegated_type_methods`), a 0-arg lambda.
+pub(crate) fn delegated_type_scopes_from_call(
+    owner: TypeName,
+    call: &InfusionCall,
+    inflector: &Inflector,
+) -> Vec<ActiveRecordScope> {
+    let Some(DelegatedType { types, .. }) = DelegatedType::from_call(call) else {
+        return Vec::new();
+    };
+    types
+        .iter()
+        .map(|ty| ActiveRecordScope {
+            owner,
+            name: delegated_type_scope_name(ty, inflector),
+            params: Some(InfusionScopeParams::default()),
+        })
+        .collect()
+}
+
+/// The statically readable part of one `delegated_type role, types:,
+/// **options` call. `None` when the call is not deterministic enough to
+/// synthesize anything: no symbol role, or `types:` missing or not an
+/// array literal of string / symbol literals (Rails itself raises on a
+/// missing `types:`; a constant `types:` is a value crema cannot read).
+struct DelegatedType<'a> {
+    role: &'a str,
+    role_location: PrismByteRange,
+    types: &'a [String],
+    primary_key: &'a str,
+}
+
+impl<'a> DelegatedType<'a> {
+    fn from_call(call: &'a InfusionCall) -> Option<Self> {
+        if call.name != "delegated_type" {
+            return None;
+        }
+        let role = call.symbol_args.first()?;
+        let types = call
+            .keyword_string_lists
+            .iter()
+            .find(|InfusionKeywordStringList { name, .. }| name == "types")?;
+        Some(Self {
+            role: &role.name,
+            role_location: role.location,
+            types: &types.values,
+            primary_key: keyword_string(call, "primary_key").unwrap_or("id"),
+        })
+    }
+}
+
+/// Rails `type.tableize.tr("/", "_")`: `tableize` is `underscore` (which
+/// also turns `::` into `/`) then `pluralize`. `"Blog::Post"` →
+/// `"blog_posts"`.
+fn delegated_type_scope_name(ty: &str, inflector: &Inflector) -> String {
+    inflector
+        .pluralize(&inflector.underscore(&ty.replace("::", "/")))
+        .replace('/', "_")
 }
 
 /// The `def self.<names>` enum mapping, carried to AR synthesis so
@@ -286,79 +348,148 @@ fn schema_paths(project_root: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// `self.table_name = "..."` / `= :...` declarations collected from model
-/// class bodies, keyed by table name. Values are absolute model paths
-/// (`::Admin::User`) in source order — several models may legally share
-/// one table in Rails, and each of them gets the table's columns.
-#[derive(Default)]
-pub struct TableNameOverrides {
-    by_table: FxHashMap<String, Vec<String>>,
+/// Per-file `table_name` facts in source order, each as
+/// `(absolute owner path, value)`: `self.table_name = <literal>` on a
+/// class, and `def self.table_name_prefix` / `table_name_suffix` returning
+/// a string literal on a module or class (Rails reads them off
+/// `module_parents`, so a class-level definition counts too).
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TableNameFacts {
+    pub(crate) assignments: Vec<(String, String)>,
+    pub(crate) prefixes: Vec<(String, String)>,
+    pub(crate) suffixes: Vec<(String, String)>,
 }
 
-/// Scan one parsed Ruby file for `self.table_name = <string or symbol
-/// literal>` in class bodies (Rails' `table_name=` does `value.to_s`, so a
-/// symbol names its table just as a string does), returning
-/// `(absolute model path, table)` in source order. Runs per file inside
-/// the infusion collect (on the ingest worker), so the main thread needs
-/// no AST for it. Only statements directly in a class body count — a
-/// `table_name=` inside a method or a conditional only takes effect at
-/// runtime, which is outside the deterministic-input boundary infusion
-/// stays within. A non-literal value (an interpolated string or symbol,
-/// any other expression) is reported as `InfusionProviderSkipped` instead
-/// of guessed at.
-pub(crate) fn collect_table_name_assignments(
+/// Scan one parsed Ruby file for the table-name facts. Runs per file
+/// inside the infusion collect (on the ingest worker), so the main thread
+/// needs no AST for it. Only statements directly in a class / module body
+/// count — an assignment or definition inside a method or a conditional
+/// only takes effect at runtime, which is outside the deterministic-input
+/// boundary infusion stays within. A non-literal value (an interpolated
+/// string, a `.freeze` call, any other expression) is reported as
+/// `InfusionProviderSkipped` instead of guessed at. Rails' `table_name=`
+/// does `value.to_s`, so a symbol literal names its table just as a
+/// string does; the prefix / suffix hooks are plain method returns, so
+/// only a string literal counts there.
+pub(crate) fn collect_table_name_facts(
     root: &Node<'_>,
     file: Option<&Path>,
     source: &[u8],
     diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<(String, String)> {
-    let mut assignments = Vec::new();
+) -> TableNameFacts {
+    let mut facts = TableNameFacts::default();
     let mut stack = Vec::new();
-    collect_overrides_in_body(
+    collect_facts_in_body(
         root,
         &mut stack,
         false,
         file,
         source,
-        &mut assignments,
+        &mut facts,
         diagnostics,
     );
-    assignments
+    facts
 }
 
-/// Build the overrides from every file's assignments, chained in walk
-/// order (the order the files run at load time).
-pub(crate) fn table_name_overrides<'a>(
-    assignments: impl Iterator<Item = &'a (String, String)> + Clone,
-) -> TableNameOverrides {
-    // Ruby reassignment semantics: only a model's last `table_name =` is in
-    // effect at runtime, so earlier assignments must not also claim their
-    // tables. Resolve last-write-wins per model first, then group by table
-    // in assignment order to keep declaration order deterministic.
-    let mut final_table: FxHashMap<&str, &str> = FxHashMap::default();
-    for (model, table) in assignments.clone() {
-        final_table.insert(model, table);
-    }
-    let mut overrides = TableNameOverrides::default();
-    for (model, table) in assignments {
-        if final_table.get(model.as_str()) != Some(&table.as_str()) {
-            continue;
-        }
-        let models = overrides.by_table.entry(table.clone()).or_default();
-        if !models.contains(model) {
-            models.push(model.clone());
-        }
-    }
-    overrides
+/// Every file's facts folded in walk order (the order the files run at
+/// load time) with Ruby reassignment semantics: per owner, only the last
+/// `table_name =` / prefix / suffix is in effect.
+pub(crate) struct TableNameRules {
+    overrides: FxHashMap<String, String>,
+    prefixes: FxHashMap<String, String>,
+    suffixes: FxHashMap<String, String>,
 }
 
-fn collect_overrides_in_body(
+pub(crate) fn table_name_rules<'a>(
+    facts: impl Iterator<Item = &'a TableNameFacts>,
+) -> TableNameRules {
+    let mut rules = TableNameRules {
+        overrides: FxHashMap::default(),
+        prefixes: FxHashMap::default(),
+        suffixes: FxHashMap::default(),
+    };
+    for file in facts {
+        for (owner, table) in &file.assignments {
+            rules.overrides.insert(owner.clone(), table.clone());
+        }
+        for (owner, prefix) in &file.prefixes {
+            rules.prefixes.insert(owner.clone(), prefix.clone());
+        }
+        for (owner, suffix) in &file.suffixes {
+            rules.suffixes.insert(owner.clone(), suffix.clone());
+        }
+    }
+    rules
+}
+
+impl TableNameRules {
+    /// Port of `ActiveRecord::ModelSchema#table_name` for one model
+    /// (`model` is the absolute path, `::Admin::ActionLog`): an
+    /// explicit `table_name =` short-circuits, otherwise
+    /// `compute_table_name` =
+    /// `full_table_name_prefix + undecorated_table_name + full_table_name_suffix`
+    /// where the decorations come from the nearest `module_parents`
+    /// entry defining them and the undecorated name is the demodulized
+    /// class name underscored and pluralized. A model nested directly
+    /// inside another model (`module_parent < Base`) is additionally
+    /// `contained`: the parent's own table name, singularized, becomes a
+    /// leading segment (`Post::Comment` → `post_comments`). `models` is
+    /// the set this is computed over, in display form.
+    ///
+    /// Not ported on purpose: the `abstract_class?` exemption of the
+    /// `contained` rule (a model nested in an abstract model is not a
+    /// shape real apps have), STI's `base_class.table_name` (a subclass
+    /// computes its own name, which normally names no table, and sees the
+    /// columns through its superclass), the global
+    /// `ActiveRecord::Base.table_name_prefix`, and
+    /// `pluralize_table_names = false`.
+    fn table_for(&self, model: &str, models: &FxHashSet<String>, inflector: &Inflector) -> String {
+        if let Some(table) = self.overrides.get(model) {
+            return table.clone();
+        }
+        let segments: Vec<&str> = model.split("::").collect();
+        let base = segments.last().copied().unwrap_or_default();
+        let parent = segments[..segments.len() - 1].join("::");
+        let contained = if models.contains(&parent) {
+            format!(
+                "{}_",
+                inflector.singularize(&self.table_for(&parent, models, inflector))
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{}{}{}{}",
+            nearest_decoration(&self.prefixes, &segments),
+            contained,
+            inflector.pluralize(&inflector.underscore(base)),
+            nearest_decoration(&self.suffixes, &segments),
+        )
+    }
+}
+
+/// `module_parents.detect { |p| p.respond_to?(hook) }`: the innermost
+/// enclosing namespace that defines the hook, or the empty string.
+fn nearest_decoration<'a>(
+    decorations: &'a FxHashMap<String, String>,
+    segments: &[&str],
+) -> &'a str {
+    // `segments[0]` is the empty root of an absolute path, so the shallowest
+    // parent is `::Top` (depth 2).
+    (2..segments.len())
+        .rev()
+        .map(|depth| segments[..depth].join("::"))
+        .find_map(|parent| decorations.get(&parent))
+        .map_or("", String::as_str)
+}
+
+fn collect_facts_in_body(
     body: &Node<'_>,
     stack: &mut Vec<String>,
     in_class: bool,
     file: Option<&Path>,
     source: &[u8],
-    assignments: &mut Vec<(String, String)>,
+    facts: &mut TableNameFacts,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let statements = if let Some(program) = body.as_program_node() {
@@ -377,32 +508,40 @@ fn collect_overrides_in_body(
         if let Some(class_node) = stmt.as_class_node() {
             if push_class_abs_path(stack, &class_node.constant_path()).is_some() {
                 if let Some(body) = class_node.body() {
-                    collect_overrides_in_body(
-                        &body,
-                        stack,
-                        true,
-                        file,
-                        source,
-                        assignments,
-                        diagnostics,
-                    );
+                    collect_facts_in_body(&body, stack, true, file, source, facts, diagnostics);
                 }
                 stack.pop();
             }
         } else if let Some(module_node) = stmt.as_module_node() {
             if push_class_abs_path(stack, &module_node.constant_path()).is_some() {
                 if let Some(body) = module_node.body() {
-                    collect_overrides_in_body(
-                        &body,
-                        stack,
-                        false,
-                        file,
-                        source,
-                        assignments,
-                        diagnostics,
-                    );
+                    collect_facts_in_body(&body, stack, false, file, source, facts, diagnostics);
                 }
                 stack.pop();
+            }
+        } else if let Some(def) = stmt.as_def_node() {
+            if def
+                .receiver()
+                .is_some_and(|receiver| receiver.as_self_node().is_some())
+            {
+                collect_decoration_def(&def, stack, file, source, facts, diagnostics);
+            }
+        } else if let Some(singleton) = stmt.as_singleton_class_node() {
+            if singleton.expression().as_self_node().is_none() {
+                continue;
+            }
+            let Some(body) = singleton.body() else {
+                continue;
+            };
+            let Some(statements) = body.as_statements_node() else {
+                continue;
+            };
+            for inner in statements.body().iter() {
+                if let Some(def) = inner.as_def_node()
+                    && def.receiver().is_none()
+                {
+                    collect_decoration_def(&def, stack, file, source, facts, diagnostics);
+                }
             }
         } else if let Some(call) = stmt.as_call_node() {
             if !in_class
@@ -418,7 +557,7 @@ fn collect_overrides_in_body(
             };
             match string_or_symbol_arg(&call, 0) {
                 Some(table) => {
-                    assignments.push((model.clone(), table));
+                    facts.assignments.push((model.clone(), table));
                 }
                 None => {
                     let location = prism_location_range(call.location());
@@ -439,6 +578,64 @@ fn collect_overrides_in_body(
                     });
                 }
             }
+        }
+    }
+}
+
+/// A `def table_name_prefix` / `def table_name_suffix` singleton
+/// definition (`def self.x` directly in the body, or `def x` inside
+/// `class << self`). The body must be exactly one string literal.
+fn collect_decoration_def(
+    def: &ruby_prism::DefNode<'_>,
+    stack: &[String],
+    file: Option<&Path>,
+    source: &[u8],
+    facts: &mut TableNameFacts,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let hook = match def.name().as_slice() {
+        b"table_name_prefix" => "table_name_prefix",
+        b"table_name_suffix" => "table_name_suffix",
+        _ => return,
+    };
+    let Some(owner) = stack.last() else {
+        return;
+    };
+    let literal = def
+        .body()
+        .and_then(|body| body.as_statements_node().map(|s| s.body()))
+        .and_then(|statements| {
+            let mut iter = statements.iter();
+            let only = iter.next()?;
+            iter.next().is_none().then_some(only)
+        })
+        .and_then(|node| node.as_string_node().map(|s| s.unescaped().to_vec()))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    match literal {
+        Some(value) => {
+            let bucket = if hook == "table_name_prefix" {
+                &mut facts.prefixes
+            } else {
+                &mut facts.suffixes
+            };
+            bucket.push((owner.clone(), value));
+        }
+        None => {
+            let location = prism_location_range(def.location());
+            diagnostics.push(Diagnostic {
+                scope: None,
+                kind: DiagnosticKind::InfusionProviderSkipped {
+                    provider: PROVIDER.to_string(),
+                    subject: format!("{owner}.{hook}"),
+                    reason: format!("{hook} definition is not a string literal"),
+                },
+                location: Diagnostic::location_for_byte_range(
+                    file.map(|p| p.to_path_buf()).unwrap_or_default(),
+                    source,
+                    location.0 as usize,
+                    location.1 as usize,
+                ),
+            });
         }
     }
 }
@@ -490,20 +687,24 @@ pub fn prepare_schema(project_root: &Path) -> (PreparsedSchema, Vec<Diagnostic>)
 /// column.
 pub(crate) fn emit_schema(
     schema: &PreparsedSchema,
-    table_names: &TableNameOverrides,
+    models: &[TypeName],
+    rules: &TableNameRules,
     draft: &mut EnvironmentDraft,
     inflector: &Inflector,
     enums_by_attr: &FxHashMap<TypeName, FxHashSet<String>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    if schema.files.is_empty() {
+        return;
+    }
+    let models_by_table = models_by_table(draft, models, rules, inflector);
     for file in &schema.files {
         let declarations = schema_declarations(
             draft.names(),
             &file.path,
             &file.source,
             &file.tables,
-            inflector,
-            table_names,
+            &models_by_table,
             enums_by_attr,
             diagnostics,
         );
@@ -516,6 +717,43 @@ pub(crate) fn emit_schema(
             );
         }
     }
+}
+
+/// Rails resolves a table from its model, never a model from a table:
+/// every `ActiveRecord::Base` descendant (`models`, the A ∪ G fixpoint
+/// `active_record_model_names` computes once per load) that is declared
+/// in the project — gem models' columns are their own signatures'
+/// business — gets its table name computed, and the tables are then
+/// looked up by that name. A table no model computes to synthesizes
+/// nothing. `models` arrives in display-name order, which keeps the
+/// declaration order deterministic.
+fn models_by_table(
+    draft: &EnvironmentDraft,
+    models: &[TypeName],
+    rules: &TableNameRules,
+    inflector: &Inflector,
+) -> FxHashMap<String, Vec<String>> {
+    let names = draft.names();
+    let mut project_names: FxHashSet<TypeName> = FxHashSet::default();
+    for (name, entry) in &draft.class_decls {
+        project_names.insert(*name);
+        collect_nested_declared_names(entry, &mut project_names);
+    }
+    let project_models: Vec<String> = models
+        .iter()
+        .filter(|name| project_names.contains(name))
+        .map(|name| names.display_type_name(*name))
+        .collect();
+    let model_set: FxHashSet<String> = project_models.iter().cloned().collect();
+    let mut by_table: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    for model in project_models {
+        let table = rules.table_for(&model, &model_set, inflector);
+        let claimants = by_table.entry(table).or_default();
+        if !claimants.contains(&model) {
+            claimants.push(model);
+        }
+    }
+    by_table
 }
 
 /// Parse one schema dump. A parse failure skips this file alone — the
@@ -589,6 +827,7 @@ pub(crate) fn collect_call(
     collect_has_many_call(members, call, inflector);
     collect_enum_call(members, call, inflector, names, owner);
     collect_scope_call(members, call, names, owner);
+    collect_delegated_type_call(members, call, inflector, names, owner);
 }
 
 pub(crate) fn association_from_call(
@@ -600,6 +839,19 @@ pub(crate) fn association_from_call(
         "belongs_to" => ActiveRecordAssociationKind::BelongsTo,
         "has_one" => ActiveRecordAssociationKind::HasOne,
         "has_many" => ActiveRecordAssociationKind::HasMany,
+        // Rails: `belongs_to role, **options, polymorphic: true`. Only
+        // when the call is deterministic enough for the rest of the
+        // surface, so a skipped call stays wholly skipped.
+        "delegated_type" => {
+            let DelegatedType { role, .. } = DelegatedType::from_call(call)?;
+            return Some(ActiveRecordAssociation {
+                owner,
+                kind: ActiveRecordAssociationKind::BelongsTo,
+                name: role.to_string(),
+                target_name: None,
+                polymorphic: true,
+            });
+        }
         _ => return None,
     };
     let arg = call.symbol_args.first()?;
@@ -712,31 +964,15 @@ fn schema_declarations(
     schema_path: &Path,
     source: &[u8],
     tables: &[SchemaTable],
-    inflector: &Inflector,
-    table_names: &TableNameOverrides,
+    models_by_table: &FxHashMap<String, Vec<String>>,
     enums_by_attr: &FxHashMap<TypeName, FxHashSet<String>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Declaration> {
     let mut declarations = Vec::new();
     for table in tables {
-        // A `self.table_name =` override consumes the table: the columns go
-        // to the declaring model(s) and the inflection-derived class (which
-        // no real model backs) is not synthesized at all.
-        let model_absolutes: Vec<String> =
-            if let Some(models) = table_names.by_table.get(&table.name) {
-                models.clone()
-            } else if let Some(model_name) = model_name_for_table(&table.name, inflector) {
-                vec![format!("::{}", model_name)]
-            } else {
-                diagnostics.push(skip_diagnostic(
-                    schema_path,
-                    source,
-                    table.location,
-                    &table.name,
-                    "irregular table name is outside the naive inflector",
-                ));
-                continue;
-            };
+        let Some(model_absolutes) = models_by_table.get(&table.name) else {
+            continue;
+        };
         let mut column_members = Vec::new();
         let mut column_kwargs: Vec<(String, Type)> = Vec::new();
         for column in &table.columns {
@@ -800,7 +1036,7 @@ fn schema_declarations(
         // sig files. Return type is the `instance` base type so STI
         // subclasses (`class Sub < Speaker`) get their own type back from
         // `Sub.new`, not the base model's.
-        for model_absolute in &model_absolutes {
+        for model_absolute in model_absolutes {
             let mut members = column_members.clone();
             // A same-named enum owns the reader/writer surface (Rails
             // redefines the column accessors); only the `name?` query
@@ -955,6 +1191,7 @@ fn push_overloaded_ctor_def(
     members.push(Member::Def(DefMember {
         visibility: None,
         ivar_param_pairs: Vec::new(),
+        initialize_params: None,
         name: method_name.to_string(),
         kind: MethodKind::Instance,
         location,
@@ -1113,6 +1350,7 @@ fn push_typed_def(
     members.push(Member::Def(DefMember {
         visibility: None,
         ivar_param_pairs: Vec::new(),
+        initialize_params: None,
         name,
         kind: MethodKind::Instance,
         location,
@@ -1287,12 +1525,6 @@ fn bool_type() -> Type {
     })
 }
 
-fn model_name_for_table(table: &str, inflector: &Inflector) -> Option<String> {
-    let singular = inflector.singularize(table);
-    let class_name = inflector.camelize(&singular);
-    (!class_name.is_empty()).then_some(class_name)
-}
-
 fn skip_diagnostic(
     file: &Path,
     source: &[u8],
@@ -1440,6 +1672,7 @@ fn collect_scope_call(
     members.push(Member::Def(DefMember {
         visibility: None,
         ivar_param_pairs: Vec::new(),
+        initialize_params: None,
         name: arg.name.clone(),
         kind: MethodKind::Singleton,
         location: call.location,
@@ -1457,6 +1690,160 @@ fn collect_scope_call(
         leading_comment: None,
         source_file: None,
     }));
+}
+
+/// Synthesizes the Rails 8.1 `delegated_type` surface (activerecord
+/// `delegated_type.rb` `define_delegated_type_methods`), extended from
+/// orthoses-rails `active_record/delegated_type.rb` which predates
+/// `#{role}_types` (Rails 7.2) and types `#{role}_name` as `String`
+/// where Rails returns `model_name.singular.inquiry`:
+///
+/// ```text
+/// def <role>: (?) -> untyped                  # implied belongs_to (polymorphic)
+/// def <role>=: (?) -> untyped
+/// def reload_<role>: (?) -> untyped
+/// def <role>_class: () -> (A | B)
+/// def <role>_name: () -> ::ActiveSupport::StringInquirer
+/// def build_<role>: () -> (A | B)
+/// def self.<role>_types: () -> ::Array[::String]
+/// def self.<tableized A>: () -> <Owner>::ActiveRecord_Relation   # per type, scope
+/// def <singular A>?: () -> bool
+/// def <singular A>: () -> A?
+/// def <singular A>_<primary_key>: () -> ::Integer?
+/// ```
+///
+/// Type names in `types:` are written as relative names, exactly as the
+/// Ruby source spells them, and resolve in the owner's context like an
+/// inline `#:` annotation would. The `_<primary_key>` reader stays
+/// `Integer?` whatever the key column is (orthoses stance).
+fn collect_delegated_type_call(
+    members: &mut Vec<Member>,
+    call: &InfusionCall,
+    inflector: &Inflector,
+    names: &NameTable,
+    owner: TypeName,
+) {
+    let Some(DelegatedType {
+        role,
+        role_location,
+        types,
+        primary_key,
+    }) = DelegatedType::from_call(call)
+    else {
+        return;
+    };
+
+    for name in [
+        role.to_string(),
+        format!("{role}="),
+        format!("reload_{role}"),
+    ] {
+        push_def(
+            members,
+            name,
+            MethodKind::Instance,
+            call.location,
+            role_location,
+        );
+    }
+
+    let type_union = class_union(types.iter().map(|ty| class_instance(ty, names)));
+    push_typed_def(
+        members,
+        format!("{role}_class"),
+        vec![],
+        type_union.clone(),
+        role_location,
+    );
+    push_typed_def(
+        members,
+        format!("{role}_name"),
+        vec![],
+        class_instance("::ActiveSupport::StringInquirer", names),
+        role_location,
+    );
+    push_typed_def(
+        members,
+        format!("build_{role}"),
+        vec![],
+        type_union,
+        role_location,
+    );
+    push_singleton_typed_def(
+        members,
+        format!("{role}_types"),
+        nullary_method_type(class_instance_generic(
+            "::Array",
+            vec![class_instance("::String", names)],
+            names,
+        )),
+        call.location,
+        role_location,
+    );
+
+    for ty in types {
+        let scope_name = delegated_type_scope_name(ty, inflector);
+        let singular = inflector.singularize(&scope_name);
+        push_singleton_typed_def(
+            members,
+            scope_name,
+            scope_method_type(names, owner, Some(&InfusionScopeParams::default())),
+            call.location,
+            role_location,
+        );
+        push_typed_def(
+            members,
+            format!("{singular}?"),
+            vec![],
+            bool_type(),
+            role_location,
+        );
+        push_typed_def(
+            members,
+            singular.clone(),
+            vec![],
+            optional(class_instance(ty, names)),
+            role_location,
+        );
+        push_typed_def(
+            members,
+            format!("{singular}_{primary_key}"),
+            vec![],
+            optional(class_instance("::Integer", names)),
+            role_location,
+        );
+    }
+}
+
+/// `A | B | ...` from class instances; a single member stays bare.
+fn class_union(types: impl Iterator<Item = Type>) -> Type {
+    let mut types: Vec<Type> = types.collect();
+    match types.len() {
+        0 => untyped_type(),
+        1 => types.remove(0),
+        _ => Type::Union(UnionType {
+            types,
+            location: None,
+        }),
+    }
+}
+
+fn nullary_method_type(return_type: Type) -> MethodType {
+    MethodType {
+        type_params: Vec::new(),
+        function: Function::Typed(FunctionType {
+            required_positionals: Vec::new(),
+            optional_positionals: Vec::new(),
+            rest_positionals: None,
+            trailing_positionals: Vec::new(),
+            required_keywords: Vec::new(),
+            optional_keywords: Vec::new(),
+            rest_keywords: None,
+            return_type: Box::new(return_type),
+        }),
+        block: None,
+        location: None,
+    }
 }
 
 /// Synthesizes the typed enum surface, ported from orthoses enum.rb
@@ -1732,6 +2119,7 @@ fn push_singleton_typed_def(
     members.push(Member::Def(DefMember {
         visibility: None,
         ivar_param_pairs: Vec::new(),
+        initialize_params: None,
         name,
         kind: MethodKind::Singleton,
         location,
@@ -1773,6 +2161,7 @@ fn push_instance_overloaded_def(
     members.push(Member::Def(DefMember {
         visibility: None,
         ivar_param_pairs: Vec::new(),
+        initialize_params: None,
         name,
         kind: MethodKind::Instance,
         location,

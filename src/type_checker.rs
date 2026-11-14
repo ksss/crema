@@ -841,10 +841,20 @@ impl<'env> TypeChecker<'env> {
         }
         let start_byte = node.location().start();
         let end_byte = node.location().end();
-        let owner = match self
+        let owner_name = self
             .extract_synthesized_owner((start_byte, end_byte))
-            .or_else(|| self.ctx.current_class_typename().copied())
-        {
+            .or_else(|| self.ctx.current_class_typename().copied());
+        // A def under `module_function` is registered on both sides
+        // (`self?`), so it implements both symbols.
+        let also_singleton = !is_singleton
+            && node.receiver().is_none()
+            && owner_name.is_some_and(|tn| {
+                let file = self.env.names().intern(&self.file.to_string_lossy());
+                self.env
+                    .ruby_module_def_kind_at(tn, file, (start_byte, end_byte))
+                    == Some(crate::ast::MethodKind::SingletonInstance)
+            });
+        let owner = match owner_name {
             Some(tn) => self.env.names().display_type_name(tn),
             // Ruby semantics: a top-level `def` is a private instance
             // method on Object. (Inside any visited class body the
@@ -855,18 +865,25 @@ impl<'env> TypeChecker<'env> {
                 .names()
                 .display_type_name(self.env.names().builtins().object),
         };
-        let separator = if is_singleton { "." } else { "#" };
         let name = String::from_utf8_lossy(node.name().as_slice());
-        collector.push_implements(crate::extract::ImplementsRecord {
-            symbol: format!("{owner}{separator}{name}"),
-            kind: if is_singleton {
-                "singleton_method"
-            } else {
-                "instance_method"
-            },
-            start_byte,
-            end_byte,
-        });
+        let sides: &[bool] = if also_singleton {
+            &[false, true]
+        } else {
+            std::slice::from_ref(&is_singleton)
+        };
+        for &singleton in sides {
+            let separator = if singleton { "." } else { "#" };
+            collector.push_implements(crate::extract::ImplementsRecord {
+                symbol: format!("{owner}{separator}{name}"),
+                kind: if singleton {
+                    "singleton_method"
+                } else {
+                    "instance_method"
+                },
+                start_byte,
+                end_byte,
+            });
+        }
     }
 
     /// The synthesized module a def / attr site at `span` is registered

@@ -17,6 +17,10 @@ pub struct Inflector {
     singulars: Vec<Rule>,
     uncountables: Vec<String>,
     acronyms: HashMap<String, String>,
+    /// The acronyms in registration order: Rails' `acronym_regex` is an
+    /// alternation in that order, and alternation picks the first listed
+    /// match, not the longest.
+    acronym_order: Vec<String>,
 }
 
 struct Rule {
@@ -140,6 +144,7 @@ impl Inflector {
             singulars: Vec::new(),
             uncountables: Vec::new(),
             acronyms: HashMap::new(),
+            acronym_order: Vec::new(),
         }
     }
 
@@ -149,6 +154,38 @@ impl Inflector {
 
     pub(crate) fn pluralize(&self, word: &str) -> String {
         self.apply(word, &self.plurals)
+    }
+
+    /// Port of `ActiveSupport::Inflector.underscore` for the class-name
+    /// segment of a table name (`"ActionLog"` → `"action_log"`,
+    /// `"HTMLParser"` → `"html_parser"`): the registered-acronym pass,
+    /// then the two generic boundary rules `([A-Z]+)([A-Z][a-z])` and
+    /// `([a-z\d])([A-Z])`, `-` → `_`, downcase. The boundary classes are
+    /// ASCII like Rails'; only the final downcase is Unicode-aware, also
+    /// like Rails.
+    pub(crate) fn underscore(&self, word: &str) -> String {
+        let word = self.lowercase_acronyms(word);
+        let chars: Vec<char> = word.chars().collect();
+        let mut out = String::with_capacity(word.len() + 4);
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '-' {
+                out.push('_');
+                continue;
+            }
+            if i > 0 && c.is_ascii_uppercase() {
+                let prev = chars[i - 1];
+                let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+                // `([a-z\d])([A-Z])` and `([A-Z]+)([A-Z][a-z])` from Rails.
+                if prev.is_ascii_lowercase()
+                    || prev.is_ascii_digit()
+                    || (prev.is_ascii_uppercase() && next_is_lower)
+                {
+                    out.push('_');
+                }
+            }
+            out.extend(c.to_lowercase());
+        }
+        out
     }
 
     pub(crate) fn camelize(&self, word: &str) -> String {
@@ -239,8 +276,62 @@ impl Inflector {
     }
 
     pub(crate) fn add_acronym(&mut self, word: &str) {
-        self.acronyms
-            .insert(word.to_ascii_lowercase(), word.to_string());
+        if self
+            .acronyms
+            .insert(word.to_ascii_lowercase(), word.to_string())
+            .is_none()
+        {
+            self.acronym_order.push(word.to_string());
+        }
+    }
+
+    /// Port of the `acronyms_underscore_regex` pass of
+    /// `ActiveSupport::Inflector.underscore`:
+    /// `/(?:(?<=([A-Za-z\d]))|\b)(A|B|...)(?=\b|[^a-z])/` replaced by
+    /// `"#{$1 && '_'}#{$2.downcase}"`. A registered acronym at a word
+    /// boundary, or right after an ASCII alphanumeric, and not followed
+    /// by a lowercase letter, is lowercased in place (with a `_` before
+    /// it in the alphanumeric case) so the generic boundary rules then
+    /// see it as one word (`HTTPAPIKey` → `http_api_key`, where the
+    /// generic rules alone give `httpapi_key`).
+    fn lowercase_acronyms(&self, word: &str) -> String {
+        if self.acronym_order.is_empty() {
+            return word.to_string();
+        }
+        let mut out = String::with_capacity(word.len() + 4);
+        let mut i = 0;
+        while i < word.len() {
+            let rest = &word[i..];
+            let prev = word[..i].chars().next_back();
+            let hit = self.acronym_order.iter().find(|acronym| {
+                if !rest.starts_with(acronym.as_str()) {
+                    return false;
+                }
+                let before_ok = prev.is_none_or(|p| {
+                    p.is_ascii_alphanumeric() || !(p.is_alphanumeric() || p == '_')
+                });
+                let after_ok = rest[acronym.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|n| !n.is_ascii_lowercase());
+                before_ok && after_ok
+            });
+            match hit {
+                Some(acronym) => {
+                    if prev.is_some_and(|p| p.is_ascii_alphanumeric()) {
+                        out.push('_');
+                    }
+                    out.extend(acronym.chars().flat_map(char::to_lowercase));
+                    i += acronym.len();
+                }
+                None => {
+                    let c = rest.chars().next().unwrap();
+                    out.push(c);
+                    i += c.len_utf8();
+                }
+            }
+        }
+        out
     }
 
     fn apply(&self, word: &str, rules: &[Rule]) -> String {

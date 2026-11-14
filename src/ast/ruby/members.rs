@@ -15,6 +15,7 @@ use rustc_hash::FxHashMap;
 
 use ruby_prism::DefNode;
 
+use crate::ast::members::AliasMember;
 use crate::ast::ruby::PrismByteRange;
 use crate::ast::ruby::annotations::{
     BlockParamTypeAnnotation, ColonMethodTypeAnnotation, DoubleSplatParamTypeAnnotation,
@@ -683,6 +684,14 @@ pub enum Member {
     InstanceVariable(InstanceVariableMember),
     /// A module-self annotation.
     ModuleSelf(ModuleSelfMember),
+    /// An `alias new old` keyword statement (crema extension: rbs v4's
+    /// inline parser does not collect method aliases; the old
+    /// rbs-inline gem's `RubyAlias` did — specs/inline.md). Carries the
+    /// signature-side member as is, since the two are the same
+    /// declaration and every consumer downstream of the method builder
+    /// already reads that shape. Boxed: inline it would widen every
+    /// member slot for a rare variant.
+    Alias(Box<AliasMember>),
 }
 
 impl Member {
@@ -699,6 +708,7 @@ impl Member {
             Member::SingletonPrepend(m) => m.mixin.location.0,
             Member::InstanceVariable(m) => m.annotation.location.0,
             Member::ModuleSelf(m) => m.annotation.location.0,
+            Member::Alias(m) => m.location.map_or(u32::MAX, |l| l.range.start_byte),
         }
     }
 }
@@ -715,6 +725,10 @@ impl Member {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DefMember {
     pub name: String,
+    /// rbs `DefMember#kind` is `:instance` / `:singleton`. crema extension:
+    /// a def under Ruby's `module_function` is `SingletonInstance`, the
+    /// value rbs `MethodDefinition#kind` uses for `def self?.x`, so the
+    /// build layer fans it out to both sides exactly as for the RBS form.
     pub kind: MethodKind,
     pub location: PrismByteRange,
     pub name_location: PrismByteRange,
@@ -729,15 +743,24 @@ pub struct DefMember {
     /// instance-variable declarations from the initialize signature
     /// (Sorbet-style instance variable inference).
     pub ivar_param_pairs: Vec<InitializeIvarParamPair>,
+    /// crema extension, not part of the rbs `DefMember` contract: the
+    /// Prism parameter layout of an instance-side `initialize`, kept so
+    /// a `Data.define` block can shape its synthesized `self.new` after
+    /// the keyword list `Data#new` forwards to (rbs lowers an
+    /// unannotated def to `UntypedFunction` and drops the names). `None`
+    /// for every other method.
+    pub initialize_params: Option<InitializeParamShape>,
     /// crema extension, not part of the rbs `DefMember` contract (rbs
     /// `docs/inline.md` lists method visibility as unsupported). Same
     /// shape as `RBS::AST::Members::MethodDefinition#visibility` so a
     /// future upstream port lands without drift: `None` = no Ruby-side
     /// marker applies (public by default), `Some(_)` = an enclosing bare
     /// `private` / `public`, a `private def` modifier, or a retroactive
-    /// `private :name` decided it. Only instance-side defs carry a value;
-    /// singleton defs stay `None` (Ruby's `private` never reaches
-    /// `def self.x`).
+    /// `private :name` decided it. Instance defs carry a value when a
+    /// marker applies; a `module_function` (`SingletonInstance`) def
+    /// always does — its instance side, private unless a later `public`
+    /// reopened it; singleton defs stay `None` (Ruby's `private` never
+    /// reaches `def self.x`).
     pub visibility: Option<Visibility>,
 }
 
@@ -752,6 +775,24 @@ pub struct InitializeIvarParamPair {
     /// Ivar name including the `@` sigil.
     pub ivar_name: String,
     pub param: InitializeParamRef,
+}
+
+/// Prism parameter layout of `def initialize`, reduced to what
+/// `Data#new` cares about: the keyword names with their required-ness,
+/// whether a `**rest` is present, and whether any positional parameter
+/// exists (`Data#new` only ever passes keywords, so a positional
+/// `initialize` cannot be modelled from the member list).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct InitializeParamShape {
+    pub keywords: Vec<InitializeKeywordParam>,
+    pub rest_keywords: bool,
+    pub positionals: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InitializeKeywordParam {
+    pub name: String,
+    pub required: bool,
 }
 
 /// Positional reference into an `initialize` method type's parameter

@@ -511,6 +511,7 @@ impl<'env, M: BucketMember> MethodBuilder<'env, M> {
         };
         let bucket_type = self.bucket_type(type_name, kind, primary_params, names);
         let mut methods = Methods::new(bucket_type);
+        let mut ruby_aliases = Vec::new();
         match entry {
             ClassOrModule::Class(c) => {
                 for (origin, _, decl) in c.context_decls() {
@@ -527,10 +528,25 @@ impl<'env, M: BucketMember> MethodBuilder<'env, M> {
                             );
                         }
                         ClassDeclaration::Ruby(rd) => {
-                            push_ruby_members(&mut methods, &rd.members, kind, names, *origin);
+                            push_ruby_members(
+                                &mut methods,
+                                &rd.members,
+                                kind,
+                                names,
+                                *origin,
+                                &mut ruby_aliases,
+                            );
                         }
                     }
                 }
+                push_ruby_aliases(&mut methods, ruby_aliases, names, |name| {
+                    c.context_decls().iter().any(|(_, _, decl)| match decl {
+                        ClassDeclaration::Signature(sd) => {
+                            signature_declares(&sd.members, name, kind, names)
+                        }
+                        ClassDeclaration::Ruby(_) => false,
+                    })
+                });
             }
             ClassOrModule::Module(m) => {
                 for (origin, _, decl) in m.context_decls() {
@@ -547,10 +563,25 @@ impl<'env, M: BucketMember> MethodBuilder<'env, M> {
                             );
                         }
                         ModuleDeclaration::Ruby(rd) => {
-                            push_ruby_members(&mut methods, &rd.members, kind, names, *origin);
+                            push_ruby_members(
+                                &mut methods,
+                                &rd.members,
+                                kind,
+                                names,
+                                *origin,
+                                &mut ruby_aliases,
+                            );
                         }
                     }
                 }
+                push_ruby_aliases(&mut methods, ruby_aliases, names, |name| {
+                    m.context_decls().iter().any(|(_, _, decl)| match decl {
+                        ModuleDeclaration::Signature(sd) => {
+                            signature_declares(&sd.members, name, kind, names)
+                        }
+                        ModuleDeclaration::Ruby(_) => false,
+                    })
+                });
             }
         }
         methods
@@ -829,12 +860,13 @@ fn push_signature_members<W: AsMember, M: BucketMember>(
 /// member in a fresh `Arc` (the decl stores members by value, so there
 /// is no `Arc` to share; measured at ~80ns/member on gitlab, see
 /// `todo/done/2026-10/2026-10-07_rejected_mid_method_builder_members_without_ast_clone.md`).
-fn push_ruby_members<M: BucketMember>(
+fn push_ruby_members<'a, M: BucketMember>(
     methods: &mut Methods<M>,
-    members: &[RubyMember],
+    members: &'a [RubyMember],
     kind: BuildSide,
     names: &NameTable,
     origin: DeclOrigin,
+    ruby_aliases: &mut Vec<(&'a AliasMember, DeclOrigin)>,
 ) {
     // Inline attr is instance-only: `class << self` is not supported on
     // the inline side (rbs/docs/inline.md §"Method definitions",
@@ -849,10 +881,17 @@ fn push_ruby_members<M: BucketMember>(
                 }
                 let bucket_name = names.intern_symbol(&def.name);
                 // Same precedence as the signature branch above:
-                // special names first, then the Ruby-side marker the
-                // inline parser folded into `def.visibility`
-                // (`None` = public default).
+                // `self?` (inline `module_function`) defaults to private
+                // on the instance side — unlike RBS `def self?`, a later
+                // Ruby `public :x` can reopen it, so the marker still
+                // decides — then special names, then the Ruby-side marker
+                // the inline parser folded into `def.visibility` (`None` =
+                // public default).
                 let bucket_visibility = match kind {
+                    BuildSide::Instance if def.kind == MethodKind::SingletonInstance => def
+                        .visibility
+                        .map(Visibility::from_ast)
+                        .unwrap_or(Visibility::Private),
                     BuildSide::Instance => special_instance_visibility(&def.name)
                         .unwrap_or_else(|| Visibility::from_ast_or_default(def.visibility)),
                     BuildSide::Singleton => Visibility::Public,
@@ -870,6 +909,13 @@ fn push_ruby_members<M: BucketMember>(
             // One payload per declaration, cloned per listed name (for
             // `MemberRef` that is an `Arc` bump, matching rbs where every
             // name's bucket holds the same member object).
+            // Held back until every decl of the type is pushed: see
+            // `push_ruby_aliases`.
+            RubyMember::Alias(alias) => {
+                if alias_kind_matches_receiver(alias.kind, kind) {
+                    ruby_aliases.push((&**alias, origin));
+                }
+            }
             RubyMember::AttrReader(r) if kind == inline_attr_kind => {
                 let member = M::from_source(MemberSource::RubyAttrReader(r), names);
                 for name in r.attribute.names() {
@@ -918,6 +964,65 @@ fn push_ruby_members<M: BucketMember>(
             _ => {}
         }
     }
+}
+
+/// Push the Ruby-side `alias new old` members a type's decls held back.
+/// An alias is an unannotated Ruby definition, so a signature
+/// declaration of the same name on the same side is *the* declaration
+/// and the alias adds nothing (specs/inline.md) — the same outcome an
+/// unannotated `def` gets by landing in `overloads`. Deciding after
+/// the whole decl list keeps this independent of the order sig and Ruby
+/// decls reach the entry.
+fn push_ruby_aliases<M: BucketMember>(
+    methods: &mut Methods<M>,
+    ruby_aliases: Vec<(&AliasMember, DeclOrigin)>,
+    names: &NameTable,
+    signature_declares: impl Fn(Symbol) -> bool,
+) {
+    for (alias, origin) in ruby_aliases {
+        if signature_declares(alias.new_name) {
+            continue;
+        }
+        MethodBuilder::build_alias(
+            methods,
+            alias.new_name,
+            M::from_source(MemberSource::Alias(alias), names),
+            origin,
+        );
+    }
+}
+
+/// Whether a signature decl's members put a method named `name` on the
+/// `kind` side — the bucket rules of [`push_signature_members`], asked
+/// for one name.
+fn signature_declares<W: AsMember>(
+    members: &[W],
+    name: Symbol,
+    kind: BuildSide,
+    names: &NameTable,
+) -> bool {
+    let name_str = names.resolve(name);
+    let writer_of = |attr: Symbol| name_str.strip_suffix('=') == Some(names.resolve(attr));
+    members
+        .iter()
+        .filter_map(AsMember::as_member)
+        .any(|member| match member {
+            Member::MethodDefinition(md) => {
+                md.name == name && method_kind_matches_receiver(md.kind, kind)
+            }
+            Member::Alias(a) => a.new_name == name && alias_kind_matches_receiver(a.kind, kind),
+            Member::AttrReader(r) => {
+                r.name == name && attribute_kind_matches_receiver(r.kind, kind)
+            }
+            Member::AttrAccessor(a) => {
+                (a.name == name || writer_of(a.name))
+                    && attribute_kind_matches_receiver(a.kind, kind)
+            }
+            Member::AttrWriter(w) => {
+                writer_of(w.name) && attribute_kind_matches_receiver(w.kind, kind)
+            }
+            _ => false,
+        })
 }
 
 fn method_kind_matches_receiver(method_kind: MethodKind, receiver: BuildSide) -> bool {

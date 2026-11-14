@@ -1,7 +1,9 @@
 [package]
 name = "crema"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
+# Tracks rust-toolchain.toml's channel; bump both together.
+rust-version = "1.99"
 description = "An AI-agent-first Ruby type checker"
 license = "MIT"
 # All integration tests build into the single `integration` target below:

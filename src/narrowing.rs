@@ -12,6 +12,13 @@
 //! `target` is a **single type** — `Union`/`Intersection` decomposition for
 //! compound conditions belongs to the upstream env-algebra (ADR-0022 §(1)).
 //!
+//! `self_bound` is the concrete type of `self` in the checking context
+//! (`current_self_type()`), passed in as one more input to the set
+//! operation so the primitives stay env-only (ADR-0022 §(2)): a
+//! `Ty::SELF_TYPE` leaf is judged against that bound instead of staying
+//! opaque. `None` means no self context (unit tests); the checker always
+//! passes `Some`.
+//!
 //! Member selection uses a two-tier strategy: an intern-id equality check
 //! first (the common case for `is_a?(C)` where `C` already appears in the
 //! union), falling back to `SubtypeChecker::check` only on miss. This keeps
@@ -42,7 +49,7 @@ fn is_type_variable(ty: Ty, env: ConsultationView) -> bool {
 ///
 /// Empty intersection → `Ty::BOTTOM`. `Untyped` on the input narrows to
 /// `target`; `Untyped` on the target acts as identity (everything matches).
-pub fn narrow(ty: Ty, target: Ty, env: ConsultationView) -> Ty {
+pub fn narrow(ty: Ty, target: Ty, env: ConsultationView, self_bound: Option<Ty>) -> Ty {
     let ty = expand_alias(env, ty);
     let target = expand_alias(env, target);
     if ty == target {
@@ -73,19 +80,38 @@ pub fn narrow(ty: Ty, target: Ty, env: ConsultationView) -> Ty {
     {
         return target;
     }
+    // `self` narrowed by a class: judge the enclosing class, not the
+    // opaque leaf. When the bound already fits `target` (`case self
+    // when Base`, `when Class` under a singleton) the result stays
+    // `self` so `-> self` identity survives; when `target` is a proper
+    // subclass of the bound (`when Bool` inside `Base`) the value is
+    // that subclass, as it would be for a `Base` argument; an unrelated
+    // class is still empty.
+    if let (Type::SelfType, Some(bound)) = (types.resolve(ty), self_bound)
+        && bound != ty
+    {
+        let checker = SubtypeChecker::new(env);
+        return if checker.check(bound, target) {
+            ty
+        } else if checker.check(target, bound) {
+            target
+        } else {
+            Ty::BOTTOM
+        };
+    }
     match types.resolve(ty) {
         Type::Union(members) => {
             let kept: Vec<Ty> = members
                 .iter()
                 .copied()
-                .map(|m| narrow(m, target, env))
+                .map(|m| narrow(m, target, env, self_bound))
                 .collect();
             union_of_many(&kept, env.types())
         }
         Type::Optional(inner) => {
             // `Optional(T)` ≡ `T | nil`.
-            let lhs = narrow(*inner, target, env);
-            let rhs = narrow(Ty::NIL, target, env);
+            let lhs = narrow(*inner, target, env, self_bound);
+            let rhs = narrow(Ty::NIL, target, env, self_bound);
             union_of(lhs, rhs, env.types())
         }
         _ => {
@@ -111,7 +137,7 @@ pub fn narrow(ty: Ty, target: Ty, env: ConsultationView) -> Ty {
 /// (`untyped without T` has no representation in RBS, so we conservatively
 /// keep the whole set). `Untyped` on the target removes nothing (a target
 /// of unknown extent cannot be safely excluded).
-pub fn subtract(ty: Ty, target: Ty, env: ConsultationView) -> Ty {
+pub fn subtract(ty: Ty, target: Ty, env: ConsultationView, self_bound: Option<Ty>) -> Ty {
     let ty = expand_alias(env, ty);
     let target = expand_alias(env, target);
     if ty == target {
@@ -142,18 +168,32 @@ pub fn subtract(ty: Ty, target: Ty, env: ConsultationView) -> Ty {
     {
         return types.intern(Type::Literal(Literal::Bool(!value)));
     }
+    // `self` with a class removed: empty only when the enclosing class
+    // is covered by `target`; otherwise `self` is kept whole (the
+    // falsy side of `when Bool` inside `Base` is still `self`, not a
+    // concrete `Base`).
+    if let (Type::SelfType, Some(bound)) = (types.resolve(ty), self_bound)
+        && bound != ty
+    {
+        let checker = SubtypeChecker::new(env);
+        return if checker.check(bound, target) {
+            Ty::BOTTOM
+        } else {
+            ty
+        };
+    }
     match types.resolve(ty) {
         Type::Union(members) => {
             let kept: Vec<Ty> = members
                 .iter()
                 .copied()
-                .map(|m| subtract(m, target, env))
+                .map(|m| subtract(m, target, env, self_bound))
                 .collect();
             union_of_many(&kept, env.types())
         }
         Type::Optional(inner) => {
-            let lhs = subtract(*inner, target, env);
-            let rhs = subtract(Ty::NIL, target, env);
+            let lhs = subtract(*inner, target, env, self_bound);
+            let rhs = subtract(Ty::NIL, target, env, self_bound);
             union_of(lhs, rhs, env.types())
         }
         _ => {

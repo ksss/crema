@@ -1245,6 +1245,33 @@ impl DefinitionBuilder {
             .map(|e| e.targets.clone())
     }
 
+    /// Kind of the `def` member a Ruby declaration of module `module`
+    /// loaded from `file` holds at exactly `span`. The inline collector
+    /// decides `module_function` (`SingletonInstance`) from the module
+    /// body's statement order, which the checker's walk does not track.
+    pub(crate) fn ruby_module_def_kind_at(
+        &self,
+        module: TypeName,
+        file: Name,
+        span: PrismByteRange,
+    ) -> Option<crate::ast::MethodKind> {
+        let Some(ClassOrModule::Module(entry)) = self.env.class_decls().get(&module) else {
+            return None;
+        };
+        entry
+            .context_decls()
+            .iter()
+            .find_map(|(origin, _, decl)| match decl {
+                ModuleDeclaration::Ruby(decl) if origin.file() == Some(file) => {
+                    decl.members.iter().find_map(|member| match member {
+                        RubyMember::Def(m) if m.location == span => Some(m.kind),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+    }
+
     /// Whether a Ruby declaration of module `module` loaded from `file`
     /// holds a `def` / `attr_*` member written at exactly `span`: the
     /// environment's own answer to "this site was registered on that
@@ -1664,22 +1691,23 @@ impl DefinitionBuilder {
             }
         }
         // Phase 2: chain walk found nothing in own/interface tables. Try
-        // each module ancestor's self_types as the final fallback (rbs
-        // build_instance line 233-247: self_types methods land in
+        // the lookup root's own self_types as the final fallback (rbs
+        // build_instance line 236-249: self_types methods land in
         // `definition.methods` first, then own/include `merge!` over
         // them, so they show up only when own/include miss).
-        // Walk chain in forward order: the receiver's own self_types
-        // come first, then include's, matching the merge-order from
-        // shallowest to deepest in rbs.
+        //
+        // Only the root is consulted, never the module ancestors reached
+        // through include/prepend: rbs's recursive `define_instance`
+        // (line 85-116) threads an ancestor's `self_type_methods` into
+        // `import_methods` solely as the alias `old_name` fallback
+        // (`define_method` line 708), so an includer never sees the
+        // included module's self_type methods themselves. The alias
+        // route still works here because the alias branch above
+        // re-enters `lookup_instance_method` with the alias-declaring
+        // module as root. `try_self_types_instance_method` returns
+        // `None` for a non-module root, so classes get no fallback.
         if acc.is_none() {
-            for ancestor in &chain {
-                let Ancestor::Instance { name, .. } = ancestor else {
-                    continue;
-                };
-                if let Some(m) = self.try_self_types_instance_method(name, method, &chain_names) {
-                    return Some(m);
-                }
-            }
+            return self.try_self_types_instance_method(class, method, &chain_names);
         }
         acc
     }
@@ -1791,7 +1819,7 @@ impl DefinitionBuilder {
             .ancestor_builder
             .instance_ancestors(class)
             .apply(args, self.ancestor_builder.types());
-        let result = self.resolve_instance_method_in_chain(&chain, method);
+        let result = self.resolve_instance_method_in_chain(&chain, Some((class, args)), method);
         self.instance_method_with_args_memo
             .insert_first((*class, method, args.into()), Arc::new(result.clone()));
         result
@@ -1818,7 +1846,7 @@ impl DefinitionBuilder {
             .ancestor_builder
             .interface_ancestors(interface)
             .apply(args, self.ancestor_builder.types());
-        self.resolve_instance_method_in_chain(&chain, method)
+        self.resolve_instance_method_in_chain(&chain, None, method)
     }
 
     /// Resolve `method` by walking `chain`, an already-`apply`-substituted
@@ -1827,16 +1855,22 @@ impl DefinitionBuilder {
     /// pass a chain slice starting after the defining class. Passing the
     /// full chain reproduces the pre-refactor behavior exactly.
     ///
+    /// `root` is the receiver the chain was linearized from, with the
+    /// args it was applied under. It is the only entry whose self_types
+    /// are consulted in the phase-2 fallback (rbs `build_instance` adds
+    /// self_type methods for the root `ModuleEntry` only). It is passed
+    /// explicitly rather than read from `chain[0]` because a `prepend`ed
+    /// module linearizes in front of the receiver. `None` disables the
+    /// fallback: interface chains have no module root, and a `super`
+    /// slice starts after the defining class so the receiver is absent.
+    ///
     /// `chain_names` (the self_type cycle-break set) is computed from the
     /// passed slice, so a `super` caller's slice intentionally excludes the
-    /// defining class and everything before it. That matches `super`
-    /// semantics — the phase-2 self_types fallback must only reach ancestors
-    /// strictly above the defining class — and stays safe for cycle-breaking
-    /// because any self_type cycle that the fallback could chase lives among
-    /// the slice's own ancestors.
+    /// defining class and everything before it.
     pub(crate) fn resolve_instance_method_in_chain(
         &self,
         chain: &[Ancestor],
+        root: Option<(&TypeName, &[Ty])>,
         method: Symbol,
     ) -> Option<(Arc<Method>, FxHashMap<TypeVarKey, Ty>)> {
         // See `resolve_instance_method_unsubstituted` for the rationale of pre-collecting
@@ -1925,27 +1959,21 @@ impl DefinitionBuilder {
                 return acc;
             }
         }
-        // Phase 2: chain-final self_types fallback. See
-        // `resolve_instance_method_unsubstituted` for the rationale (rbs merge order).
-        if acc.is_none() {
-            for ancestor in chain {
-                let Ancestor::Instance {
-                    name,
-                    args: anc_args,
-                    ..
-                } = ancestor
-                else {
-                    continue;
-                };
-                if let Some(found) = self.try_self_types_instance_method_with_args(
-                    name,
-                    anc_args,
-                    method,
-                    &chain_names,
-                ) {
-                    return Some(found);
-                }
-            }
+        // Phase 2: root-only self_types fallback. See
+        // `resolve_instance_method_unsubstituted` for the rationale (rbs
+        // build_instance vs. define_instance). Callers without a module
+        // root (interface chains, `super` slices) pass `None` and get no
+        // fallback, so `super` from inside an includer does not reach
+        // the included module's self_type (Steep `UnexpectedSuper`).
+        if acc.is_none()
+            && let Some((root_name, root_args)) = root
+        {
+            return self.try_self_types_instance_method_with_args(
+                root_name,
+                root_args,
+                method,
+                &chain_names,
+            );
         }
         acc
     }
@@ -1986,7 +2014,7 @@ impl DefinitionBuilder {
                 let skip = chain
                     .iter()
                     .position(|a| matches!(a, Ancestor::Instance { name: n, .. } if n == name))?;
-                self.resolve_instance_method_in_chain(&chain[skip + 1..], method)
+                self.resolve_instance_method_in_chain(&chain[skip + 1..], None, method)
             }
             Type::ClassSingleton { name } => {
                 let chain = self.ancestor_builder.singleton_ancestors(name);
@@ -4500,9 +4528,16 @@ pub(crate) fn special_instance_visibility(name: &str) -> Option<Visibility> {
 
 /// Ruby-side visibility carried by an overload-only bucket's inline
 /// defs (see step 3 of the precedence list in
-/// [`lower_bucket_defn_to_method`]). First explicit marker wins.
+/// [`lower_bucket_defn_to_method`]). First explicit marker wins. A
+/// `module_function` def (`self?`) defaults to private here, the same
+/// rule `push_ruby_members` applies to an annotated one.
 fn ruby_overload_visibility(overloads: &[MemberRef]) -> Option<Visibility> {
     overloads.iter().find_map(|member| match member {
+        MemberRef::RubyDef(def) if def.kind == crate::ast::MethodKind::SingletonInstance => Some(
+            def.visibility
+                .map(Visibility::from_ast)
+                .unwrap_or(Visibility::Private),
+        ),
         MemberRef::RubyDef(def) => def.visibility.map(Visibility::from_ast),
         _ => None,
     })
@@ -5832,6 +5867,17 @@ impl<'a> ConsultationView<'a> {
     ) -> bool {
         self.builder
             .ruby_module_declares_member_at(module, file, span)
+    }
+
+    /// Not recorded, for the same reason as
+    /// [`Self::ruby_module_declares_member_at`].
+    pub(crate) fn ruby_module_def_kind_at(
+        &self,
+        module: TypeName,
+        file: Name,
+        span: PrismByteRange,
+    ) -> Option<crate::ast::MethodKind> {
+        self.builder.ruby_module_def_kind_at(module, file, span)
     }
 
     pub(crate) fn ruby_module_has_member_within(

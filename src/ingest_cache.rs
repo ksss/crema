@@ -70,7 +70,11 @@ pub const INGEST_CACHE_MAGIC: u64 = 0xC5EA_1A6E_0000_0001;
 /// 3: `ConcernSite` gained the call's byte range.
 /// 4: `ConcernSite` / `ConcernDependency` carry the argument as written
 ///    plus its cref instead of two namespace candidates.
-pub const INGEST_CACHE_SCHEMA_VERSION: u32 = 4;
+/// 5: Ruby members gained `Alias` (`alias new old` in a class body).
+/// 6: `CollectedSource` gained ActiveModel `attribute` candidates.
+/// 7: table names are resolved from the model (`TableNameFacts`).
+/// 8: `InfusionCall` gained `keyword_string_lists` (`types: %w[...]`).
+pub const INGEST_CACHE_SCHEMA_VERSION: u32 = 11;
 /// magic u64 LE | schema_version u32 LE | reserved u32 = 0 | key 32 bytes
 pub const HEADER_LEN: usize = 48;
 
@@ -80,6 +84,9 @@ pub const HEADER_LEN: usize = 48;
 /// prism rejects contributes nothing but its diagnostic, and that fact
 /// is as stable as any other collect result.
 #[derive(Serialize, Deserialize)]
+// `Parsed` is the variant of nearly every file; boxing it to shrink the
+// rare `SyntaxError` would cost an allocation per file.
+#[allow(clippy::large_enum_variant)]
 pub enum IngestPayload<'a> {
     SyntaxError(Diagnostic),
     Parsed {

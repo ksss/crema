@@ -116,7 +116,7 @@ Synthesizes, in memory and without writing RBS, the declarations that metaprogra
 
 ### [infusion.rails]
 
-- `enabled` — `Boolean`, default `false`. Turns on the ActiveSupport, ActiveModel and ActiveRecord rule families together, plus zeitwerk-style constant synthesis. Also synthesizes each ActionMailer action (an instance `def` on an `ActionMailer::Base` descendant) as a class method returning `ActionMailer::MessageDelivery`. The unit of choice is the framework, not the individual rule.
+- `enabled` — `Boolean`, default `false`. Turns on the ActiveSupport, ActiveModel and ActiveRecord rule families together, plus zeitwerk-style constant synthesis. Also synthesizes each ActionMailer action (an instance `def` on an `ActionMailer::Base` descendant) as a class method returning `ActionMailer::MessageDelivery`. ActiveRecord rules cover `belongs_to` / `has_one` / `has_many` / `scope` / `enum` / `delegated_type` (the Rails 8.1 surface: the implied polymorphic `belongs_to`, `<role>_class` / `<role>_name` / `build_<role>` / `<role>_types`, and per type the scope plus `<type>?` / `<type>` / `<type>_<primary_key>`; `types:` must be an array literal of strings or symbols). The unit of choice is the framework, not the individual rule.
 - `inflections` — `Table`, default `absent`. Locale sub-tables; only `en` exists.
 
 Propose this table when the project uses Rails.
@@ -148,7 +148,7 @@ Propose it when the project reads settings from a pure-YAML file.
 
 Covers the [active_decorator](https://github.com/amatsuda/active_decorator) gem, whose decorator modules are written as if the model's methods were their own.
 
-- `enabled` — `Boolean`, default `false`. A module under `app/decorators` whose name ends with `decorator_suffix` gains the same-named model as its self type, so `UserDecorator` resolves `User`'s methods.
+- `enabled` — `Boolean`, default `false`. A module under `app/decorators` whose name ends with `decorator_suffix` gains the same-named model as its self type, so `UserDecorator` resolves `User`'s methods. When `ActionView::Base` is declared (the rbs collection's `actionview` entry), it is added as a self type too, so view helpers such as `content_tag` and `t` resolve; the model's methods take precedence.
 - `decorator_suffix` — `String`, default `"Decorator"`. Example: `decorator_suffix = "Presenter"`. Mirrors `ActiveDecorator.config.decorator_suffix`. An empty string is rejected.
 
 The directory is fixed at `app/decorators`. A decorator whose model is not declared is skipped silently, and an explicitly written self type is never overwritten.
@@ -174,6 +174,18 @@ Covers the [sidekiq](https://github.com/sidekiq/sidekiq) gem, whose `include Sid
 Independent of `[infusion.rails]`. Only classes are synthesized; a module that includes `Sidekiq::Job` is skipped, because the `extend` would land on that module's singleton, not on its includers. The `Sidekiq::Job` types come from the rbs collection (the `sidekiq` gem's entry); when absent, the original `Ruby::NoMethod` diagnostics stay.
 
 Propose it when the Gemfile depends on sidekiq and job classes include `Sidekiq::Job` (or `Sidekiq::Worker`).
+
+### [infusion.dry_initializer]
+
+Covers the [dry-initializer](https://github.com/dry-rb/dry-initializer) gem, whose `param` / `option` calls define a reader per argument and the initializer at runtime.
+
+- `enabled` — `Boolean`, default `false`. Every class that extends `Dry::Initializer` (also as `Dry::Initializer[undefined: false]`, or by inheriting from such a class) gains, for its `param` / `option` calls, a reader named after `as:` or the argument, the `@name` instance variable, and an `initialize` that requires the arguments without `optional: true` / `default:`. `reader: :private` makes the reader private, `reader: false` omits it.
+
+Every synthesized type is `untyped`: the `type` argument is a coercer, not a type. The initializer accepts surplus positionals and unknown keywords, as the gem does, so only a missing required argument is reported. A class that writes its own `def initialize` keeps it. Modules are skipped. Not covered: `Dry::Initializer.define`, nested `option ... do ... end` structs, aliases of `param` / `option`, custom dispatchers, dry-initializer-rails' `model:`.
+
+Independent of `[infusion.rails]`, with one exception: `extend Dry::Initializer` written in an `ActiveSupport::Concern` `included do` block reaches the including classes only when `[infusion.rails]` is enabled too, because that preset owns Concern expansion. The `Dry::Initializer` types come from the rbs collection or the project's `sig/`; when absent, nothing is synthesized and the original diagnostics stay.
+
+Propose it when the Gemfile depends on dry-initializer and classes extend `Dry::Initializer`.
 
 ### [infusion.class_methods]
 

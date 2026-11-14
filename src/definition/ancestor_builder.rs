@@ -79,6 +79,13 @@ pub struct OneAncestors {
     /// and for declarations without a file.
     pub super_class_location: Option<SourceLocation>,
     pub self_types: Vec<MixinRef>,
+    /// The subset of `self_types` (by name) that only infusion-synthesized
+    /// declarations contribute. They are assumptions about `self` inside
+    /// the module's own bodies, not constraints an includer has to meet:
+    /// the user wrote neither side, so there is nothing for them to fix.
+    /// Lookup treats them like any self-type; only the includer check
+    /// (`validator::validate_module_self_types`) reads this.
+    pub assumed_self_types: Vec<TypeName>,
     pub included_modules: Vec<MixinRef>,
     pub included_interfaces: Vec<MixinRef>,
     pub prepended_modules: Vec<MixinRef>,
@@ -603,7 +610,7 @@ impl AncestorBuilder {
             }
             ClassOrModule::Module(module_entry) => {
                 one.params = module_type_params(module_entry, lowering, &class_scope);
-                one.self_types = module_self_types_or_default(
+                (one.self_types, one.assumed_self_types) = module_self_types_or_default(
                     module_entry,
                     name,
                     lowering,
@@ -1333,6 +1340,8 @@ fn class_super_or_default(
     (MixinRef::bare(names.builtins().object), true)
 }
 
+/// The module's self types and, second, the names among them that are
+/// assumed rather than required ([`OneAncestors::assumed_self_types`]).
 fn module_self_types_or_default(
     entry: &ModuleEntry,
     name: &TypeName,
@@ -1340,7 +1349,7 @@ fn module_self_types_or_default(
     env: &Environment,
     names: &NameTable,
     class_scope: &TypeParamScope,
-) -> Vec<MixinRef> {
+) -> (Vec<MixinRef>, Vec<TypeName>) {
     // rbs `ModuleEntry#self_types` aggregates `each_decl.flat_map(&:self_types).uniq`,
     // aligning each decl's type params onto the primary decl's spelling
     // (`align_params`) before the `uniq`. Reading only `primary_decl()`
@@ -1348,16 +1357,18 @@ fn module_self_types_or_default(
     // not necessarily the first one loaded; lowering every decl under the
     // primary scope leaves a reopen-spelled `_Each[Elem]` unbound.
     let primary_params = primary_signature_module_type_params(entry);
-    let mut resolved: Vec<MixinRef> = Vec::new();
-    let mut push_unique = |mref: MixinRef| {
-        if !resolved
-            .iter()
-            .any(|existing| existing.name == mref.name && existing.args == mref.args)
-        {
-            resolved.push(mref);
-        }
+    // `bool`: every declaration naming this self type so far was
+    // synthesized. One written declaration makes it a real constraint.
+    let mut resolved: Vec<(MixinRef, bool)> = Vec::new();
+    let mut push_unique = |mref: MixinRef, synthesized: bool| match resolved
+        .iter_mut()
+        .find(|(existing, _)| existing.name == mref.name && existing.args == mref.args)
+    {
+        Some((_, assumed)) => *assumed &= synthesized,
+        None => resolved.push((mref, synthesized)),
     };
-    for (_, _, decl) in entry.context_decls() {
+    for (origin, _, decl) in entry.context_decls() {
+        let synthesized = matches!(origin, crate::environment::DeclOrigin::Synthesized(..));
         let (self_types, decl_scope): (
             Vec<crate::ast::declarations::ModuleSelf>,
             std::borrow::Cow<'_, TypeParamScope>,
@@ -1377,22 +1388,32 @@ fn module_self_types_or_default(
             .iter()
             .filter(|st| names.type_name_is_absolute(st.name))
         {
-            push_unique(mixin_ref(
-                st.name,
-                &st.args,
-                st.source_file,
-                st.location.map(|l| l.range),
-                lowering,
-                env,
-                &decl_scope,
-            ));
+            push_unique(
+                mixin_ref(
+                    st.name,
+                    &st.args,
+                    st.source_file,
+                    st.location.map(|l| l.range),
+                    lowering,
+                    env,
+                    &decl_scope,
+                ),
+                synthesized,
+            );
         }
     }
     if resolved.is_empty() {
-        vec![MixinRef::bare(names.builtins().object)]
-    } else {
-        resolved
+        return (vec![MixinRef::bare(names.builtins().object)], Vec::new());
     }
+    let assumed = resolved
+        .iter()
+        .filter(|(_, assumed)| *assumed)
+        .map(|(mref, _)| mref.name)
+        .collect();
+    (
+        resolved.into_iter().map(|(mref, _)| mref).collect(),
+        assumed,
+    )
 }
 
 /// Per-decl scope for lowering a reopen's mixin / self_types args: the

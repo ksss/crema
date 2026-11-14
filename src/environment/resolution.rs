@@ -1529,7 +1529,8 @@ fn collect_ruby_member_names(
         | RubyMember::Prepend(_)
         | RubyMember::SingletonPrepend(_)
         | RubyMember::InstanceVariable(_)
-        | RubyMember::ModuleSelf(_) => {}
+        | RubyMember::ModuleSelf(_)
+        | RubyMember::Alias(_) => {}
     }
 }
 
@@ -1673,6 +1674,9 @@ fn resolve_ruby_member(
         RubyMember::AttrReader(a) => RubyMember::AttrReader(a.clone()),
         RubyMember::AttrWriter(a) => RubyMember::AttrWriter(a.clone()),
         RubyMember::AttrAccessor(a) => RubyMember::AttrAccessor(a.clone()),
+        // Method names only, nothing to resolve (the signature-side
+        // `Alias` arm passes through the same way).
+        RubyMember::Alias(a) => RubyMember::Alias(a.clone()),
         // rbs `resolve_ruby_member` `InstanceVariableMember` arm.
         RubyMember::InstanceVariable(a) => {
             let mut resolved = a.clone();

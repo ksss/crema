@@ -3,10 +3,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ruby_prism::{
-    CallNode, ClassNode, ConstantPathWriteNode, ConstantWriteNode, DefNode, ModuleNode, Node,
-    SingletonClassNode, Visit,
+    AliasMethodNode, CallNode, ClassNode, ConstantPathWriteNode, ConstantWriteNode, DefNode,
+    ModuleNode, Node, SingletonClassNode, Visit,
 };
 
+use crate::ast::members::{AliasKind, AliasMember};
 use crate::ast::method_type::MethodType as AstMethodType;
 use crate::ast::ruby::annotations::{
     ColonMethodTypeAnnotation, LeadingAnnotation, TypeApplicationAnnotation,
@@ -18,14 +19,17 @@ use crate::ast::ruby::declarations::{
 };
 use crate::ast::ruby::members::{
     AttrAccessorMember, AttrReaderMember, AttrWriterMember, AttributeMember, AttributeNameNode,
-    DefMember, ExplicitAnnotation, ExtendMember, IncludeMember, InitializeIvarParamPair,
-    InitializeParamRef, InstanceVariableMember, Member, MethodTypeAnnotation, MixinMember,
-    ModuleSelfMember, PrependMember, TrailingResolution, TypeAnnotations,
+    DefMember, DoubleSplatRestEntry, ExplicitAnnotation, ExtendMember, IncludeMember,
+    InitializeIvarParamPair, InitializeKeywordParam, InitializeParamRef, InitializeParamShape,
+    InstanceVariableMember, Member, MethodTypeAnnotation, MixinMember, ModuleSelfMember,
+    PositionalEntry, PrependMember, TrailingResolution, TypeAnnotations,
 };
+use crate::ast::ruby::members::{BlockEntry, DocStyle, SplatRestEntry};
 use crate::ast::ruby::{LineIndex, PrismByteRange};
 use crate::ast::types::{
-    BaseType, BaseTypeKind, Function, FunctionParam, FunctionType, KeywordParam, Literal,
-    LiteralType, RecordField, RecordKey, RecordType, TupleType, Type, UnionType,
+    BaseType, BaseTypeKind, BlockType, Function, FunctionParam, FunctionType, KeywordParam,
+    Literal, LiteralType, RecordField, RecordKey, RecordType, TupleType, Type, UnionType,
+    UntypedFunctionType,
 };
 use crate::ast::{MethodKind, Visibility};
 use crate::ast_builder;
@@ -34,6 +38,7 @@ use crate::data_struct_recognizer::{DataStructConstructionKind, data_struct_cons
 use crate::diagnostic::{Diagnostic, DiagnosticKind, InlineAliasKind};
 use crate::environment::draft::EnvironmentDraft;
 use crate::environment::ruby_decl::{build_annotation_syntax_error, parse_rbs_type};
+use crate::location::{AliasMemberLocation, LocationRange};
 use crate::name::{Name, NameTable};
 use crate::rbs_raw::Parser as RbsParser;
 use crate::type_name::TypeName;
@@ -135,6 +140,10 @@ struct InlineCollector<'a> {
     /// [`collect_visibility_call`] around the argument visit only, and
     /// consumed by `visit_def_node` / `collect_attr_call`.
     pending_explicit_visibility: Option<Visibility>,
+    /// `module_function def x` is under visit: the def becomes a
+    /// `SingletonInstance` method. Same lifetime as
+    /// `pending_explicit_visibility`.
+    pending_module_function: bool,
     /// Inside the block of an infusion-owned call (`concerning`,
     /// `included`, `prepended`, `class_methods`) and not yet inside a
     /// nested `class` / `module` / class-body block. Ruby evaluates these
@@ -155,13 +164,20 @@ struct InlineCollector<'a> {
 /// top-level statements: a visibility call only counts when it is one
 /// of them, so `if cond; private; end` (not statically decidable) is
 /// ignored and stays on the public side.
+///
+/// `module_function` is set by a bare `module_function` and cleared by
+/// the next bare visibility call, matching Ruby's scope visibility; it
+/// is only ever set in a `module` body (`module_body`), since Class and
+/// singleton classes have no `module_function`.
 struct VisibilityFrame {
     ambient: Option<Visibility>,
+    module_function: bool,
+    module_body: bool,
     direct_statement_starts: FxHashSet<u32>,
 }
 
 impl VisibilityFrame {
-    fn new(body: Option<Node<'_>>) -> Self {
+    fn new(body: Option<Node<'_>>, module_body: bool) -> Self {
         // A body with `rescue` / `ensure` clauses parses as a BeginNode
         // wrapping the statements; its main statements are still direct
         // children of the class body in Ruby's eyes.
@@ -179,6 +195,8 @@ impl VisibilityFrame {
             .unwrap_or_default();
         VisibilityFrame {
             ambient: None,
+            module_function: false,
+            module_body,
             direct_statement_starts,
         }
     }
@@ -338,6 +356,7 @@ impl<'a> InlineCollector<'a> {
             singleton_class_depth: 0,
             visibility_frames: vec![],
             pending_explicit_visibility: None,
+            pending_module_function: false,
             in_concern_block: false,
         }
     }
@@ -543,13 +562,22 @@ impl<'a> InlineCollector<'a> {
     /// Forms handled: bare (sets the ambient default for the rest of
     /// the body), `X def name` / `X attr_* :name` (modifier on the
     /// argument), and `X :a, :b` (retroactive on already-collected
-    /// instance defs / single-name attrs). Anything else — `module_function`,
+    /// instance defs / single-name attrs). Anything else —
     /// `private_class_method`, array or string arguments, unknown names —
     /// is left alone, i.e. stays public.
+    ///
+    /// `module_function` in a `module` body (crema extension, see
+    /// specs/inline.md) takes the same three forms and turns the instance
+    /// defs it reaches into `SingletonInstance` ones, RBS's `def self?.x`.
+    /// Its bare form also sets a private ambient, which is all an
+    /// `attr_*` after it gets: Ruby makes such attrs private without
+    /// copying them to the singleton. Retroactive `module_function :x`
+    /// only reaches defs.
     fn collect_visibility_call(&mut self, node: &CallNode<'_>) -> bool {
         let marker = match node.name().as_slice() {
-            b"private" => Visibility::Private,
-            b"public" | b"protected" => Visibility::Public,
+            b"private" => Some(Visibility::Private),
+            b"public" | b"protected" => Some(Visibility::Public),
+            b"module_function" => None,
             _ => return false,
         };
         if node.receiver().is_some() || self.class_stack.is_empty() || self.in_singleton_class() {
@@ -561,28 +589,64 @@ impl<'a> InlineCollector<'a> {
         if !frame
             .direct_statement_starts
             .contains(&{ node.location().start() })
+            || (marker.is_none() && !frame.module_body)
         {
             return false;
         }
 
         let Some(arguments) = node.arguments() else {
-            self.visibility_frames.last_mut().unwrap().ambient = Some(marker);
+            let frame = self.visibility_frames.last_mut().unwrap();
+            frame.ambient = Some(marker.unwrap_or(Visibility::Private));
+            frame.module_function = marker.is_none();
             self.mark_enclosed_leading_lines(node.location());
             return true;
         };
         for arg in arguments.arguments().iter() {
-            if let Some(sym) = arg.as_symbol_node() {
-                let name = String::from_utf8_lossy(sym.unescaped()).to_string();
-                self.apply_retroactive_visibility(&name, marker);
-            } else if arg.as_def_node().is_some() || is_attr_call(&arg) {
-                let saved = self.pending_explicit_visibility.replace(marker);
-                self.visit(&arg);
-                self.pending_explicit_visibility = saved;
-            } else {
-                self.visit(&arg);
+            match (marker, arg.as_symbol_node()) {
+                (Some(marker), Some(sym)) => {
+                    let name = String::from_utf8_lossy(sym.unescaped()).to_string();
+                    self.apply_retroactive_visibility(&name, marker);
+                }
+                (None, Some(sym)) => {
+                    let name = String::from_utf8_lossy(sym.unescaped()).to_string();
+                    self.apply_retroactive_module_function(&name);
+                }
+                (Some(marker), None) if arg.as_def_node().is_some() || is_attr_call(&arg) => {
+                    let saved = self.pending_explicit_visibility.replace(marker);
+                    self.visit(&arg);
+                    self.pending_explicit_visibility = saved;
+                }
+                (None, None) if arg.as_def_node().is_some() => {
+                    let saved = std::mem::replace(&mut self.pending_module_function, true);
+                    self.visit(&arg);
+                    self.pending_module_function = saved;
+                }
+                _ => self.visit(&arg),
             }
         }
         true
+    }
+
+    /// `module_function :name` after the fact: the matching instance defs
+    /// already collected in the open body become `SingletonInstance`,
+    /// private on the instance side even if an earlier `public :name`
+    /// made them public.
+    fn apply_retroactive_module_function(&mut self, name: &str) {
+        let Some(members) = self.scope_stack.last_mut() else {
+            return;
+        };
+        for member in members.iter_mut() {
+            if let Member::Def(def) = member
+                && matches!(
+                    def.kind,
+                    MethodKind::Instance | MethodKind::SingletonInstance
+                )
+                && def.name == name
+            {
+                def.kind = MethodKind::SingletonInstance;
+                def.visibility = Some(Visibility::Private);
+            }
+        }
     }
 
     /// `private :name` after the fact: rewrite the visibility of the
@@ -598,7 +662,12 @@ impl<'a> InlineCollector<'a> {
         };
         for member in members.iter_mut() {
             match member {
-                Member::Def(def) if def.kind == MethodKind::Instance && def.name == name => {
+                Member::Def(def)
+                    if matches!(
+                        def.kind,
+                        MethodKind::Instance | MethodKind::SingletonInstance
+                    ) && def.name == name =>
+                {
                     def.visibility = Some(marker);
                 }
                 Member::AttrReader(r) if single_attr_name(&r.attribute) == Some(name) => {
@@ -960,10 +1029,9 @@ impl<'a> InlineCollector<'a> {
                         }
                         let parent_name = if let Some(c) = first.as_constant_read_node() {
                             String::from_utf8_lossy(c.name().as_slice()).to_string()
-                        } else if let Some(p) = first.as_constant_path_node() {
-                            static_constant_path_string(&p)?
                         } else {
-                            return None;
+                            let p = first.as_constant_path_node()?;
+                            static_constant_path_string(&p)?
                         };
                         (
                             self.names.parse_type_name(&parent_name),
@@ -1016,7 +1084,7 @@ impl<'a> InlineCollector<'a> {
         let saved_in_concern_block = std::mem::replace(&mut self.in_concern_block, false);
         self.scope_stack.push(Vec::new());
         self.visibility_frames
-            .push(VisibilityFrame::new(block_node.body()));
+            .push(VisibilityFrame::new(block_node.body(), false));
 
         if let Some(body) = block_node.body() {
             self.visit(&body);
@@ -1072,10 +1140,18 @@ impl<'a> InlineCollector<'a> {
             self.collect_data_struct_attributes(&data_struct.call, data_struct.kind, &options);
         let mut data_struct_members: Vec<Member> =
             attributes.iter().map(|attr| attr.member.clone()).collect();
+        // Ruby keeps the last definition, so scan from the end.
+        let body_initialize = members.iter().rev().find_map(|member| match member {
+            Member::Def(def) if def.kind == MethodKind::Instance && def.name == "initialize" => {
+                Some(def)
+            }
+            _ => None,
+        });
         data_struct_members.extend(self.data_struct_generated_methods(
             data_struct.kind,
             &attributes,
             &options,
+            body_initialize,
             data_struct.call.location(),
         ));
         data_struct_members.extend(members);
@@ -1095,16 +1171,45 @@ impl<'a> InlineCollector<'a> {
         }
     }
 
+    /// `body_initialize` is an instance `def initialize` found in the
+    /// `do ... end` block / class body. `Struct#new` hands its arguments
+    /// to `initialize` unchanged, so an override makes the member-derived
+    /// `self.new` wrong and the ordinary `initialize` -> `new` bake takes
+    /// over (untyped when the def is unannotated, like any class).
+    /// `Data#new` converts positionals to keywords by member order and
+    /// then calls `initialize(**kw)`, so the override's keyword list is
+    /// what `new` accepts; the synthesized overloads follow it.
     fn data_struct_generated_methods(
         &self,
         kind: DataStructConstructionKind,
         attributes: &[DataStructAttribute],
         options: &DataStructOptions,
+        body_initialize: Option<&DefMember>,
         location: ruby_prism::Location<'_>,
     ) -> Vec<Member> {
         let mut members = Vec::new();
         let location = prism_location_range(location);
         match kind {
+            DataStructConstructionKind::Struct if body_initialize.is_some() => {
+                // `Struct.self.new` in rbs core is the class factory
+                // `(*Symbol, ?keyword_init:)`; leaving the own `new` out
+                // would let the chain walk land on it, so the override's
+                // signature is mirrored here instead of in the bake.
+                let def = body_initialize.expect("guarded by the match arm");
+                let overloads = match initialize_annotation_method_types(def, self.names) {
+                    Some(method_types) => {
+                        method_types.into_iter().map(with_instance_return).collect()
+                    }
+                    None => vec![untyped_method_type_returning_instance()],
+                };
+                members.push(generated_def(
+                    "new",
+                    MethodKind::Singleton,
+                    location,
+                    overloads,
+                    None,
+                ));
+            }
             DataStructConstructionKind::Struct => {
                 let mut overloads = Vec::new();
                 if options.keyword_init != Some(true) {
@@ -1132,14 +1237,22 @@ impl<'a> InlineCollector<'a> {
                 ));
             }
             DataStructConstructionKind::Data => {
+                let overloads = body_initialize
+                    .and_then(|def| initialize_keyword_layout(def, self.names))
+                    .map(|layout| {
+                        data_new_overloads_from_initialize(&layout, attributes, self.names)
+                    })
+                    .unwrap_or_else(|| {
+                        vec![
+                            method_type_with_required_positionals(attributes),
+                            method_type_with_required_keywords(attributes, self.names),
+                        ]
+                    });
                 members.push(generated_def(
                     "new",
                     MethodKind::Singleton,
                     location,
-                    vec![
-                        method_type_with_required_positionals(attributes),
-                        method_type_with_required_keywords(attributes, self.names),
-                    ],
+                    overloads,
                     None,
                 ));
                 let members_method =
@@ -1242,7 +1355,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         self.singleton_class_depth = 0;
         self.scope_stack.push(Vec::new());
         self.visibility_frames
-            .push(VisibilityFrame::new(node.body()));
+            .push(VisibilityFrame::new(node.body(), false));
         self.cref_scope_frames.push(self.scope_stack.len() - 1);
         let saved_in_concern_block = std::mem::replace(&mut self.in_concern_block, false);
         ruby_prism::visit_class_node(self, node);
@@ -1304,7 +1417,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         self.singleton_class_depth = 0;
         self.scope_stack.push(Vec::new());
         self.visibility_frames
-            .push(VisibilityFrame::new(node.body()));
+            .push(VisibilityFrame::new(node.body(), true));
         self.cref_scope_frames.push(self.scope_stack.len() - 1);
         self.collect_leading_module_self_members(module_start_line);
         let saved_in_concern_block = std::mem::replace(&mut self.in_concern_block, false);
@@ -1347,6 +1460,15 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             (true, Some(_)) => return,
             (false, Some(receiver)) if receiver.as_self_node().is_some() => MethodKind::Singleton,
             (false, Some(_)) => return,
+            (false, None)
+                if self.pending_module_function
+                    || self
+                        .visibility_frames
+                        .last()
+                        .is_some_and(|f| f.module_function) =>
+            {
+                MethodKind::SingletonInstance
+            }
             (false, None) => MethodKind::Instance,
         };
 
@@ -1422,12 +1544,15 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         // keeps the body un-walked. A top-level `def initialize` is never
         // called as a constructor, and synthesizing ivars onto `::Object`
         // would leak them into every class, so it stays empty.
-        let ivar_param_pairs = if kind == MethodKind::Instance && name == "initialize" && !top_level
-        {
+        let is_instance_initialize =
+            kind == MethodKind::Instance && name == "initialize" && !top_level;
+        let ivar_param_pairs = if is_instance_initialize {
             collect_initialize_ivar_param_pairs(node)
         } else {
             Vec::new()
         };
+        let initialize_params =
+            is_instance_initialize.then(|| collect_initialize_param_shape(node));
 
         let visibility = if top_level {
             // Top-level defs are always private on `Object`. A bare
@@ -1435,6 +1560,15 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             Some(Visibility::Private)
         } else if kind == MethodKind::Instance {
             self.effective_instance_visibility()
+        } else if kind == MethodKind::SingletonInstance {
+            // Instance side of `self?`: private unless the def is the
+            // argument of `public` / `protected` (`public def x` under a
+            // bare `module_function` copies to the singleton, then
+            // reopens the instance side).
+            Some(
+                self.pending_explicit_visibility
+                    .unwrap_or(Visibility::Private),
+            )
         } else {
             // Ruby's `private` never reaches `def self.x` (the modifier
             // form receives the *instance* method name `:x`), so the
@@ -1452,6 +1586,7 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             leading_comment,
             source_file: self.file_name(),
             ivar_param_pairs,
+            initialize_params,
         });
         if top_level {
             self.object_members.push(member);
@@ -1494,6 +1629,57 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
             return;
         }
         ruby_prism::visit_call_node(self, node);
+    }
+
+    /// `alias new old` in a class / module body (crema extension,
+    /// specs/inline.md): a method alias declaration on the side the
+    /// enclosing scope selects, same as an unreceivered `def`. The
+    /// top level is left out — specs limit this to class / module
+    /// bodies — and so is any name that is not a plain Symbol
+    /// (`alias :"a#{x}" b`), which RBS cannot spell.
+    fn visit_alias_method_node(&mut self, node: &AliasMethodNode<'pr>) {
+        if self.is_node_skipped(node.location())
+            || self.in_concern_block
+            || self.class_stack.is_empty()
+        {
+            return;
+        }
+        let (Some(new_name), Some(old_name)) = (
+            node.new_name().as_symbol_node(),
+            node.old_name().as_symbol_node(),
+        ) else {
+            return;
+        };
+        let kind = if self.in_singleton_class() {
+            AliasKind::Singleton
+        } else {
+            AliasKind::Instance
+        };
+        let range = |loc: ruby_prism::Location<'_>| {
+            let (start, end) = prism_location_range(loc);
+            LocationRange::new(start, start, end, end)
+        };
+        let member = AliasMember {
+            new_name: self
+                .names
+                .intern_symbol(&String::from_utf8_lossy(new_name.unescaped())),
+            old_name: self
+                .names
+                .intern_symbol(&String::from_utf8_lossy(old_name.unescaped())),
+            kind,
+            annotations: Vec::new(),
+            location: Some(AliasMemberLocation {
+                range: range(node.location()),
+                keyword_range: range(node.keyword_loc()),
+                new_name_range: range(new_name.location()),
+                old_name_range: range(old_name.location()),
+                new_kind_range: None,
+                old_kind_range: None,
+            }),
+            source_file: self.file_name(),
+            comment: None,
+        };
+        self.push_member(Member::Alias(Box::new(member)));
     }
 
     fn visit_singleton_class_node(&mut self, node: &SingletonClassNode<'pr>) {
@@ -1569,10 +1755,13 @@ impl<'pr, 'a> Visit<'pr> for InlineCollector<'a> {
         }
         let target = node.target();
         let path = constant_path_to_string(&target);
+        // Under the cref like the bare write: inside a `Const = Class.new
+        // do ... end` body the parent segment is looked up outside the
+        // class being built.
         let qualified_path = if path.starts_with("::") {
             path
         } else {
-            qualify_under(self.class_stack.last().map(String::as_str), &path)
+            qualify_under(self.cref_stack.last().map(String::as_str), &path)
         };
         let qualified_name = self.names.parse_type_name(&qualified_path);
         self.process_constant_assignment(
@@ -2134,6 +2323,278 @@ fn method_type_with_positionals(
     mt
 }
 
+/// One keyword of a `Data.define` body `initialize`, normalized across
+/// the places its type can come from: a method-type annotation (explicit
+/// or doc-style), or nothing but the Prism shape. `ty: None` defers to
+/// the same-named member's type.
+struct InitializeKeywordSpec {
+    name: crate::name::Symbol,
+    required: bool,
+    ty: Option<Type>,
+}
+
+struct InitializeKeywordLayout {
+    keywords: Vec<InitializeKeywordSpec>,
+    /// `Some(T)` when `**rest` is declared (its type, untyped when unannotated).
+    rest: Option<Type>,
+}
+
+/// AST method types a body `initialize` was annotated with: explicit
+/// `#:` / `# @rbs (...)` overloads as written, a doc-style annotation
+/// lowered to one method type (the AST-level twin of the builder's
+/// `build_doc_style_method_type`), `None` when unannotated.
+fn initialize_annotation_method_types(
+    def: &DefMember,
+    names: &NameTable,
+) -> Option<Vec<AstMethodType>> {
+    match &def.method_type.type_annotations {
+        TypeAnnotations::Array(annotations) => {
+            let overloads: Vec<AstMethodType> = annotations
+                .iter()
+                .flat_map(|a| match a {
+                    ExplicitAnnotation::Colon(c) => vec![c.method_type.clone()],
+                    ExplicitAnnotation::MethodTypes(m) => {
+                        m.overloads.iter().map(|o| o.method_type.clone()).collect()
+                    }
+                })
+                .collect();
+            (!overloads.is_empty()).then_some(overloads)
+        }
+        TypeAnnotations::DocStyle(doc) => Some(vec![doc_style_ast_method_type(doc, names)]),
+        TypeAnnotations::None => None,
+    }
+}
+
+fn doc_style_ast_method_type(doc: &DocStyle, names: &NameTable) -> AstMethodType {
+    let entry = |e: &PositionalEntry| match e {
+        PositionalEntry::Annotated(a) => a.param_type.clone(),
+        PositionalEntry::ByName(_) => untyped_ast_type(),
+    };
+    let return_type = doc
+        .return_type_annotation
+        .as_ref()
+        .map_or_else(untyped_ast_type, |a| a.return_type.clone());
+    let mut mt = method_type_returning(return_type);
+    let Function::Typed(f) = &mut mt.function else {
+        unreachable!("generated method types are typed")
+    };
+    f.required_positionals = doc
+        .required_positionals
+        .iter()
+        .map(|e| ast_param(entry(e), None))
+        .collect();
+    f.optional_positionals = doc
+        .optional_positionals
+        .iter()
+        .map(|e| ast_param(entry(e), None))
+        .collect();
+    f.rest_positionals = doc.rest_positionals.as_ref().map(|r| {
+        Box::new(ast_param(
+            match r {
+                SplatRestEntry::Annotated(a) => a.param_type.clone(),
+                SplatRestEntry::ByName(_) | SplatRestEntry::Unnamed => untyped_ast_type(),
+            },
+            None,
+        ))
+    });
+    f.trailing_positionals = doc
+        .trailing_positionals
+        .iter()
+        .map(|e| ast_param(entry(e), None))
+        .collect();
+    let keyword = |(n, e): &(String, PositionalEntry)| KeywordParam {
+        name: names.intern_symbol(n),
+        param: ast_param(entry(e), None),
+    };
+    f.required_keywords = doc.required_keywords.iter().map(keyword).collect();
+    f.optional_keywords = doc.optional_keywords.iter().map(keyword).collect();
+    f.rest_keywords = doc.rest_keywords.as_ref().map(|r| {
+        Box::new(ast_param(
+            match r {
+                DoubleSplatRestEntry::Annotated(a) => a.param_type.clone(),
+                DoubleSplatRestEntry::ByName(_) | DoubleSplatRestEntry::Unnamed => {
+                    untyped_ast_type()
+                }
+            },
+            None,
+        ))
+    });
+    mt.block = doc.block.as_ref().map(|b| match b {
+        BlockEntry::Annotated(a) => BlockType {
+            required: a.question_location.is_none(),
+            function: a.function.clone(),
+            self_type: None,
+        },
+        BlockEntry::ByName(_) | BlockEntry::Unnamed => BlockType {
+            required: false,
+            function: Function::Untyped(UntypedFunctionType {
+                return_type: Box::new(untyped_ast_type()),
+            }),
+            self_type: None,
+        },
+    });
+    mt
+}
+
+fn with_instance_return(mut mt: AstMethodType) -> AstMethodType {
+    match &mut mt.function {
+        Function::Typed(f) => *f.return_type = self_instance_ast_type(),
+        Function::Untyped(u) => *u.return_type = self_instance_ast_type(),
+    }
+    mt
+}
+
+fn untyped_method_type_returning_instance() -> AstMethodType {
+    AstMethodType {
+        type_params: vec![],
+        function: Function::Untyped(UntypedFunctionType {
+            return_type: Box::new(self_instance_ast_type()),
+        }),
+        block: None,
+        location: None,
+    }
+}
+
+/// `None` when the override cannot be modelled: no Prism shape was
+/// captured, or the def takes positional parameters (`Data#new` passes
+/// keywords only, so such an `initialize` has no `new` the member list
+/// could describe). The caller then keeps the member-derived overloads.
+fn initialize_keyword_layout(
+    def: &DefMember,
+    names: &NameTable,
+) -> Option<InitializeKeywordLayout> {
+    let shape = def.initialize_params.as_ref()?;
+    let annotated = initialize_annotation_method_types(def, names);
+    if let Some(Function::Typed(f)) = annotated
+        .as_ref()
+        .and_then(|mts| mts.first())
+        .map(|mt| &mt.function)
+    {
+        if !f.required_positionals.is_empty()
+            || !f.optional_positionals.is_empty()
+            || f.rest_positionals.is_some()
+            || !f.trailing_positionals.is_empty()
+        {
+            return None;
+        }
+        // A doc-style keyword without its own `@rbs name: T` lowers to
+        // untyped above; here it should still defer to the member type.
+        let unannotated: Vec<crate::name::Symbol> = match &def.method_type.type_annotations {
+            TypeAnnotations::DocStyle(doc) => doc
+                .required_keywords
+                .iter()
+                .chain(doc.optional_keywords.iter())
+                .filter(|(_, entry)| matches!(entry, PositionalEntry::ByName(_)))
+                .map(|(name, _)| names.intern_symbol(name))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let spec = |required: bool| {
+            let unannotated = &unannotated;
+            move |kw: &KeywordParam| InitializeKeywordSpec {
+                name: kw.name,
+                required,
+                ty: (!unannotated.contains(&kw.name)).then(|| (*kw.param.ty).clone()),
+            }
+        };
+        let keywords = f
+            .required_keywords
+            .iter()
+            .map(spec(true))
+            .chain(f.optional_keywords.iter().map(spec(false)))
+            .collect();
+        return Some(InitializeKeywordLayout {
+            keywords,
+            rest: f.rest_keywords.as_ref().map(|p| (*p.ty).clone()),
+        });
+    }
+    if shape.positionals {
+        return None;
+    }
+    Some(InitializeKeywordLayout {
+        keywords: shape
+            .keywords
+            .iter()
+            .map(|kw| InitializeKeywordSpec {
+                name: names.intern_symbol(&kw.name),
+                required: kw.required,
+                ty: None,
+            })
+            .collect(),
+        rest: shape.rest_keywords.then(untyped_ast_type),
+    })
+}
+
+/// Keyword overload mirrors the `initialize` keyword list. The positional
+/// overload follows `Data#new`'s positional-to-keyword conversion: the
+/// i-th positional becomes the i-th member's keyword, so only the leading
+/// run of members that `initialize` accepts as keywords is reachable, and
+/// it is required up to the last required keyword in that run. When a
+/// required keyword sits outside the run no positional call can satisfy
+/// `initialize`, so the positional overload is omitted.
+fn data_new_overloads_from_initialize(
+    layout: &InitializeKeywordLayout,
+    attributes: &[DataStructAttribute],
+    names: &NameTable,
+) -> Vec<AstMethodType> {
+    let member_type = |name: crate::name::Symbol| {
+        attributes
+            .iter()
+            .find(|attr| names.intern_symbol(&attr.name) == name)
+            .map(|attr| attr.ty.clone())
+    };
+    let resolve = |spec: &InitializeKeywordSpec| {
+        spec.ty
+            .clone()
+            .or_else(|| member_type(spec.name))
+            .unwrap_or_else(untyped_ast_type)
+    };
+
+    let mut keyword = method_type_returning(self_instance_ast_type());
+    let Function::Typed(function) = &mut keyword.function else {
+        unreachable!("generated method types are typed")
+    };
+    for spec in &layout.keywords {
+        let param = KeywordParam {
+            name: spec.name,
+            param: ast_param(resolve(spec), None),
+        };
+        if spec.required {
+            function.required_keywords.push(param);
+        } else {
+            function.optional_keywords.push(param);
+        }
+    }
+    function.rest_keywords = layout.rest.clone().map(|ty| Box::new(ast_param(ty, None)));
+
+    let mut prefix: Vec<(Type, bool)> = Vec::new();
+    for attr in attributes {
+        let name = names.intern_symbol(&attr.name);
+        match layout.keywords.iter().find(|spec| spec.name == name) {
+            Some(spec) => prefix.push((resolve(spec), spec.required)),
+            None if layout.rest.is_some() => prefix.push((attr.ty.clone(), false)),
+            None => break,
+        }
+    }
+    let required_total = layout.keywords.iter().filter(|s| s.required).count();
+    let required_in_prefix = prefix.iter().filter(|(_, required)| *required).count();
+    if required_in_prefix != required_total {
+        return vec![keyword];
+    }
+    let required_len = prefix
+        .iter()
+        .rposition(|(_, required)| *required)
+        .map_or(0, |i| i + 1);
+    let mut positional = method_type_returning(self_instance_ast_type());
+    let Function::Typed(function) = &mut positional.function else {
+        unreachable!("generated method types are typed")
+    };
+    let mut params = prefix.into_iter().map(|(ty, _)| ast_param(ty, None));
+    function.required_positionals = params.by_ref().take(required_len).collect();
+    function.optional_positionals = params.collect();
+    vec![positional, keyword]
+}
+
 fn method_type_with_required_keywords(
     attributes: &[DataStructAttribute],
     names: &NameTable,
@@ -2231,6 +2692,7 @@ fn generated_def(
     Member::Def(DefMember {
         visibility: None,
         ivar_param_pairs: Vec::new(),
+        initialize_params: None,
         name: name.to_string(),
         kind,
         location,
@@ -2384,6 +2846,48 @@ impl<'a> InlineCollector<'a> {
 /// local-variable indirection, rest/block/post params) is skipped —
 /// not inferring is always the safe direction. The first eligible
 /// assignment per ivar wins; later ones are left to the write check.
+fn collect_initialize_param_shape(node: &DefNode<'_>) -> InitializeParamShape {
+    let Some(params) = node.parameters() else {
+        return InitializeParamShape::default();
+    };
+    let keywords = params
+        .keywords()
+        .iter()
+        .filter_map(|keyword| {
+            if let Some(p) = keyword.as_required_keyword_parameter_node() {
+                Some(InitializeKeywordParam {
+                    name: String::from_utf8_lossy(p.name().as_slice()).into_owned(),
+                    required: true,
+                })
+            } else {
+                keyword
+                    .as_optional_keyword_parameter_node()
+                    .map(|p| InitializeKeywordParam {
+                        name: String::from_utf8_lossy(p.name().as_slice()).into_owned(),
+                        required: false,
+                    })
+            }
+        })
+        .collect();
+    let keyword_rest = params.keyword_rest();
+    // `...` forwards positionals too, so it counts on both sides.
+    let forwarding = keyword_rest
+        .as_ref()
+        .is_some_and(|n| n.as_forwarding_parameter_node().is_some());
+    InitializeParamShape {
+        keywords,
+        rest_keywords: forwarding
+            || keyword_rest
+                .as_ref()
+                .is_some_and(|n| n.as_keyword_rest_parameter_node().is_some()),
+        positionals: forwarding
+            || !params.requireds().is_empty()
+            || !params.optionals().is_empty()
+            || params.rest().is_some()
+            || !params.posts().is_empty(),
+    }
+}
+
 fn collect_initialize_ivar_param_pairs(node: &DefNode<'_>) -> Vec<InitializeIvarParamPair> {
     let Some(params) = node.parameters() else {
         return Vec::new();
