@@ -5284,15 +5284,11 @@ impl<'env> TypeChecker<'env> {
         // against it. `lookup_block_type` may leave unresolved
         // `TypeVariable`s when no call-site anchor solved them (e.g.
         // `def m: [X] () { () -> X } -> X` called without an LHS hint);
-        // pass `None` in that case to keep bare variables out of literal
-        // inference. `check_statements_with_hint` forwards the hint to
-        // the body's final statement only.
-        let body_hint = if crate::types::contains_type_variable(block_return_type, self.env.types())
-        {
-            None
-        } else {
-            Some(block_return_type)
-        };
+        // `return_shape_hint` keeps the shape around them (`[T, U]` still
+        // makes `[a, b]` a tuple) without handing a free variable to the
+        // body. `check_statements_with_hint` forwards the hint to the
+        // body's final statement only.
+        let body_hint = self.return_shape_hint(block_return_type);
         // Extract-mode hand-off: the body's tail-expression type, typed
         // read-only (`infer_statements_with_hint` infers exactly the last
         // statement), is carried to the tail call's record point (reached

@@ -1,6 +1,6 @@
 [package]
 name = "crema"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 # Tracks rust-toolchain.toml's channel; bump both together.
 rust-version = "1.99"

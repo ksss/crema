@@ -6614,9 +6614,13 @@ impl<'env> TypeChecker<'env> {
         // `[self: T]` the opaque `SELF_TYPE` in the body type means `T`, so
         // it is frozen before the override is popped; outside, it would be
         // read as the enclosing self.
+        // The body is typed under the shape of the expected return so a
+        // tuple-shaped return (`[T, U]`, `Hash::_Pair[K, V]`) keeps an array
+        // literal a tuple and the unify below can bind `T` / `U` from it.
         let rebinds_self = resolved_block.self_type.is_some();
+        let body_hint = self.return_shape_hint(expected_block.return_type());
         let body_ty = self.with_readonly_self(resolved_block.self_type, |checker| {
-            let ty = checker.with_overlay(overlay, |checker| checker.infer_type(&body, None));
+            let ty = checker.with_overlay(overlay, |checker| checker.infer_type(&body, body_hint));
             if rebinds_self {
                 checker.freeze_self_type_for_lvar_binding(ty)
             } else {
@@ -7692,6 +7696,41 @@ impl<'env> TypeChecker<'env> {
         }
     }
 
+    /// The candidates an array literal's tuple paths pick from: the hint's
+    /// own candidates when any is a `Tuple`, else the `Tuple`s its members'
+    /// `to_ary` returns — Steep `try_convert(hint, :to_ary)` in the `:array`
+    /// arm, so `Hash::_Pair[K, V]` (`to_ary: () -> [K, V]`) types `[k, v]`
+    /// as a tuple. `Array` members are skipped: `Array#to_ary` returns
+    /// `self`, never a tuple.
+    fn tuple_hint_candidates(&self, hint: Ty) -> Vec<Ty> {
+        let candidates = self.expand_hint_candidates(hint);
+        let types = self.env.types();
+        if candidates
+            .iter()
+            .any(|&c| matches!(types.resolve(c), Type::Tuple(_)))
+        {
+            return candidates;
+        }
+        let array = self.env.names().builtins().array;
+        let mut converted = Vec::new();
+        for c in candidates {
+            if c.is_untyped()
+                || matches!(types.resolve(c), Type::ClassInstance { name, .. } if *name == array)
+            {
+                continue;
+            }
+            let Some(ret) = self.try_convert_to_ary_return_type(c) else {
+                continue;
+            };
+            for t in self.expand_hint_candidates(ret) {
+                if matches!(types.resolve(t), Type::Tuple(_)) && !converted.contains(&t) {
+                    converted.push(t);
+                }
+            }
+        }
+        converted
+    }
+
     /// Pick the `Tuple` candidate from `hint` whose arity matches
     /// `elements.len()`, returning its element types. Returns `None` when
     /// no Tuple candidate fits or when every candidate has a different
@@ -7710,7 +7749,7 @@ impl<'env> TypeChecker<'env> {
         hint: Ty,
         elements: &[Node<'pr>],
     ) -> Option<Vec<Ty>> {
-        let candidates = self.expand_hint_candidates(hint);
+        let candidates = self.tuple_hint_candidates(hint);
         let matching: Vec<Ty> = candidates
             .into_iter()
             .filter(|c| {
@@ -7748,7 +7787,7 @@ impl<'env> TypeChecker<'env> {
     /// arity itself after walking the splat. Returns `None` on no Tuple
     /// candidate or ambiguous (multiple distinct Tuple shapes).
     fn array_tuple_hint_loose(&self, hint: Ty) -> Option<Vec<Ty>> {
-        let candidates = self.expand_hint_candidates(hint);
+        let candidates = self.tuple_hint_candidates(hint);
         let mut picked: Option<Vec<Ty>> = None;
         for c in candidates {
             if let Type::Tuple(members) = self.env.types().resolve(c) {
@@ -8340,9 +8379,31 @@ impl<'env> TypeChecker<'env> {
     /// `LambdaNode`s and only for a non-generic overload), so the same
     /// guard is applied here: a hint still holding a type variable would
     /// bind a free variable to a param and make the body walk a
-    /// false-positive source.
+    /// false-positive source. A variable only in a Proc hint's return type
+    /// (`^() -> [T, U]`) binds no param, so that hint is kept: the body is
+    /// typed under its shape (`lambda_body_hint`), and the stabby-lambda
+    /// argument path already receives such hints unfiltered.
     pub(super) fn kernel_lambda_hint(&self, hint: Option<Ty>) -> Option<Ty> {
-        hint.filter(|&h| !crate::types::contains_type_variable(h, self.env.types()))
+        hint.filter(|&h| !self.type_variable_outside_proc_return(h))
+    }
+
+    /// Whether `ty` holds a type variable anywhere but a typed Proc's
+    /// return type. Non-Proc types are checked whole.
+    fn type_variable_outside_proc_return(&self, ty: Ty) -> bool {
+        let types = self.env.types();
+        if let Type::Proc(p) = types.resolve(ty)
+            && let FunctionType::Typed(function) = &p.type_
+        {
+            let mut params_only = function.clone();
+            params_only.return_type = Ty::UNTYPED;
+            let probe = types.intern(Type::Proc(Box::new(ProcType {
+                type_: FunctionType::Typed(params_only),
+                self_type: p.self_type,
+                block: p.block.clone(),
+            })));
+            return crate::types::contains_type_variable(probe, types);
+        }
+        crate::types::contains_type_variable(ty, types)
     }
 
     /// Side-effecting walk of a lambda literal's body, then the literal
@@ -8494,10 +8555,14 @@ impl<'env> TypeChecker<'env> {
             };
             // The hinted lambda's type takes the hint's params / self / block
             // (Steep `params_hint || params.params_type`, `self_hint`), so the
-            // subsequent argument check is trivially satisfied.
+            // subsequent argument check is trivially satisfied. A return
+            // type still holding a method-level variable (`^() -> [T, U]`)
+            // keeps the body's type instead: handing the hint back would
+            // leave `T` for the call's binding to unify against itself.
             if actual_return.is_untyped()
                 || function.return_type == Ty::VOID
-                || self.subtyper().check(actual_return, function.return_type)
+                || (!crate::types::contains_type_variable(function.return_type, self.env.types())
+                    && self.subtyper().check(actual_return, function.return_type))
             {
                 return proc_ty;
             }
@@ -8520,18 +8585,43 @@ impl<'env> TypeChecker<'env> {
     }
 
     /// The hint a hinted lambda's body tail (and its `next` values) is
-    /// typed under: the hint Proc's return type, unless it is untyped,
-    /// `void`, or still holds a type variable — the same rule
-    /// `check_block` applies to a block's declared return type.
+    /// typed under: [`Self::return_shape_hint`] of the hint Proc's return
+    /// type — the same rule `check_block` applies to a block's declared
+    /// return type.
     fn lambda_body_hint(&self, function: &Function) -> Option<Ty> {
-        let ret = function.return_type;
-        if ret.is_untyped()
-            || ret == Ty::VOID
-            || crate::types::contains_type_variable(ret, self.env.types())
-        {
+        self.return_shape_hint(function.return_type)
+    }
+
+    /// The hint a block / lambda body is typed under, given its declared
+    /// return type `ret`. `None` for untyped / `void`.
+    ///
+    /// Method-level type variables the call site has not solved yet are
+    /// replaced with `untyped`, so the hint keeps the *shape* of `ret`
+    /// (`[T, U]` → `[untyped, untyped]`, `Hash::_Pair[K, V]` →
+    /// `Hash::_Pair[untyped, untyped]`) without handing a free variable to
+    /// the body: an array literal still elaborates as a tuple, and a tail
+    /// call never binds its own type params to the enclosing call's
+    /// variables. Steep types the body under the fresh variables and solves
+    /// them afterwards; crema solves them from the body's type in
+    /// `bind_unbound_from_block_return`, which needs that type to be the
+    /// tuple.
+    ///
+    /// The shape is handed over only when an array literal can take a tuple
+    /// from it (`tuple_hint_candidates`). Any other shape around a variable
+    /// (`T?`, `T | Integer`, `^() -> T`, a bare `T`) yields `None` as
+    /// before: typed under `untyped?` the body's own type would be dragged
+    /// to `untyped`, binding `T` to it and losing every diagnostic on the
+    /// call's result.
+    pub(super) fn return_shape_hint(&self, ret: Ty) -> Option<Ty> {
+        if ret.is_untyped() || ret == Ty::VOID {
             return None;
         }
-        Some(ret)
+        let types = self.env.types();
+        if !crate::types::contains_type_variable(ret, types) {
+            return Some(ret);
+        }
+        let shape = crate::types::fallback_unbound_type_vars_to_untyped(ret, types);
+        (!self.tuple_hint_candidates(shape).is_empty()).then_some(shape)
     }
 
     /// Run `f` with `next_hint` set to `hint`, restoring the outer value

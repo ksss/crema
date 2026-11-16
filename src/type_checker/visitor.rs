@@ -1337,7 +1337,7 @@ impl<'env> TypeChecker<'env> {
     /// the RHS returns a class carrying `def to_ary: () -> [...]`.
     // Implicit-conversion probe, not a dispatch: consulted only.
     #[allow(clippy::disallowed_methods)]
-    fn try_convert_to_ary_return_type(&self, receiver_ty: Ty) -> Option<Ty> {
+    pub(super) fn try_convert_to_ary_return_type(&self, receiver_ty: Ty) -> Option<Ty> {
         let to_ary = self.env.names().intern_symbol("to_ary");
         let resolved = super::method_resolver::lookup_method(self.env, receiver_ty, to_ary)?;
         if resolved.method.accessibility == Visibility::Private {
