@@ -190,7 +190,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "crema"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "bincode",
  "clap",
@@ -515,9 +515,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "ruby-prism"
-version = "2.0.0-rc.1"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51efc9d9a793710a47add79bed34855bf20ee995187fe759fd6b78392dbf9b64"
+checksum = "ef9dd23fe10d6335d390c9fd23cf7dac83f594be5676ad28de58d6f2bac65f4c"
 dependencies = [
  "ruby-prism-sys",
  "serde",
@@ -526,9 +526,9 @@ dependencies = [
 
 [[package]]
 name = "ruby-prism-sys"
-version = "2.0.0-rc.1"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd45d44b4d7aaf30f41b500ae2b874ea3324d6ceb19877a56825ba1c265cbdeb"
+checksum = "f3e6b1801eb164c6b2c6c6cd42e55bf61d73f973719f675370769ce0295ba7f1"
 dependencies = [
  "cc",
  "shlex 2.0.1",

@@ -593,10 +593,10 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 --------------------------------------------------------------------------------
 Used by:
-- ruby-prism-sys 2.0.0-rc.1
-- ruby-prism 2.0.0-rc.1
+- ruby-prism-sys 2.1.0
+- ruby-prism 2.1.0
 
-Copyright 2022-present, Shopify Inc.
+Copyright 2022-present, Ruby developers
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
@@ -639,7 +639,7 @@ SOFTWARE.
 MIT License (MIT)
 --------------------------------------------------------------------------------
 Used by:
-- crema 0.5.1
+- crema 0.5.2
 
 MIT License
 

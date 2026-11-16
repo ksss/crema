@@ -14,9 +14,13 @@
 //! `glob` (default [`DEFAULT_GLOB`]); a GIT checkout is
 //! `<bundle_path>/bundler/gems/<base_name>-<revision[0..12]>`.
 //! Other sections (`PLUGIN SOURCE`, `DEPENDENCIES`, `CHECKSUMS`, ...)
-//! carry no spec crema can place, so their gems read as not locked.
+//! carry no spec crema can place, so their gems read as not locked;
+//! `PLATFORMS` only decides how a GEM spec's platform is read (see
+//! [`Lockfile::locate`]).
 
 use std::path::{Component, Path, PathBuf};
+
+use crate::gem_platform::{self, Platform};
 
 
 pub const DEFAULT_GLOB: &str = "{,*,*/*}.gemspec";
@@ -31,14 +35,18 @@ pub struct BundlerRoots {
     /// `Gem.path` after `Bundler.configure`: the only roots searched for
     /// GEM-source gems (never wider than bundler itself).
     pub gem_path: Vec<PathBuf>,
+    /// `Bundler.local_platform` as a string: `Gem::Platform.local`, or
+    /// `"ruby"` under `force_ruby_platform`.
+    pub local_platform: String,
 }
 
-/// The probe prints `lockfile=`, `root=`, `bundle_path=` once and
-/// `gem_path=` once per root, in Gem.path order.
+/// The probe prints `lockfile=`, `root=`, `bundle_path=`, `platform=`
+/// once and `gem_path=` once per root, in Gem.path order.
 pub fn parse_probe_output(stdout: &str) -> Result<BundlerRoots, String> {
     let mut lockfile = None;
     let mut bundle_root = None;
     let mut bundle_path = None;
+    let mut local_platform = None;
     let mut gem_path = Vec::new();
     for line in stdout.lines().filter(|l| !l.is_empty()) {
         let Some((key, value)) = line.split_once('=') else {
@@ -50,6 +58,7 @@ pub fn parse_probe_output(stdout: &str) -> Result<BundlerRoots, String> {
             "lockfile" => lockfile = Some(PathBuf::from(value)),
             "root" => bundle_root = Some(PathBuf::from(value)),
             "bundle_path" => bundle_path = Some(PathBuf::from(value)),
+            "platform" => local_platform = Some(value.to_string()),
             "gem_path" => gem_path.push(PathBuf::from(value)),
             _ => {
                 return Err(format!(
@@ -58,13 +67,16 @@ pub fn parse_probe_output(stdout: &str) -> Result<BundlerRoots, String> {
             }
         }
     }
-    match (lockfile, bundle_root, bundle_path) {
-        (Some(lockfile), Some(bundle_root), Some(bundle_path)) => Ok(BundlerRoots {
-            lockfile,
-            bundle_root,
-            bundle_path,
-            gem_path,
-        }),
+    match (lockfile, bundle_root, bundle_path, local_platform) {
+        (Some(lockfile), Some(bundle_root), Some(bundle_path), Some(local_platform)) => {
+            Ok(BundlerRoots {
+                lockfile,
+                bundle_root,
+                bundle_path,
+                gem_path,
+                local_platform,
+            })
+        }
         _ => Err("error: incomplete bundler probe output".to_string()),
     }
 }
@@ -103,6 +115,8 @@ impl LockedSpec {
 pub struct Lockfile {
     sources: Vec<Source>,
     specs: Vec<LockedSpec>,
+    /// The `PLATFORMS` section, as written.
+    platforms: Vec<String>,
 }
 
 /// Outcome of placing one gem on disk.
@@ -126,6 +140,7 @@ impl Lockfile {
         // `None` outside GEM / PATH / GIT (DEPENDENCIES, PLATFORMS, ...).
         let mut current: Option<usize> = None;
         let mut in_specs = false;
+        let mut in_platforms = false;
         for raw in text.lines() {
             let line = raw.trim_end();
             if line.is_empty() {
@@ -133,6 +148,7 @@ impl Lockfile {
             }
             if !line.starts_with(' ') {
                 in_specs = false;
+                in_platforms = line == "PLATFORMS";
                 let kind = match line {
                     "GEM" => Some(SourceKind::Rubygems),
                     "PATH" => Some(SourceKind::Path {
@@ -151,6 +167,10 @@ impl Lockfile {
                     });
                     lock.sources.len() - 1
                 });
+                continue;
+            }
+            if in_platforms {
+                lock.platforms.push(line.trim_start().to_string());
                 continue;
             }
             let Some(idx) = current else { continue };
@@ -209,6 +229,9 @@ impl Lockfile {
         let version = first.version.clone();
         let source = &self.sources[first.source];
         let dir = match &source.kind {
+            SourceKind::Rubygems if self.platform_is_ignored(&roots.local_platform) => {
+                best_installed_platform(&first.name, &version, roots)
+            }
             SourceKind::Rubygems => {
                 // A platform variant is the more specific install, so it is
                 // tried first within each root; root order stays Gem.path's.
@@ -240,6 +263,70 @@ impl Lockfile {
             None => Located::NotInstalled { version },
         }
     }
+}
+
+impl Lockfile {
+    /// Bundler's `!ruby_platform_materializes_to_ruby_platform?`: when the
+    /// most specific locked platform is `ruby` — `PLATFORMS` lists nothing
+    /// else — a locked `name (version)` does not name an install. Bundler
+    /// then loads whichever installed `name-version[-platform]` best fits
+    /// the local platform (`LazySpecification#resolve_best_platform`),
+    /// which is how a lockfile written on one machine stays usable on a
+    /// machine that installed a precompiled variant. `force_ruby_platform`
+    /// keeps the exact reading. (JRuby's `java` generic is not modeled.)
+    fn platform_is_ignored(&self, local_platform: &str) -> bool {
+        local_platform != gem_platform::RUBY
+            && !self.platforms.is_empty()
+            && self.platforms.iter().all(|p| p == gem_platform::RUBY)
+    }
+}
+
+/// The installed `<name>-<version>[-<platform>]` dir whose platform runs
+/// on `roots.local_platform` with the lowest
+/// `Gem::Platform.platform_specificity_match`, over all of `Gem.path`
+/// (bundler searches one merged index). Equal ranks go to the earlier
+/// root, then the smaller dir name, since `read_dir` order is unspecified.
+fn best_installed_platform(name: &str, version: &str, roots: &BundlerRoots) -> Option<PathBuf> {
+    let local = Platform::parse(&roots.local_platform);
+    let ruby_name = format!("{name}-{version}");
+    let variant_prefix = format!("{ruby_name}-");
+    let mut best: Option<(i64, usize, String, PathBuf)> = None;
+    for (root_idx, root) in roots.gem_path.iter().enumerate() {
+        let gems = root.join("gems");
+        let Ok(entries) = std::fs::read_dir(&gems) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let platform = if file_name == ruby_name {
+                None
+            } else if let Some(suffix) = file_name.strip_prefix(&variant_prefix) {
+                let platform = Platform::parse(suffix);
+                if !platform.matches(&local) {
+                    continue;
+                }
+                Some(platform)
+            } else {
+                continue;
+            };
+            let path = gems.join(file_name);
+            if !path.is_dir() {
+                continue;
+            }
+            let rank = gem_platform::specificity(platform.as_ref(), Some(&local));
+            let key = (rank, root_idx, file_name);
+            if best
+                .as_ref()
+                .is_none_or(|(r, i, n, _)| key < (*r, *i, n.as_str()))
+            {
+                best = Some((rank, root_idx, file_name.to_string(), path));
+            }
+        }
+    }
+    best.map(|(_, _, _, path)| path)
 }
 
 /// `Source::Git#base_name`: `File.basename(uri.sub(%r{^(\w+://)?([^/:]+:)?

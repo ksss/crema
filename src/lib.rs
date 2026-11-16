@@ -15,6 +15,7 @@ pub mod extract;
 pub mod file_finder;
 pub mod gem_dir_cache;
 pub mod gem_lockfile;
+pub mod gem_platform;
 pub mod ids;
 pub mod infusion_collector;
 pub mod ingest_cache;

@@ -427,13 +427,15 @@ fn warn_and_record(warnings: &mut Vec<String>, message: String) {
 /// (`BUNDLE_PATH` set means vendor only, never the shared gems); without
 /// it `Gem.path` would also show system gems and be more permissive than
 /// bundler. Which gem at which version comes from `Gemfile.lock`, read in
-/// Rust (`gem_lockfile`).
+/// Rust (`gem_lockfile`); `platform` lets that pick the installed
+/// platform variant the way bundler would.
 const BUNDLER_PROBE_SCRIPT: &str = r##"
 require "bundler"
 Bundler.configure
 puts "lockfile=#{Bundler.default_lockfile}"
 puts "root=#{Bundler.root}"
 puts "bundle_path=#{Bundler.bundle_path}"
+puts "platform=#{Bundler.local_platform}"
 Gem.path.each { |path| puts "gem_path=#{path}" }
 "##;
 
